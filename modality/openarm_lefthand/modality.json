@@ -1,0 +1,64 @@
+{
+    "state": {
+        "neck_joints": {
+            "start": 0,
+            "end": 2,
+            "original_key": "observation.joint_position"
+        },
+        "left_arm_joints": {
+            "start": 2,
+            "end": 9,
+            "original_key": "observation.joint_position"
+        },
+        "left_hand_joints": {
+            "start": 9,
+            "end": 15,
+            "original_key": "observation.joint_position"
+        },
+        "right_arm_joints": {
+            "start": 15,
+            "end": 22,
+            "original_key": "observation.joint_position"
+        },
+        "right_hand_joints": {
+            "start": 22,
+            "end": 28,
+            "original_key": "observation.joint_position"
+        }
+    },
+    "action": {
+        "neck_joints": {
+            "start": 0,
+            "end": 2
+        },
+        "left_arm_joints": {
+            "start": 2,
+            "end": 9
+        },
+        "left_hand_joints": {
+            "start": 9,
+            "end": 15
+        },
+        "right_arm_joints": {
+            "start": 15,
+            "end": 22
+        },
+        "right_hand_joints": {
+            "start": 22,
+            "end": 28
+        }
+    },
+    "video": {
+        "camera_ego_left": {
+            "original_key": "observation.images.camera_ego_left"
+        },
+        "camera_ego_right": {
+            "original_key": "observation.images.camera_ego_right"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}

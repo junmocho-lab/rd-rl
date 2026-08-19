@@ -18,6 +18,12 @@ gets the target size appended:
 data/ and meta/ are copied byte-for-byte, except that the video resolution written
 in meta/info.json is patched to the new size (--keep-info to leave it alone).
 
+--modality PATH copies that file into every converted dataset as meta/modality.json
+(RLDX needs it; rrc-release does not write one). It is installed even for datasets
+that are already converted, so it can be added in a second pass:
+
+    python convert_data.py <src> -o ./rl-dataset/r0 --modality modality/openarm_lefthand/modality.json
+
 Re-running is incremental: datasets already converted at the same target size are
 skipped, and a dataset that gained new episodes only converts the missing videos.
 """
@@ -202,6 +208,24 @@ def patch_info_json(info_path: Path, width: int, height: int) -> None:
         f.write("\n")
 
 
+def install_modality(dst_ds: Path, modality: Path, dry_run: bool) -> bool:
+    """Drop modality.json into the converted dataset's meta/.
+
+    Called for skipped datasets too, so `--modality` can be added on a later run
+    without re-encoding anything.
+    """
+    dst = dst_ds / "meta" / "modality.json"
+    if dst.exists() and dst.read_bytes() == modality.read_bytes():
+        return False
+    if dry_run:
+        print(f"         would install meta/modality.json <- {modality}")
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(modality, dst)
+    print(f"         installed meta/modality.json <- {modality}")
+    return True
+
+
 def read_fps(ds: Path, default: float = 30.0) -> float:
     try:
         with open(ds / "meta" / "info.json") as f:
@@ -234,6 +258,8 @@ def convert_dataset(src_ds: Path, dst_ds: Path, args) -> str:
     )
     if up_to_date:
         print(f"[skip] {src_ds.name}: already converted ({len(src_videos)} videos)")
+        if args.modality:
+            install_modality(dst_ds, args.modality, args.dry_run)
         return "skipped"
 
     todo = []
@@ -254,6 +280,8 @@ def convert_dataset(src_ds: Path, dst_ds: Path, args) -> str:
     n_copied = copy_rest(src_ds, dst_ds)
     if not args.keep_info:
         patch_info_json(dst_ds / "meta" / "info.json", args.width, args.height)
+    if args.modality:
+        install_modality(dst_ds, args.modality, args.dry_run)
     if n_copied:
         print(f"         copied {n_copied} non-video files")
 
@@ -305,6 +333,7 @@ def convert_dataset(src_ds: Path, dst_ds: Path, args) -> str:
                 "width": args.width,
                 "height": args.height,
                 "num_videos": len(src_videos),
+                "modality": str(args.modality) if args.modality else None,
                 "interpolation": "cv2.INTER_LINEAR",
                 "vcodec": args.vcodec,
                 "crf": args.crf,
@@ -338,6 +367,8 @@ def main() -> int:
                    help="parallel video conversions")
     p.add_argument("--force", action="store_true", help="re-convert everything")
     p.add_argument("--dry-run", action="store_true", help="only report what would run")
+    p.add_argument("--modality", type=Path, default=None,
+                   help="modality.json to install into each dataset's meta/")
     p.add_argument("--keep-info", action="store_true",
                    help="do not patch the resolution in meta/info.json")
     p.add_argument("--ffmpeg", default=shutil.which("ffmpeg") or "ffmpeg")
@@ -357,6 +388,17 @@ def main() -> int:
     if not src.is_dir():
         print(f"error: {src} is not a directory", file=sys.stderr)
         return 1
+    if args.modality is not None:
+        args.modality = args.modality.expanduser().resolve()
+        if not args.modality.is_file():
+            print(f"error: modality file not found: {args.modality}", file=sys.stderr)
+            return 1
+        try:
+            with open(args.modality) as f:
+                json.load(f)
+        except json.JSONDecodeError as exc:
+            print(f"error: {args.modality} is not valid JSON ({exc})", file=sys.stderr)
+            return 1
     if shutil.which(args.ffmpeg) is None and not Path(args.ffmpeg).exists():
         print(f"error: ffmpeg not found ({args.ffmpeg}), pass --ffmpeg /path/to/ffmpeg",
               file=sys.stderr)

@@ -3,11 +3,29 @@
 # 실행 순서
 
 0. rd-rl git clone 받고 각 submodule 및 .venv 세팅 
-1. config 세팅 (각 경로를 확실하게 세팅)
+1. paths 세팅 후 `source ./configs/paths.sh`, modality 파일 추가 
 2. teleop data 세팅 (post-training에 활용)
    ```
-   
+   uv run ./utils/convert_data.py ~/Code/rrc-release/data/user/0814/openarm_rh56f1_teleop -o ./rl-dataset/t0 --modality modality/openarm_lefthand/modality.json
    ```
+3. teleop data 학습 서버에 업로드
+   ```
+   kubectl cp $A_DS/t0 $L_POD:$L_DS/t0
+   ```
+3. bc policy 학습 서버에서 다운로드 받기
+   ```
+   kubectl cp $L_POD:$L_CKPT/0814-openarm-rh56f1-rldx-ptimg $A_CKPT/0814-openarm-rh56f1-rldx-ptimg
+   ```
+4. bc policy rollout 진행 및 위처럼 2. 처럼 inference data 세팅
+   ```
+   uv run ./utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/0815_openarm_rh56f1_inference -o ./rl-dataset/r0 --modality modality/openarm_lefthand/modality.json
+   ```
+5. inference data 학습 서버에 업로드
+   ```
+   kubectl cp $A_DS/r0 $L_POD:$L_DS/r0
+   ```
+
+
 
 
 
@@ -53,7 +71,7 @@ uv sync          # .python-version(3.12) 의 파이썬까지 uv 가 받아온다
 uv run python utils/convert_data.py ...      # 또는 .venv/bin/python
 ```
 
-그 머신에 맞게 **`configs/config.yaml` 의 경로는 고쳐야 한다.**
+그 머신에 맞게 **`configs/paths.sh` 의 경로는 고쳐야 한다.**
 
 시스템 의존성이 하나 있다 — **`ffmpeg`** (비디오 재인코딩). 파이썬 패키지가 아니라 따로 깔려
 있어야 한다 (학습 서버 k8s Job 은 시작 시 `apt-get install -y ffmpeg` 를 한다).
@@ -95,16 +113,32 @@ next.truncated  시간 제한 종료 (bootstrapping 구분용)
 
 ```
 rd-rl/
-├── configs/config.yaml          # 사이트 설정 (양쪽 rd-rl 경로, 체크포인트 루트, k8s)
+├── configs/paths.sh             # 경로 설정 (source 해서 쓴다)
+├── modality/                    # RLDX modality.json (embodiment 별)
 ├── utils/convert_data.py        # LeRobot 비디오 다운스케일 (증분·병렬)
 ├── rl-dataset/                  # 변환된 데이터 (git 에는 디렉토리만)
 ├── pyproject.toml  uv.lock      # 의존성 (재현용)
 └── third_party/{RLDX-1,expo-ft} # submodule (pin)
 ```
 
-### configs/config.yaml
-한 번 쓰고 안 바뀌는 것만 넣는다. 롤아웃/teleop 경로와 실험 설정(task, base policy,
-하이퍼파라미터)은 **여기 없다** — 라운드마다 바뀌므로 명령어 인자 / 별도 설정으로 받는다.
+### configs/paths.sh
+경로를 셸 변수로 둔다. 파서가 필요 없고 `kubectl` 명령에 그대로 꽂힌다.
+
+```bash
+source configs/paths.sh
+
+# base 정책 받아오기 (learner → local)
+kubectl -n $RDRL_NS cp $RDRL_POD:$RDRL_LEARNER_CKPT/$RDRL_BASE_POLICY \
+                       $RDRL_LOCAL_CKPT/$RDRL_BASE_POLICY
+
+# 데이터 올리기 (local → learner). kubectl cp 는 없는 원격 경로에 못 쓰므로 부모를 먼저 만든다
+kubectl -n $RDRL_NS exec $RDRL_POD -- mkdir -p $RDRL_LEARNER_DS/r0
+kubectl -n $RDRL_NS cp $RDRL_LOCAL_DS/r0/openarm_rh56f1_teleop \
+                       $RDRL_POD:$RDRL_LEARNER_DS/r0/openarm_rh56f1_teleop
+```
+
+한 번 쓰고 안 바뀌는 것만 둔다. 롤아웃/teleop 원본 경로와 실험 설정(task, 하이퍼파라미터)은
+**여기 없다** — 라운드마다 바뀌므로 명령어 인자로 받는다.
 
 ### utils/convert_data.py
 ```bash
@@ -113,6 +147,8 @@ python utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/0815_openarm_rh56
 SRC 하위의 LeRobot 데이터셋들을 `OUT/<SRC 이름>/<데이터셋 이름>_320x192/` 로 미러링.
 `data/`·`meta/` 는 그대로 복사하고 `meta/info.json` 의 해상도만 패치한다. 재실행은 증분
 (이미 변환된 것은 건너뛰고, 에피소드가 늘어난 데이터셋은 없는 비디오만 변환).
+`--modality <파일>` 을 주면 각 데이터셋의 `meta/modality.json` 으로 설치한다 (RLDX 가 요구하는
+파일이고 rrc 는 만들지 않는다). 이미 변환된 데이터셋에도 넣으므로 나중에 따로 추가할 수 있다.
 주요 옵션: `-s 320x192` `-j <병렬>` `--dry-run` `--force` `--keep-info`
 
 ## 남은 것
