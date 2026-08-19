@@ -1,0 +1,7 @@
+[submodule "third_party/RLDX-1"]
+	path = third_party/RLDX-1
+	url = git@github.com:junmocho-lab/RLDX-1.git
+	branch = junmo/cjl-v6
+[submodule "third_party/expo-ft"]
+	path = third_party/expo-ft
+	url = git@github.com:junmocho-lab/expo-ft.git
