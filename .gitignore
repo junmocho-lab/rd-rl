@@ -1,0 +1,4 @@
+# 데이터는 git 에 올리지 않는다 (전송은 kubectl cp, 보관은 로컬/DDN).
+# .gitkeep 만 추적해서 디렉토리 자체는 clone 에 남긴다.
+rl-dataset/*
+!rl-dataset/.gitkeep
