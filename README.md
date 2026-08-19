@@ -25,6 +25,14 @@
    kubectl cp $A_DS/r0 $L_POD:$L_DS/r0
    ```
 
+# BC Recipe
+```
+uv run ./utils/convert_data.py ~/Code/rrc-release/data/user/0819/openarm_rh56f1_teleop/ -o ~/ws/
+junmo_cho/dataset/0819_openarm_rh56f1_teleop --modality modality/openarm_lefthand/modality.json
+```
+```
+kubectl cp ~/ws/junmo_cho/dataset/0819_openarm_rh56f1_teleop junmo-cho-data-pod:/data/junmo_cho/workspace/datasets/0819_openarm_rh56f1_teleop
+```
 
 
 
