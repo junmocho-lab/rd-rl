@@ -2,3 +2,7 @@
 # .gitkeep 만 추적해서 디렉토리 자체는 clone 에 남긴다.
 rl-dataset/*
 !rl-dataset/.gitkeep
+
+# python
+.venv/
+__pycache__/

@@ -1,0 +1,16 @@
+[project]
+name = "rd-rl"
+version = "0.1.0"
+description = "actor(로컬 롤아웃) ↔ learner(클러스터 학습) 동기 RL 루프 오케스트레이션"
+requires-python = ">=3.11"
+dependencies = [
+    # configs/config.yaml 파싱
+    "pyyaml>=6.0",
+    # utils/convert_data.py 의 비디오 디코딩/리사이즈.
+    # headless: GUI(imshow) 를 쓰지 않으므로 학습 서버·헤드리스 환경에서도 그대로 돈다.
+    "opencv-python-headless>=4.10",
+]
+
+[tool.uv]
+# 스크립트+설정 모음이라 이 repo 자체를 패키지로 설치하지 않는다 (빌드 백엔드 불필요).
+package = false

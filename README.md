@@ -3,10 +3,10 @@
 # 실행 순서
 
 0. rd-rl git clone 받고 각 submodule 및 .venv 세팅 
-1. config 세팅 
+1. config 세팅 (각 경로를 확실하게 세팅)
 2. teleop data 세팅 (post-training에 활용)
    ```
-   asd
+   
    ```
 
 
@@ -35,6 +35,28 @@ rrc-release 와의 접점은 두 개뿐:
 - **데이터**: rrc 가 LeRobot 포맷으로 저장한 디렉토리를 읽는다 (경로는 명령어 인자로 받는다)
 - **정책**: rrc 의 ZMQ 클라이언트(`rrc/inference/zmq_client.py`, `RldxCodec`, 기본 포트 5555)가
   rd-rl 이 띄운 정책 서버에 붙는다 — rrc 쪽은 host/port 만 보면 된다
+
+## 설치
+
+의존성은 [uv](https://docs.astral.sh/uv/) 로 관리한다 (`pyproject.toml` + `uv.lock`).
+**다른 머신에서 같은 세팅을 재현하려면**:
+
+```bash
+git clone --recurse-submodules git@github.com:junmocho-lab/rd-rl.git
+cd rd-rl
+uv sync          # .python-version(3.12) 의 파이썬까지 uv 가 받아온다
+```
+
+`uv.lock` 이 커밋돼 있어서 패키지 버전이 정확히 같은 `.venv/` 가 만들어진다. 실행은:
+
+```bash
+uv run python utils/convert_data.py ...      # 또는 .venv/bin/python
+```
+
+그 머신에 맞게 **`configs/config.yaml` 의 경로는 고쳐야 한다.**
+
+시스템 의존성이 하나 있다 — **`ffmpeg`** (비디오 재인코딩). 파이썬 패키지가 아니라 따로 깔려
+있어야 한다 (학습 서버 k8s Job 은 시작 시 `apt-get install -y ffmpeg` 를 한다).
 
 ## 라운드 한 바퀴 순서
 
@@ -75,6 +97,8 @@ next.truncated  시간 제한 종료 (bootstrapping 구분용)
 rd-rl/
 ├── configs/config.yaml          # 사이트 설정 (양쪽 rd-rl 경로, 체크포인트 루트, k8s)
 ├── utils/convert_data.py        # LeRobot 비디오 다운스케일 (증분·병렬)
+├── rl-dataset/                  # 변환된 데이터 (git 에는 디렉토리만)
+├── pyproject.toml  uv.lock      # 의존성 (재현용)
 └── third_party/{RLDX-1,expo-ft} # submodule (pin)
 ```
 
