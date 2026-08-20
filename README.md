@@ -40,8 +40,37 @@
 
    ── 여기부터 7~10을 라운드마다 반복 ──
 
-7. 정책 서버 띄우기 (round 0 은 base BC, 이후는 10에서 회수한 산출물) — **⬜ 미구현**
-   rrc 의 ZMQ 클라이언트가 붙는다. 후보 N개 뽑기 + edit 더하기 + Q argmax + RTC prefix.
+7. 정책 서버 띄우기 (rrc 의 ZMQ 클라이언트가 붙는다)
+   ```
+   cd third_party/RLDX-1
+   PYTHONPATH="$PWD:$A_RL" pixi run -e rldx python -u -m rl.vla_rldx serve \
+       --exp openarm_rim \
+       --model-path $A_CKPT/0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
+       --modality $A_RL/modality/openarm_lefthand/modality.json \
+       --artifacts $A_CKPT/expo/<run id>/r<NNN>/critic.pt \
+       --host 127.0.0.1 --port 5555
+   ```
+   (`--artifacts` 를 만드는 learner 쪽은 아직 stub 이다 — 아래 참고. round 0 은 안 쓴다.)
+
+   `--model-path` 는 **base BC 정책**이고 라운드가 지나도 바뀌지 않는다. 라운드마다 바뀌는 것은
+   `--artifacts` (critic + 인코더 + edit policy) 다. **round 0 은 `--artifacts` 없이** 띄운다 —
+   랜덤 critic·랜덤 residual 로 수집하는 EXPO-FT 의 warmup 과 같은 조건이고, edit 이 액션을
+   흔들어주는 덕에 탐색 데이터가 생긴다 (base BC 보다 성공률은 낮다).
+
+   `action_horizon` / `replan_steps` / `inference_latency` / `explore_groups` / EXPO 값은
+   전부 `--exp` 의 yaml 에서 읽는다. RTC 는 `--rtc-inference-mode trained` (기본) 이고 지연은
+   yaml 의 `inference_latency` 를 쓴다 — RLDX 원본 서버의
+   `--rtc-inference-delay` 를 따로 줄 필요가 없다.
+
+   RLDX 원본(`rldx/eval/run_rldx_server.py`) 과 다른 점은 청크를 **고르는** 단계 하나뿐이다:
+   ```
+   unbatch → 프로세서 → RTC prefix 주입 → [추론] → RTC 캐시 → 디코드
+                                          ↑ 여기서 백본 1회 + 디노이저 N회 → 후보 N개
+                                            + edit 후보 → target critic argmax
+   ```
+   실측 (로컬 5090, openarm base 정책, N=8+edit 8): **첫 회 639ms, 이후 121ms/회** (예산 400ms).
+   `[EXPO] #12 88ms 후보 8+8 → 11 (edit) Q=+0.017 후보간 Q std=0.001` 형태로 라운드마다
+   선택 상태가 로그에 남는다. **후보간 Q std** 가 이 루프의 핵심 지표다 (아래 참고).
 
 8. 롤아웃 + 사람이 에피소드별 성공/실패 라벨 (rrc-release) → 2번처럼 변환
    ```
@@ -80,13 +109,32 @@ learner 는 **READY 가 있고 DONE/FAILED 가 없는 가장 작은 번호**를 
 이유는 `kubectl cp` 가 원자적이지 않아서다 — learner 가 READY 의 숫자를 디스크와 대조해 절반만
 도착한 라운드를 걸러낸다.
 
+## 후보간 Q std — 이 루프가 되는지 보는 지표
+
+EXPO 는 후보 액션들을 critic 으로 줄 세워 고른다. 그래서 **critic 이 액션을 구분하지 못하면
+argmax 가 무작위**가 되고 루프 전체가 base BC 와 같아진다. 서버 로그의 `후보간 Q std` 가 그것이다.
+
+지금 상태 (Phase D critic 20k step, openarm):
+
+```
+후보간 Q std        0.0012      ← 사실상 0. argmax 가 무작위다
+base 후보 다양성    std 0.0275  ← 같은 관측에서 8개를 뽑아도 이만큼밖에 안 벌어진다
+edit_scale         0.2         ← edit 이 흔드는 크기 (base 다양성의 7배)
+```
+
+원인은 학습 데이터에 **"같은 상황에서 다르게 행동해본" 기록이 없다**는 것이다. BC 정책이 거의
+결정론적이라 Q 가 사실상 V(s) 로 수렴한다. 이걸 푸는 것이 라운드를 도는 이유다 — edit 이 실제로
+실행되고 그 결과가 라벨링되면서 critic 이 처음으로 액션의 좋고 나쁨을 볼 재료를 얻는다.
+라운드가 지나며 이 숫자가 커지는지 보면 된다.
+
 ## 아직 stub 인 것
 
 - **learner 의 학습** — 지금 `learner/loop.py` 는 왕복(감지 → 검증 → 산출물 → DONE)만 검증하는
   `export_stub` 이다. 실제 `update()` 로 교체해야 한다: 라운드 누적 리플레이 버퍼 →
   `rl/data.py` × `rl/expo.py` × `rl/vla_rldx.py`, 산출물(LoRA + critic + encoder + residual +
   temperature ≈ 120MB) export, 주기적 체크포인트
-- **정책 서버** (7번) — 새 라운드가 오면 13.8GB 백본 재로드 없이 핫리로드해야 한다
+- **정책 서버 핫리로드** — 지금은 라운드마다 서버를 다시 띄워야 한다 (백본 13.8GB 로드에
+  약 40초). `--artifacts` 만 다시 읽으면 되므로 나중에 붙인다
 - **GPU 잡 yaml** — `k8s/learner.yaml` 은 CPU 전용이고 learner 환경도 py3.10(RLDX-1) 로 맞춰야 한다
 
 # BC Recipe

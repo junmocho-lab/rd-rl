@@ -177,24 +177,27 @@ class EXPOLearner:
         return self.critic.subsample(self.cfg.num_min_qs, self.gen)
 
     # --- 후보 생성 + Q argmax (원본 sample_batch_actions) --------------------
-    def candidate_actions(self, vla_obs, latent: torch.Tensor, state: torch.Tensor,
-                          ) -> tuple[torch.Tensor, dict]:
-        """next_obs 에서 후보 N + n_edit 개를 만들고 target critic 으로 argmax.
+    def select_from_chunks(self, chunks: torch.Tensor, latent: torch.Tensor, state: torch.Tensor,
+                           ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """이미 만들어진 후보 청크 (B,N,H,A) → 실행 구간 argmax.
 
-        원본과 달리 base N 개를 잘라내지 않고 그대로 유지한 뒤 edit 을 덧붙인다
-        (원본 롤아웃 경로는 N == n_edit_samples 를 가정하는 버그가 있다).
+        반환 (chosen (B,full), best (B,), info). best < N 이면 base 후보 그 자체,
+        best >= N 이면 base 후보 (best-N) 에 edit 을 더한 것이다.
+
+        샘플링과 분리해 둔 이유: 정책 서버는 후보를 RLDX 추론 파이프라인(RTC prefix 주입
+        포함)에서 이미 받아 놓으므로 다시 sample() 을 부르면 안 된다. 그리고 서버는 best
+        인덱스로 원래 청크를 되찾아 실행 구간만 갈아끼운다 (청크 전체를 돌려줘야 한다).
         """
         c = self.cfg
         B = latent.shape[0]
-        with torch.no_grad():
-            chunks = self.vla.sample(vla_obs, num_samples=c.N)              # (B,N,H,A)
         # RTC 지연: 앞 latency 개는 prefix 가 붙잡아 후보끼리 거의 같다. 실제로 실행되고
         # 후보끼리 다른 구간 [latency, latency+replan) 만 critic 에 넣는다.
         s = self.latency
-        acts = chunks[:, :, s:s + self.replan_steps].reshape(B, c.N, -1)     # (B,N,full)
+        n_base = chunks.shape[1]
+        acts = chunks[:, :, s:s + self.replan_steps].reshape(B, n_base, -1)  # (B,N,full)
 
         if c.n_edit_samples > 0:
-            k = min(c.n_edit_samples, c.N)
+            k = min(c.n_edit_samples, n_base)
             base = acts[:, :k].reshape(B * k, -1)
             rep_lat = latent.repeat_interleave(k, 0)
             rep_st = state.repeat_interleave(k, 0)
@@ -211,12 +214,25 @@ class EXPOLearner:
             q = qs.min(dim=0).values.view(B, total)
         best = q.argmax(dim=1)
         chosen = acts[torch.arange(B, device=acts.device), best]
-        with_edit = (best >= c.N).float()
-        return chosen, {
+        with_edit = (best >= n_base).float()
+        return chosen, best, {
             "select_ratio_with_residual": float(with_edit.mean()),
             "select_ratio_without_residual": float(1 - with_edit.mean()),
             "candidate_q_std": float(q.std(dim=1).mean()),   # 후보 간 Q 분산 (0 이면 critic 이 액션을 구분 못함)
+            "chosen_q": float(q.gather(1, best[:, None]).mean()),
         }
+
+    def candidate_actions(self, vla_obs, latent: torch.Tensor, state: torch.Tensor,
+                          ) -> tuple[torch.Tensor, dict]:
+        """관측에서 후보 N + n_edit 개를 만들고 target critic 으로 argmax.
+
+        원본과 달리 base N 개를 잘라내지 않고 그대로 유지한 뒤 edit 을 덧붙인다
+        (원본 롤아웃 경로는 N == n_edit_samples 를 가정하는 버그가 있다).
+        """
+        with torch.no_grad():
+            chunks = self.vla.sample(vla_obs, num_samples=self.cfg.N)        # (B,N,H,A)
+        chosen, _, info = self.select_from_chunks(chunks, latent, state)
+        return chosen, info
 
     # --- critic (원본 update_critic) ----------------------------------------
     def update_critic(self, b: dict) -> dict:
