@@ -462,19 +462,52 @@ def video_path(session: Path, key: str, episode: int, chunk_size: int = 1000) ->
     return session / "videos" / f"chunk-{episode // chunk_size:03d}" / key / f"episode_{episode:06d}.mp4"
 
 
-def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality) -> dict:
-    """(T, n_cams, H, W, 3) uint8 memmap 을 flat 과 같은 순서로 채운다."""
+def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality,
+                 resume: bool = True) -> dict:
+    """(T, n_cams, H, W, 3) uint8 memmap 을 flat 과 같은 순서로 채운다.
+
+    resume=True 면 기존 memmap 의 세션 목록이 새 목록의 **접두사**일 때 그 부분을 다시
+    디코딩하지 않고 뒤에만 이어붙인다. 라운드마다 몇 에피소드씩 늘어나는 학습 버퍼용이다
+    — fuji 는 프레임당 553KB(카메라 3개)라 매 라운드 전체 재디코딩은 수십 GB 를 다시 쓴다.
+    세션 순서가 바뀌거나 카메라·해상도가 달라지면 접두사가 깨진 것으로 보고 전체를 다시
+    만든다 (조용히 어긋난 프레임을 쓰는 것보다 낫다).
+    """
     from rldx.utils.video_utils import get_frames_by_indices
 
     keys = video_keys(sessions[0], mod)
     H, W = image_shape(sessions[0], mod)
     T = len(flat)
+    shape = (T, len(keys), H, W, 3)
+    nbytes = T * len(keys) * H * W * 3
     out.parent.mkdir(parents=True, exist_ok=True)
-    mm = np.memmap(out, dtype=np.uint8, mode="w+", shape=(T, len(keys), H, W, 3))
 
-    pos = ep_global = 0
+    n_done = 0
+    meta_path = out.with_suffix(".json")
+    if resume and out.is_file() and meta_path.is_file():
+        old = json.loads(meta_path.read_text())
+        names = [p.name for p in sessions]
+        k = len(old.get("sessions", []))
+        old_bytes = 1
+        for d in old.get("shape", [0]):
+            old_bytes *= int(d)
+        if (old.get("keys") == keys and list(old.get("shape", [])[1:]) == list(shape[1:])
+                and k <= len(names) and old["sessions"] == names[:k]
+                and out.stat().st_size == old_bytes):
+            n_done = k
+
+    if n_done:
+        pos = int((flat.session < n_done).sum())
+        ep_global = int(np.unique(flat.episode[flat.session < n_done]).size)
+        with out.open("r+b") as f:                    # 늘리기만 한다 — 앞부분은 그대로
+            f.truncate(nbytes)
+        mm = np.memmap(out, dtype=np.uint8, mode="r+", shape=shape)
+        print(f"  이어받기: 세션 {n_done}개 / {pos} 프레임은 그대로 두고 뒤에 붙인다")
+    else:
+        pos = ep_global = 0
+        mm = np.memmap(out, dtype=np.uint8, mode="w+", shape=shape)
+
     t0 = time.time()
-    for path in sessions:
+    for path in sessions[n_done:]:
         n_ep = len(sorted(path.glob("data/chunk-*/episode_*.parquet")))
         for e in range(n_ep):
             L = flat.ep_length[ep_global]
@@ -488,9 +521,9 @@ def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality) -> 
             ep_global += 1
         print(f"  {path.name}: {n_ep} 에피소드  누적 {pos}/{T} 프레임  {time.time()-t0:.0f}s")
     mm.flush()
-    meta = {"path": str(out), "shape": [T, len(keys), H, W, 3], "dtype": "uint8",
+    meta = {"path": str(out), "shape": list(shape), "dtype": "uint8",
             "keys": keys, "sessions": [p.name for p in sessions],
-            "bytes": T * len(keys) * H * W * 3, "seconds": round(time.time() - t0, 1)}
+            "bytes": nbytes, "seconds": round(time.time() - t0, 1)}
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
 

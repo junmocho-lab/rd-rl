@@ -1,11 +1,10 @@
-# rd-rl learner — 상시 대기 잡 (현재는 학습 stub, CPU 만).
+# rd-rl learner — 상시 대기 잡 (GPU 1개).
 #
 # 시작하면 먼저 θ₀ (critic + 인코더 + edit policy + temperature) 를
 # $L_CKPT/expo/<run id>/init/ 로 내보낸다. actor 가 그것을 받아 round 0 을 돈다
 # (./actor/recv_round.py --round init).
 #
-# 라운드 메일박스를 폴링하다가 actor 가 READY 를 올리면 검증 → (학습) → DONE 을 쓴다.
-# 실제 학습을 붙일 때 바뀌는 것은 두 곳뿐: resources 에 GPU 추가, activeDeadlineSeconds 를 48h.
+# 라운드 메일박스를 폴링하다가 actor 가 READY 를 올리면 검증 → 학습 → DONE 을 쓴다.
 #
 #   제출: ./actor/start_learner.sh [실험이름]
 #         (이 yaml 은 __RUN_ID__ / __JOB_NAME__ 플레이스홀더가 있어 직접 apply 하면 안 된다)
@@ -31,7 +30,7 @@ spec:
   ttlSecondsAfterFinished: 3600
   # DeadlineExceeded 는 재시도되지 않는다 (다시 apply 해야 한다). 상태는 DDN 에 있으므로
   # 재제출하면 DONE/FAILED 없는 라운드부터 이어받는다.
-  activeDeadlineSeconds: 86400 # 24h. 실제 학습 잡은 172800 (48h)
+  activeDeadlineSeconds: 172800 # 48h
   backoffLimit: 3
   template:
     metadata:
@@ -96,5 +95,8 @@ spec:
             - name: ddn
               mountPath: /data
           resources:
-            requests: { cpu: "100m", memory: "512Mi" }
-            limits: { cpu: "500m", memory: "4Gi" }
+            # GPU 1개면 된다 — 백본은 동결이고 학습 대상은 action expert LoRA(4.78M) +
+            # critic 앙상블 + 인코더뿐이다. 백본 13.8GB 를 올려 추론만 돌린다.
+            # 메모리는 백본 + uint8 이미지 배치(64프레임 × 카메라수) 기준.
+            requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }
+            limits: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }

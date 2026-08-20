@@ -350,6 +350,15 @@ class ExpoServer:
             if k in sd:
                 m.load_state_dict(sd[k])
                 got.append(k)
+        if sd.get("lora"):
+            # r000 부터는 학습된 action expert LoRA 가 들어온다 (init/ 에는 없다 — 주입
+            # 직후 델타가 0 이라 base BC 와 같기 때문). 로드하려면 먼저 주입해야 한다.
+            # setup_training 이 옵티마이저도 만들지만 서빙에서는 쓰지 않는다.
+            self.vla.setup_training(lora=True)
+            r = self.vla.model.load_state_dict(sd["lora"], strict=False)
+            if r.unexpected_keys:
+                raise SystemExit(f"lora 키가 모델에 없다: {r.unexpected_keys[:3]}")
+            got.append(f"lora({len(sd['lora'])}텐서)")
         if not got:
             raise SystemExit(f"{path} 에 쓸 수 있는 키가 없다 (있는 키: {sorted(sd)})")
         return got

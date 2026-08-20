@@ -343,16 +343,37 @@ class EXPOLearner:
         return self.candidate_actions(vla_obs, lat, state)
 
 
+def _sub(v, sl: slice):
+    """배치 축을 따라 자른다. tensor / ndarray / list / 중첩 dict 를 모두 다룬다."""
+    if torch.is_tensor(v):
+        return v[sl]
+    if isinstance(v, (list, tuple)):
+        return v[sl]
+    if isinstance(v, dict):
+        return {k: _sub(x, sl) for k, x in v.items()}
+    if hasattr(v, "shape") and hasattr(v, "__getitem__"):      # numpy 등
+        return v[sl]
+    return v
+
+
 def _slice(b: dict, sl: slice) -> dict:
+    """미니배치 자르기.
+
+    vla_obs 는 {"video": {카메라: (B,1,H,W,3)}, "state": {...}, "language": {키: [[task]]*B}}
+    형태의 **중첩 numpy dict** 이므로 안쪽까지 잘라야 한다. 예전 구현은 batch_size 만
+    갈아끼웠는데 그건 DummyVLA(관측을 보지 않는다) 에서만 맞고, 실제 RLDXVLA 에서는
+    critic 미니배치 n 개에 대해 후보를 B=total 개 뽑아 latent 와 shape 이 어긋난다.
+    """
+    n = sl.stop - sl.start
     out = {}
     for k, v in b.items():
-        if torch.is_tensor(v):
-            out[k] = v[sl]
-        elif isinstance(v, dict) and k.startswith("vla_"):
-            out[k] = {"batch_size": (sl.stop - sl.start), **{kk: vv for kk, vv in v.items()
-                                                             if kk != "batch_size"}}
+        if isinstance(v, dict) and k.startswith("vla_"):
+            sliced = _sub(v, sl)
+            if "batch_size" in v:                              # DummyVLA 용
+                sliced["batch_size"] = n
+            out[k] = sliced
         else:
-            out[k] = v
+            out[k] = _sub(v, sl)
     return out
 
 

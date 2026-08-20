@@ -322,6 +322,248 @@ def export_init(ckpt_exp: Path, log: Log, args) -> None:
     log(f"[init] DONE → {out}  (actor: ./actor/recv_round.py --round init)")
 
 
+class Trainer:
+    """라운드 학습. VLA(13.8GB)·학습기·버퍼는 프로세스 수명 동안 한 번만 만든다.
+
+    버퍼는 $L_RUNS/<exp>/buffer/ 에 둔다:
+        sessions.json     ingest 순서의 세션 경로 — **이 순서가 memmap 의 프레임 순서다**
+        images.mm(.json)  디코딩된 uint8 프레임 (라운드마다 뒤에만 붙는다)
+        actnorm.npy       모델 공간으로 정규화된 액션 청크 (critic 입력)
+
+    액션 공간 규약이 제일 중요하다:
+        critic / residual 의 action  → **모델 공간**. vla.sample() 이 내는 후보와 같은
+                                       공간이어야 Q argmax 가 의미를 갖는다
+        actor BC 의 target           → **raw LeRobot**. vla.train_step 이 안에서 정규화한다
+    뒤집으면 에러 없이 조용히 학습이 망가진다.
+
+    학습 때 RTC 는 끈다 (rtc_inference_mode="none"). EXPO-FT 의 타깃 계산은 prefix 없이
+    후보를 뽑고, critic 이 보는 구간은 어차피 [latency, latency+replan) 로 같다.
+    """
+
+    def __init__(self, args, log: Log):
+        self.args, self.log = args, log
+        self.buf = args.runs_root / args.exp / "buffer"
+        self.ckpt_exp = args.ckpt_root / "expo" / args.exp
+        self.built = False
+        self.flat = self.imgs = self.actnorm = None
+        self.task = ""
+
+    # --- 1회 생성 -----------------------------------------------------------
+    def _build(self) -> None:
+        if self.built:
+            return
+        import torch
+        import numpy as np
+        import yaml
+
+        from rl.data import resolve_modality
+        from rl.expo import EXPOLearner, ExpoConfig
+        from rl.nets import explore_spec
+        from rl.vla_rldx import RLDXVLA
+
+        repo = Path(self.args.repo)
+        cfg_path = Path(self.args.exp_config)
+        if not cfg_path.is_absolute():
+            cfg_path = repo / cfg_path
+        exp = yaml.safe_load(cfg_path.read_text())
+        self.exp = exp
+        self.repo = repo
+        self.replan = int(exp["replan_steps"])
+        self.latency = int(exp["inference_latency"])
+        self.horizon = int(exp["action_horizon"])
+        self.rnd_cfg = exp.get("round") or {}
+        self.rldx_root = repo / "third_party" / "RLDX-1"
+
+        base = self.args.ckpt_root / exp["base_policy"]
+        if not base.is_dir():
+            raise SystemExit(f"base 정책이 없다: {base}  (configs/exp 의 base_policy 확인)")
+        mod, src = resolve_modality(repo, repo / exp["modality"], self.rldx_root,
+                                    exp["rldx_data_config"], base)
+        self.mod = mod
+        self.cfg = ExpoConfig.from_dict(exp.get("expo"))
+        spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
+                            mod.action_dim, self.replan)
+        self.log(f"[학습] {src}")
+        self.log(f"[학습] 정책 로드 {base.name}")
+        t0 = time.time()
+        self.vla = RLDXVLA(base, mod, self.rldx_root, exp["rldx_data_config"],
+                           device="cuda", rtc_inference_mode="none")
+        info = self.vla.setup_training(lr=float((exp.get("vla") or {}).get("lora_lr", 3e-4)))
+        self.L = EXPOLearner(self.vla, spec, mod.state_dim, mod.n_cams, self.replan, self.cfg,
+                             device="cuda", seed=int(self.args.seed), latency=self.latency)
+        self.log(f"[학습] {time.time()-t0:.0f}s  LoRA {info['trainable_params']/1e6:.2f}M "
+                 f"(백본 trainable {info['backbone_trainable_tensors']})  "
+                 f"탐색 {list(spec.groups)} {spec.active_dim}/{mod.action_dim}차원")
+        self._load_theta()
+        self.rng = np.random.default_rng(int(self.args.seed))
+        self.built = True
+
+    def _latest_theta(self) -> Path | None:
+        """가장 최근 산출물. 프로세스가 살아있는 동안은 메모리 상태가 최신이지만, Job 이
+        재시작하면 여기서 이어받아야 한다."""
+        cands = sorted(self.ckpt_exp.glob("r*/theta.pt"))
+        if cands:
+            return cands[-1]
+        p = self.ckpt_exp / "init" / "theta.pt"
+        return p if p.is_file() else None
+
+    def _load_theta(self) -> None:
+        import torch
+        path = self._latest_theta()
+        if path is None:
+            self.log("[학습] 이어받을 산출물이 없다 — 방금 만든 θ 로 시작한다")
+            return
+        sd = torch.load(path, map_location=self.L.device, weights_only=True)
+        pairs = {"enc": self.L.encoder, "critic": self.L.critic, "target": self.L.target_critic,
+                 "residual": self.L.residual, "temp": self.L.temp}
+        got = [k for k in pairs if k in sd]
+        for k in got:
+            pairs[k].load_state_dict(sd[k])
+        if "lora" in sd:
+            missing = self.vla.model.load_state_dict(sd["lora"], strict=False)
+            got.append(f"lora({len(sd['lora'])}텐서)")
+            if missing.unexpected_keys:
+                raise SystemExit(f"lora 키가 모델에 없다: {missing.unexpected_keys[:3]}")
+        self.log(f"[학습] 이어받기 {path.parent.name}/{path.name} → {got}")
+
+    # --- 버퍼 ---------------------------------------------------------------
+    def ingest(self, round_dir: Path) -> dict:
+        import numpy as np
+        from rl.data import build_flat, build_images, find_sessions, open_images
+        from rl.offline_critic import normalize_all
+
+        self.buf.mkdir(parents=True, exist_ok=True)
+        manifest = self.buf / "sessions.json"
+        known = json.loads(manifest.read_text()) if manifest.is_file() else []
+        have = {Path(p).name for p in known}
+        new = [str(s) for s in find_sessions(round_dir / "dataset") if s.name not in have]
+        if new:
+            known += new
+            manifest.write_text(json.dumps(known, indent=2) + "\n")
+        paths = [Path(p) for p in known]
+        gone = [p for p in paths if not p.is_dir()]
+        if gone:
+            raise SystemExit(f"버퍼에 등록된 세션이 사라졌다 (순서가 깨지면 memmap 이 어긋난다): "
+                             f"{[p.name for p in gone][:3]}")
+        self.log(f"[버퍼] 새 세션 {len(new)}개 / 누적 {len(paths)}개")
+
+        self.flat = build_flat(paths, self.mod)
+        build_images(paths, self.flat, self.buf / "images.mm", self.mod, resume=True)
+        self.imgs, _ = open_images(self.buf / "images.mm")
+        self.actnorm = normalize_all(self.vla, self.flat, self.horizon,
+                                     cache=self.buf / "actnorm.npy")
+        tasks = json.loads((paths[0] / "meta" / "tasks.jsonl").read_text().splitlines()[0])
+        self.task = tasks["task"]
+
+        self.succ_idx = np.nonzero(self.flat.is_success)[0]
+        n_ep = len(self.flat.ep_length)
+        n_succ_ep = int(sum(self.flat.ep_success))
+        self.log(f"[버퍼] 프레임 {len(self.flat)}  에피소드 {n_ep} (성공 {n_succ_ep})  "
+                 f"성공 프레임 {len(self.succ_idx)}")
+        return {"sessions": len(paths), "new_sessions": len(new), "frames": len(self.flat),
+                "episodes": n_ep, "success_episodes": n_succ_ep}
+
+    # --- 배치 ---------------------------------------------------------------
+    def _batch(self, n: int, success_only: bool = False) -> dict:
+        import torch
+        import numpy as np
+        from rl.data import make_batch
+
+        # 마지막 replan_steps 프레임은 뽑지 않는다 — nstep 이 t+replan 까지 읽으므로
+        # 버퍼 끝을 넘어간다 (rl/offline_critic.py 와 rl/expo.py 의 표본 추출도 같은 규칙).
+        hi = len(self.flat) - self.replan
+        if hi <= 0:
+            raise SystemExit(f"버퍼가 너무 작다: {len(self.flat)} 프레임 <= replan {self.replan}")
+        if success_only:
+            pool = self.succ_idx[self.succ_idx < hi]
+            if len(pool) == 0:
+                raise SystemExit("actor_success_only 인데 쓸 수 있는 성공 프레임이 0개다 "
+                                 "(round.seed_teleop_episodes 로 성공 시연을 시드할 것)")
+            idx = pool[self.rng.integers(0, len(pool), size=n)]
+        else:
+            idx = self.rng.integers(0, hi, size=n)
+        b = make_batch(self.flat, self.imgs, idx, self.mod, replan_steps=self.replan,
+                       action_horizon=self.horizon, discount=self.cfg.discount,
+                       task=self.task, latency=self.latency)
+        # critic 이 보는 액션만 모델 공간으로 갈아끼운다. full_action(actor BC 대상) 은 raw.
+        L, R, A = self.latency, self.replan, self.mod.action_dim
+        b["action"] = self.actnorm[idx][:, L:L + R].reshape(len(idx), R * A)
+        dev = self.L.device
+        out = {}
+        for k, v in b.items():
+            if k in ("full_action", "vla_obs", "vla_next_obs"):
+                out[k] = v                                   # numpy 로 둔다 (VLA 가 받는다)
+            elif isinstance(v, np.ndarray):
+                out[k] = torch.from_numpy(np.ascontiguousarray(v)).to(dev)
+            else:
+                out[k] = v
+        return out
+
+    # --- 라운드 -------------------------------------------------------------
+    def run_round(self, round_dir: Path, ckpt_round: Path, stats: dict, ready: dict) -> None:
+        self._build()
+        buf = self.ingest(round_dir)
+        c, rc = self.cfg, self.rnd_cfg
+        min_ep = int(rc.get("min_online_episodes", 0))
+        n_updates = int(rc.get("updates_per_episode", 1)) * int(stats["episodes"])
+        if buf["episodes"] < min_ep:
+            self.log(f"[학습] 에피소드 {buf['episodes']} < min_online_episodes {min_ep} — "
+                     "이번 라운드는 버퍼에만 넣고 학습은 건너뛴다 (EXPO-FT can_update)")
+            n_updates = 0
+
+        t0 = time.time()
+        last: dict = {}
+        for i in range(n_updates):
+            last = self.L.update(self._batch(c.batch_size * c.utd_ratio),
+                                 actor_batch=(self._batch(c.batch_size, success_only=True)
+                                              if c.actor_success_only else None))
+            if i == 0 or (i + 1) % 5 == 0 or i == n_updates - 1:
+                self.log(f"  [{i+1}/{n_updates}] critic_loss={last.get('critic_loss', 0):.4f} "
+                         f"q={last.get('q', 0):+.3f} q_max={last.get('q_max', 0):+.3f} "
+                         f"actor_loss={last.get('actor_loss', 0):.4f} "
+                         f"후보Q std={last.get('candidate_q_std', 0):.4f} "
+                         f"edit선택={last.get('select_ratio_with_residual', 0):.2f} "
+                         f"{(time.time()-t0)/(i+1):.1f}s/회")
+        if n_updates:
+            self.log(f"[학습] {n_updates}회 {time.time()-t0:.0f}s  steps={self.L.steps}")
+            if last.get("q_max", 0) > 1.2:
+                self.log(f"  [경고] q_max={last['q_max']:.2f} > 1.2 — sparse terminal reward 의 "
+                         "리턴 상한이 1 이므로 발산 신호다")
+        self.export(ckpt_round, stats, ready, buf, n_updates, last)
+
+    def export(self, ckpt_round: Path, stats: dict, ready: dict, buf: dict,
+               n_updates: int, last: dict) -> None:
+        import torch
+        ckpt_round.mkdir(parents=True, exist_ok=True)
+        lora = {k: v.detach().cpu() for k, v in self.vla.model.state_dict().items()
+                if "lora_" in k}
+        theta = ckpt_round / "theta.pt"
+        torch.save({"enc": self.L.encoder.state_dict(), "critic": self.L.critic.state_dict(),
+                    "target": self.L.target_critic.state_dict(),
+                    "residual": self.L.residual.state_dict(), "temp": self.L.temp.state_dict(),
+                    "lora": lora}, theta)
+        sha = hashlib.sha256(theta.read_bytes()).hexdigest()
+        self.log(f"[산출물] theta.pt {theta.stat().st_size/1e6:.0f} MB "
+                 f"(lora {len(lora)}텐서)  sha256 {sha[:16]}")
+        write_atomic(ckpt_round / "meta.json", {
+            "round": ready.get("round"),
+            "collected_by": ready.get("collected_by"),
+            "dataset": {k: stats[k] for k in ("sessions", "episodes", "frames", "files", "bytes")},
+            "buffer": buf,
+            "updates": n_updates,
+            "steps": self.L.steps,
+            "metrics": {k: last[k] for k in sorted(last) if isinstance(last[k], float)},
+            "theta_sha256": sha,
+            "artifacts": ["theta.pt"],
+            "keys": ["enc", "critic", "target", "residual", "temp", "lora"],
+            "seed": int(self.args.seed),
+            "torch": torch.__version__,
+            "expo_deviations": self.cfg.deviations(),
+            "code": code_provenance(Path(self.args.repo)),
+            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+
+
 def export_stub(ckpt_round: Path, log: Log, args, stats: dict, ready: dict) -> None:
     """실제 학습이 붙기 전의 자리. actor recv 를 시험할 수 있게 더미 페이로드를 쓴다."""
     payload_dir = ckpt_round / "payload"
@@ -345,7 +587,8 @@ def export_stub(ckpt_round: Path, log: Log, args, stats: dict, ready: dict) -> N
 
 
 # --------------------------------------------------------------------------- #
-def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args) -> str:
+def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args,
+                  trainer: "Trainer | None" = None) -> str:
     log(f"[r{n:03d}] 감지: {round_dir}")
     fingerprint = ready_fingerprint(round_dir)
 
@@ -377,15 +620,29 @@ def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args) -> 
     log(f"[r{n:03d}] 검증 통과: 세션 {len(stats['sessions'])}개 / 에피소드 {stats['episodes']} / "
         f"프레임 {stats['frames']} / {stats['bytes']/1e6:.1f} MB")
 
-    # ── 실제 update() 가 들어갈 자리 ─────────────────────────────────────
-    planned = args.updates_per_episode * stats["episodes"]
-    log(f"[r{n:03d}] [STUB] 학습 생략. 실제로는 update() {planned}회 "
-        f"(에피소드당 {args.updates_per_episode})")
-    time.sleep(args.stub_seconds)
-    # ────────────────────────────────────────────────────────────────────
+    if trainer is not None:
+        try:
+            trainer.run_round(round_dir, ckpt_round, stats, ready)
+        except Exception as exc:                       # 학습 실패를 라운드 상태로 남긴다
+            import traceback
+            tb = traceback.format_exc()
+            write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                                 "reason": f"학습 실패: {exc}",
+                                                 "traceback": tb.splitlines()[-12:]})
+            for line in tb.splitlines()[-12:]:
+                log(f"[r{n:03d}]   {line}")
+            log(f"[r{n:03d}] FAILED — 학습 실패")
+            return "failed"
+        stub = False
+    else:
+        planned = args.updates_per_episode * stats["episodes"]
+        log(f"[r{n:03d}] [STUB] --exp-config 가 없어 학습을 생략한다. 실제로는 "
+            f"update() {planned}회")
+        time.sleep(args.stub_seconds)
+        export_stub(ckpt_round, log, args, stats, ready)
+        stub = True
 
-    export_stub(ckpt_round, log, args, stats, ready)
-    write_atomic(ckpt_round / "DONE", {"round": n, "stub": True, "ready_sha": fingerprint,
+    write_atomic(ckpt_round / "DONE", {"round": n, "stub": stub, "ready_sha": fingerprint,
                                        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
     log(f"[r{n:03d}] DONE → {ckpt_round}")
     return "done"
@@ -431,6 +688,12 @@ def main() -> int:
     # 폴링 전에 θ₀ 를 내보낸다 — actor 가 이걸 받아야 round 0 을 돌 수 있다.
     export_init(ckpt_exp, log, args)
 
+    # VLA(13.8GB) 와 학습기는 프로세스 수명 동안 한 번만 만든다 (라운드마다 재로드 금지).
+    # 실제 로드는 첫 라운드가 올 때 (_build) — 데이터가 없으면 GPU 를 점유하지 않는다.
+    trainer = Trainer(args, log) if args.exp_config else None
+    if trainer is None:
+        log("[경고] --exp-config 가 없어 학습 stub 으로 동작한다")
+
     last_beat = 0.0
     processed = 0
     while not _stop:
@@ -446,7 +709,7 @@ def main() -> int:
             continue
 
         n, round_dir = found
-        process_round(n, round_dir, ckpt_exp / round_dir.name, log, args)
+        process_round(n, round_dir, ckpt_exp / round_dir.name, log, args, trainer)
         processed += 1
         last_beat = 0.0
         if args.once:
