@@ -70,6 +70,8 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=0,
                    help="DONE 을 기다릴 최대 초. 0 = 무한")
     p.add_argument("--poll-seconds", type=float, default=5.0)
+    p.add_argument("--retries", type=int, default=3,
+                   help="kubectl cp 가 잘려 오면 지우고 다시 받는 횟수")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
 
@@ -134,18 +136,28 @@ def main() -> int:
     # 3) 로컬을 비우고 내려받는다 — kubectl cp 는 대상이 있으면 그 안에 넣어 중첩된다
     if not str(local_round).endswith(f"/{a.exp}/{rnd}") or len(a.exp) < 3:
         sys.exit(f"안전장치: 지우려는 경로가 예상과 다르다: {local_round}")
-    if local_round.exists():
-        print(f"기존 로컬 디렉토리 제거: {local_round}")
-        shutil.rmtree(local_round)
-    local_round.parent.mkdir(parents=True, exist_ok=True)
-    run(kube(a.namespace, "cp", f"{a.pod}:{remote_round}", str(local_round)))
+    # kubectl cp 는 큰 파일에서 "unexpected EOF" 로 조용히 실패하거나 반쯤 받은 파일을
+    # 남긴다 (파드가 바쁘면 더 잘 난다). 그래서 실패도 불일치도 같은 방식으로 다룬다:
+    # 지우고 다시 받는다. 라운드마다 166MB 를 받아야 하므로 사람이 재시도하게 두지 않는다.
+    for attempt in range(1, a.retries + 1):
+        if local_round.exists():
+            print(f"기존 로컬 디렉토리 제거: {local_round}")
+            shutil.rmtree(local_round)
+        local_round.parent.mkdir(parents=True, exist_ok=True)
+        run(kube(a.namespace, "cp", f"{a.pod}:{remote_round}", str(local_round)), check=False)
 
-    # 4) 대조
-    n_local, b_local = count_files(local_round)
-    if (n_local, b_local) != (n_remote, b_remote):
-        sys.exit(f"불일치 — 다시 실행하면 새로 내려받는다.\n"
-                 f"  원격 files={n_remote} bytes={b_remote}\n"
-                 f"  로컬 files={n_local} bytes={b_local}")
+        # 4) 대조
+        n_local, b_local = count_files(local_round)
+        if (n_local, b_local) == (n_remote, b_remote):
+            break
+        print(f"  [{attempt}/{a.retries}] 불일치 — 원격 files={n_remote} bytes={b_remote} / "
+              f"로컬 files={n_local} bytes={b_local}")
+        if attempt == a.retries:
+            sys.exit(f"{a.retries}회 시도해도 불일치. 파드가 바쁘면 반복될 수 있다.\n"
+                     f"  대안: kubectl -n {a.namespace} exec {a.pod} -- "
+                     f"tar cf - -C {Path(remote_round).parent} {rnd} | "
+                     f"tar xf - -C {local_round.parent}")
+        time.sleep(3)
     print(f"검증 OK: files={n_local} bytes={b_local}")
     print()
     print(f"산출물: {local_round}")
