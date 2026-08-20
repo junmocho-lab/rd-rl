@@ -26,14 +26,17 @@
    ```
 
 # BC Recipe
+## Openarm
 ```
-uv run ./utils/convert_data.py ~/Code/rrc-release/data/user/0819/openarm_rh56f1_teleop/ -o ~/ws/
-junmo_cho/dataset/0819_openarm_rh56f1_teleop --modality modality/openarm_lefthand/modality.json
+uv run ./utils/convert_data.py ~/Code/rrc-release/data/user/0819/openarm_rh56f1_teleop/ -o ~/ws/junmo_cho/dataset/0819_openarm_rh56f1_teleop --modality modality/openarm_lefthand/modality.json
 ```
 ```
 kubectl cp ~/ws/junmo_cho/dataset/0819_openarm_rh56f1_teleop junmo-cho-data-pod:/data/junmo_cho/workspace/datasets/0819_openarm_rh56f1_teleop
 ```
-
+## CJL
+```
+uv run ./utils/convert_data.py ~/ws/rrc-release/data/CJL/ -o ~/ws/junmo_cho/datasets/cjl_0819_v9 --modality modality/rby1m_wuji2/modality.json
+```
 
 
 

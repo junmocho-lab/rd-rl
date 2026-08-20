@@ -1,0 +1,162 @@
+{
+    "state": {
+        "wheel_joints": {
+            "start": 0,
+            "end": 4,
+            "original_key": "observation.joint_position"
+        },
+        "torso_joints": {
+            "start": 4,
+            "end": 10,
+            "original_key": "observation.joint_position"
+        },
+        "right_arm_joints": {
+            "start": 10,
+            "end": 17,
+            "original_key": "observation.joint_position"
+        },
+        "right_hand_joints": {
+            "start": 17,
+            "end": 37,
+            "original_key": "observation.joint_position"
+        },
+        "left_arm_joints": {
+            "start": 37,
+            "end": 44,
+            "original_key": "observation.joint_position"
+        },
+        "left_hand_joints": {
+            "start": 44,
+            "end": 64,
+            "original_key": "observation.joint_position"
+        },
+        "neck_joints": {
+            "start": 64,
+            "end": 66,
+            "original_key": "observation.joint_position"
+        }
+    },
+    "action": {
+        "wheel_joints": {
+            "start": 0,
+            "end": 4,
+            "names": [
+                "wheel_fr",
+                "wheel_fl",
+                "wheel_rr",
+                "wheel_rl"
+            ]
+        },
+        "torso_joints": {
+            "start": 4,
+            "end": 10,
+            "names": [
+                "torso_0",
+                "torso_1",
+                "torso_2",
+                "torso_3",
+                "torso_4",
+                "torso_5"
+            ]
+        },
+        "right_arm_joints": {
+            "start": 10,
+            "end": 17,
+            "names": [
+                "right_arm_0",
+                "right_arm_1",
+                "right_arm_2",
+                "right_arm_3",
+                "right_arm_4",
+                "right_arm_5",
+                "right_arm_6"
+            ]
+        },
+        "right_hand_joints": {
+            "start": 17,
+            "end": 37,
+            "names": [
+                "right_thumb_cmc_flex",
+                "right_thumb_cmc_abd",
+                "right_thumb_mcp",
+                "right_thumb_ip",
+                "right_index_finger_mcp_flex",
+                "right_index_finger_mcp_abd",
+                "right_index_finger_pip",
+                "right_index_finger_dip",
+                "right_middle_finger_mcp_flex",
+                "right_middle_finger_mcp_abd",
+                "right_middle_finger_pip",
+                "right_middle_finger_dip",
+                "right_ring_finger_mcp_flex",
+                "right_ring_finger_mcp_abd",
+                "right_ring_finger_pip",
+                "right_ring_finger_dip",
+                "right_pinky_mcp_flex",
+                "right_pinky_mcp_abd",
+                "right_pinky_pip",
+                "right_pinky_dip"
+            ]
+        },
+        "left_arm_joints": {
+            "start": 37,
+            "end": 44,
+            "names": [
+                "left_arm_0",
+                "left_arm_1",
+                "left_arm_2",
+                "left_arm_3",
+                "left_arm_4",
+                "left_arm_5",
+                "left_arm_6"
+            ]
+        },
+        "left_hand_joints": {
+            "start": 44,
+            "end": 64,
+            "names": [
+                "left_thumb_cmc_flex",
+                "left_thumb_cmc_abd",
+                "left_thumb_mcp",
+                "left_thumb_ip",
+                "left_index_finger_mcp_flex",
+                "left_index_finger_mcp_abd",
+                "left_index_finger_pip",
+                "left_index_finger_dip",
+                "left_middle_finger_mcp_flex",
+                "left_middle_finger_mcp_abd",
+                "left_middle_finger_pip",
+                "left_middle_finger_dip",
+                "left_ring_finger_mcp_flex",
+                "left_ring_finger_mcp_abd",
+                "left_ring_finger_pip",
+                "left_ring_finger_dip",
+                "left_pinky_mcp_flex",
+                "left_pinky_mcp_abd",
+                "left_pinky_pip",
+                "left_pinky_dip"
+            ]
+        },
+        "neck_joints": {
+            "start": 64,
+            "end": 66,
+            "names": [
+                "head_0",
+                "head_1"
+            ]
+        }
+    },
+    "video": {
+        "camera_ego_left": {
+            "original_key": "observation.images.camera_ego_left"
+        },
+        "camera_ego_right": {
+            "original_key": "observation.images.camera_ego_right"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}
