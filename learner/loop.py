@@ -22,6 +22,7 @@ usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -69,12 +70,32 @@ def round_num(path: Path) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def round_status(ckpt_round: Path) -> str | None:
-    """이미 처리된 라운드인지. DONE/FAILED 둘 다 '처리됨' 으로 본다."""
-    if (ckpt_round / "DONE").exists():
-        return "done"
-    if (ckpt_round / "FAILED").exists():
-        return "failed"
+def ready_fingerprint(round_dir: Path) -> str:
+    """READY 파일 내용의 지문. '이 라운드' 가 아니라 '이 READY' 를 처리했는지로 판단한다."""
+    p = round_dir / "READY"
+    if not p.is_file():
+        return ""
+    return hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+
+
+def round_status(ckpt_round: Path, fingerprint: str) -> str | None:
+    """이미 처리된 라운드인지.
+
+    라운드 번호가 아니라 **처리한 READY 의 지문**으로 판단한다:
+      - 같은 데이터가 다시 오면 건너뛴다 (Job 재시작 시 이어받기)
+      - 같은 번호로 새 데이터가 오면 다시 처리한다 (재테스트가 수동 정리 없이 재현된다)
+    지문이 없는 옛 DONE/FAILED 는 다시 처리한다.
+    """
+    for name in ("DONE", "FAILED"):
+        p = ckpt_round / name
+        if not p.exists():
+            continue
+        try:
+            rec = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            continue
+        if rec.get("ready_sha") and rec["ready_sha"] == fingerprint:
+            return name.lower()
     return None
 
 
@@ -87,7 +108,7 @@ def find_next_round(runs_exp: Path, ckpt_exp: Path) -> tuple[int, Path] | None:
         n = round_num(d) if d.is_dir() else None
         if n is None or not (d / "READY").is_file():
             continue
-        if round_status(ckpt_exp / d.name) is None:
+        if round_status(ckpt_exp / d.name, ready_fingerprint(d)) is None:
             candidates.append((n, d))
     return min(candidates) if candidates else None
 
@@ -95,20 +116,25 @@ def find_next_round(runs_exp: Path, ckpt_exp: Path) -> tuple[int, Path] | None:
 # --------------------------------------------------------------------------- #
 # 검증 — READY 의 숫자 vs 실제 디스크
 # --------------------------------------------------------------------------- #
-def scan_dataset(ds_dir: Path) -> tuple[dict, list[str]]:
-    """dataset/ 아래를 훑어 (통계, 문제목록) 반환.
+def count_files(root: Path) -> tuple[int, int]:
+    """(일반 파일 수, 총 바이트). actor 와 learner 가 같은 정의를 쓰게 하는 단일 소스."""
+    files = nbytes = 0
+    for f in root.rglob("*"):
+        if f.is_file():
+            files += 1
+            nbytes += f.stat().st_size
+    return files, nbytes
 
-    files/bytes 는 dataset/ 아래 **모든 파일**이 기준이다 (actor 도 같은 정의로 세야 한다).
+
+def scan_sessions(sessions: list[Path]) -> tuple[dict, list[str]]:
+    """세션 디렉토리 목록을 검사하고 합계를 낸다.
+
+    actor(보낼 세션들) 와 learner(도착한 dataset/ 아래 전부) 가 같은 함수를 쓴다.
     """
     problems: list[str] = []
     stats = {"sessions": [], "episodes": 0, "frames": 0, "files": 0, "bytes": 0}
 
-    if not ds_dir.is_dir():
-        return stats, [f"dataset/ 없음: {ds_dir}"]
-
-    for p in sorted(ds_dir.iterdir()):
-        if not p.is_dir():
-            continue
+    for p in sessions:
         missing = [d for d in REQUIRED_DIRS if not (p / d).is_dir()]
         info_path = p / "meta" / "info.json"
         if missing:
@@ -129,12 +155,26 @@ def scan_dataset(ds_dir: Path) -> tuple[dict, list[str]]:
         stats["sessions"].append(p.name)
         stats["episodes"] += eps
         stats["frames"] += int(info.get("total_frames", 0))
+        f, b = count_files(p)
+        stats["files"] += f
+        stats["bytes"] += b
 
-    for f in ds_dir.rglob("*"):
-        if f.is_file():
-            stats["files"] += 1
-            stats["bytes"] += f.stat().st_size
+    return stats, problems
 
+
+def scan_dataset(ds_dir: Path) -> tuple[dict, list[str]]:
+    """도착한 dataset/ 를 훑는다 (learner 쪽).
+
+    files/bytes 는 세션 디렉토리 합이 아니라 **dataset/ 아래 전부**로 덮어쓴다.
+    세션 밖에 예상 못한 파일이 섞여 있으면 actor 가 보고한 숫자와 어긋나 검증에서 걸린다.
+    """
+    if not ds_dir.is_dir():
+        return {"sessions": [], "episodes": 0, "frames": 0, "files": 0, "bytes": 0}, \
+               [f"dataset/ 없음: {ds_dir}"]
+
+    subdirs = [p for p in sorted(ds_dir.iterdir()) if p.is_dir()]
+    stats, problems = scan_sessions(subdirs)
+    stats["files"], stats["bytes"] = count_files(ds_dir)
     return stats, problems
 
 
@@ -212,16 +252,28 @@ def export_stub(ckpt_round: Path, log: Log, args, stats: dict, ready: dict) -> N
 # --------------------------------------------------------------------------- #
 def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args) -> str:
     log(f"[r{n:03d}] 감지: {round_dir}")
+    fingerprint = ready_fingerprint(round_dir)
+
+    # 같은 번호를 다시 처리하는 경우 이전 센티넬을 먼저 없앤다 — DONE 과 FAILED 가
+    # 동시에 남아 상태가 모순되는 것을 막는다.
+    for name in ("DONE", "FAILED"):
+        stale = ckpt_round / name
+        if stale.exists():
+            log(f"[r{n:03d}] 이전 {name} 제거 (READY 가 바뀌어 재처리)")
+            stale.unlink()
+
     try:
         ready = json.loads((round_dir / "READY").read_text())
     except json.JSONDecodeError as exc:
-        write_atomic(ckpt_round / "FAILED", {"round": n, "reason": f"READY JSON 파싱 실패: {exc}"})
+        write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                             "reason": f"READY JSON 파싱 실패: {exc}"})
         log(f"[r{n:03d}] FAILED — READY JSON 파싱 실패")
         return "failed"
 
     stats, problems = validate(round_dir, ready)
     if problems:
-        write_atomic(ckpt_round / "FAILED", {"round": n, "reason": "검증 실패", "problems": problems})
+        write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                             "reason": "검증 실패", "problems": problems})
         for p in problems:
             log(f"[r{n:03d}]   ✗ {p}")
         log(f"[r{n:03d}] FAILED — 학습하지 않음")
@@ -238,7 +290,7 @@ def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args) -> 
     # ────────────────────────────────────────────────────────────────────
 
     export_stub(ckpt_round, log, args, stats, ready)
-    write_atomic(ckpt_round / "DONE", {"round": n, "stub": True,
+    write_atomic(ckpt_round / "DONE", {"round": n, "stub": True, "ready_sha": fingerprint,
                                        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
     log(f"[r{n:03d}] DONE → {ckpt_round}")
     return "done"
@@ -263,7 +315,8 @@ def main() -> int:
 
     runs_exp = args.runs_root / args.exp
     ckpt_exp = args.ckpt_root / "expo" / args.exp
-    log = Log(runs_exp / "learner.log")
+    # 로그는 runs/<exp>/ 밖에 둔다 — 라운드 디렉토리를 지워도 남아야 한다.
+    log = Log(args.runs_root / f"{args.exp}.learner.log")
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
