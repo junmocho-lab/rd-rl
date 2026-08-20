@@ -30,7 +30,8 @@ if [ -n "$RUNNING" ]; then
     echo "  run id 가 다르면 메일박스도 달라서 충돌하지 않지만, 필요 없으면 지울 것"
 fi
 
-sed -e "s|__RUN_ID__|$RUN_ID|g" -e "s|__JOB_NAME__|$JOB_NAME|g" k8s/learner.yaml \
+sed -e "s|__RUN_ID__|$RUN_ID|g" -e "s|__JOB_NAME__|$JOB_NAME|g" \
+    -e "s|__EXP_NAME__|$NAME|g" k8s/learner.yaml \
     | kubectl apply -f -
 
 mkdir -p "$A_RUNS"
@@ -41,6 +42,7 @@ cat <<EOS
 run id : $RUN_ID   (→ $A_RUNS/CURRENT)
 job    : $JOB_NAME
 
+  θ₀     .venv/bin/python actor/recv_round.py --round init   ← round 0 롤아웃 전에 받는다
   로그   kubectl -n $L_NS logs -f job/$JOB_NAME
          kubectl -n $L_NS exec $L_POD -- tail -20 $L_RUNS/$RUN_ID/learner.log
   라운드 .venv/bin/python actor/send_round.py --round 0 --dataset <세션경로>

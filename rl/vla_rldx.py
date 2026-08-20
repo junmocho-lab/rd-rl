@@ -390,8 +390,8 @@ def _serve(argv: list[str]) -> int:
     p = argparse.ArgumentParser("rl.vla_rldx serve", description="EXPO 정책 서버")
     p.add_argument("--exp", required=True, help="configs/exp/<이름>.yaml 의 <이름>")
     p.add_argument("--model-path", required=True, type=Path, help="base BC 정책 디렉토리")
-    p.add_argument("--modality", required=True, type=Path,
-                   help="modality/<embodiment>/modality.json (그룹 경계의 정본)")
+    p.add_argument("--modality", type=Path,
+                   help="modality/<embodiment>/modality.json. 기본값은 exp yaml 의 modality 키")
     p.add_argument("--artifacts", type=Path,
                    help="라운드 산출물 .pt (critic/encoder/residual). 없으면 랜덤 초기화")
     p.add_argument("--host", default="127.0.0.1")
@@ -406,9 +406,10 @@ def _serve(argv: list[str]) -> int:
     a = p.parse_args(argv)
 
     exp = yaml.safe_load((repo / "configs" / "exp" / f"{a.exp}.yaml").read_text())
+    modality = a.modality or (repo / exp["modality"])
     w, h = (int(v) for v in a.critic_image_size.lower().split("x"))
     print(f"EXPO 정책 서버 — 실험 {a.exp}")
-    srv = ExpoServer(exp, a.model_path, a.modality, repo / "third_party" / "RLDX-1",
+    srv = ExpoServer(exp, a.model_path, modality, repo / "third_party" / "RLDX-1",
                      device=a.device, artifacts=a.artifacts, seed=a.seed,
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose)
     srv.run(a.host, a.port)

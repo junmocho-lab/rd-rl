@@ -12,6 +12,7 @@ FAILED 가 보이면 이유를 출력하고 종료한다 (무한 대기 방지).
 그래서 나중에 정책 서버가 "어느 라운드의 산출물"만 알면 경로가 유도된다.
 
 usage:
+    python3 actor/recv_round.py --round init      # learner 가 시작할 때 낸 θ₀ (round 0 용)
     python3 actor/recv_round.py --round 1 [--exp <run id>] [--timeout 3600] [--dry-run]
 """
 
@@ -58,7 +59,8 @@ def main() -> int:
     paths = read_paths()
     p = argparse.ArgumentParser(description=__doc__,
                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--round", type=int, required=True)
+    p.add_argument("--round", required=True,
+                   help="라운드 번호, 또는 'init' (learner 가 시작할 때 내보낸 θ₀)")
     p.add_argument("--exp", default=current_run(paths.get("A_RUNS")),
                    help="run id. 생략하면 runs/CURRENT")
     p.add_argument("--local-ckpt", default=paths.get("A_CKPT"))
@@ -77,7 +79,9 @@ def main() -> int:
         if not getattr(a, name):
             sys.exit(f"--{name.replace('_','-')} 를 알 수 없다 (configs/paths.sh 확인)")
 
-    rnd = f"r{a.round:03d}"
+    # init 은 라운드 번호가 아니다 — "rNNN = 데이터 N 라운드로 학습한 결과" 규칙을 지키려고
+    # θ₀ 는 별도 이름을 쓴다. 나머지 로직(DONE 대기 → 다운로드 → 파일 수·바이트 대조) 은 같다.
+    rnd = "init" if a.round == "init" else f"r{int(a.round):03d}"
     rel = f"expo/{a.exp}/{rnd}"
     remote_round = f"{a.remote_ckpt}/{rel}"
     local_round = Path(a.local_ckpt) / rel
