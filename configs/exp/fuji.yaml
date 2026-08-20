@@ -1,5 +1,35 @@
 # 실험 하나. 라운드 manifest 에 그대로 기록된다.
 #
+# ── 무엇이 자동이고 무엇을 적어야 하나 ─────────────────────────────────────────
+#
+# 데이터에서 자동으로 나온다 (여기 적지 않는다):
+#   robot_type, action/state 차원, 그룹 경계, 카메라 개수·이름, language prompt
+#     ← <세션>/meta/{modality.json, info.json, tasks.jsonl}
+#   embodiment 3종(openarm_lefthand 28차원·카메라2, rby1m_rh56f1 34·3,
+#   rby1m_wuji2 66·2)으로 검증됨. 세션들의 modality 가 다르면 학습을 시작하지 않는다.
+#
+# 코드에서 유도된다:
+#   full_action_dim = replan_steps x action_dim        (critic 이 보는 액션 차원)
+#   target_entropy  = -(활성 차원 수) / 2
+#   critic 인코더 입력 채널 = 3 x 카메라 수, 해상도는 내부에서 224x224 로 맞춤
+#   gamma_eff = discount ** replan_steps               (실효 할인)
+#
+# 이 파일에 적어야 하는 것: base_policy, action_horizon, replan_steps,
+#   inference_latency, explore_groups. 전부 "고르는 값" 이 아니라 외부 사실을 베끼는 것.
+#
+# 지켜야 하는 제약 (코드가 검사한다):
+#   action_horizon >= inference_latency + replan_steps
+#   replan_steps      == rrc controller 의 execution_horizon
+#   inference_latency == rrc controller 의 inference_latency_steps
+#   action_horizon    == 모델 config 의 action_horizon
+#
+# 아직 단순화해 둔 것 (알고 쓰는 것):
+#   보상 n-step 창은 결정 시점 기준 [t, t+replan) 이다. RTC 지연을 엄격히 따르면
+#   [t+latency, t+latency+replan) 이지만, 보상이 성공 에피소드 마지막 1프레임뿐이라
+#   (sparse terminal) 크레딧이 최대 latency 프레임 이동하는 정도의 차이다.
+#   mask = 1 - done 은 next.truncated 가 항상 0 이라는 데이터 관찰에 근거한다
+#   (rl/data.py 검사 8 이 아니면 FAIL 로 잡는다).
+#
 # 여기 없는 것은 **데이터에서 온다** (손으로 적지 않는다):
 #   embodiment/차원/그룹/카메라  ← <세션>/meta/modality.json  (convert_data.py --modality 가 심음)
 #   language prompt              ← <세션>/meta/tasks.jsonl
@@ -22,12 +52,24 @@ base_policy: ""
 #                     길이가 달라져 critic 이 엉뚱한 것을 학습한다.
 #
 # 참고 (rrc configs/controllers/):
-#   openarm_rh56f1      chunk 16 / exec  8
-#   allex_p3            chunk 40 / exec 16
-#   rby1m_wujihand      chunk 40 / exec 15
+#   openarm_rh56f1      chunk 16 / exec  8 / latency  2
+#   allex_p3            chunk 40 / exec 16 / latency  4
+#   rby1m_wujihand      chunk 40 / exec 15 / latency 12
 # TODO: rby1m_rh56f1 추론 컨트롤러가 rrc 에 아직 없다. 만들 때 값을 여기와 맞출 것.
 action_horizon: 40
-replan_steps: 15
+replan_steps: 8
+
+# RTC 지연. 추론은 8스텝 경계보다 latency 스텝 **먼저** 시작하고, 이미 확정된 latency 개
+# 액션이 prefix 로 들어간다. 그래서 obs(t) 에서 뽑은 청크 중 **실제로 실행되는 구간은
+# [latency, latency+replan_steps)** 이다:
+#
+#   critic 액션 = chunk[latency : latency+replan_steps]
+#     위치 0..latency-1 은 prefix 가 붙잡아 후보끼리 거의 같고 (판별력 희석),
+#     새로 계획되어 실제 실행되는 뒤쪽 latency 개는 아예 못 보게 되므로 오프셋이 필요하다.
+#   actor BC 대상 = 청크 전체 (RLDX 가 학습한 obs(t) → actions[t:t+H] 정렬 그대로)
+#
+# action_horizon >= latency + replan_steps 여야 한다 (40 >= 11).
+inference_latency: 3
 
 # --- 탐색 범위 --------------------------------------------------------------
 # residual(edit) policy 를 적용할 action 그룹. modality.json 의 그룹 이름을 쓴다.
@@ -35,8 +77,10 @@ replan_steps: 15
 # EXPO-FT 의 residual_action_xyzg (회전 3축 마스킹) 를 그룹 단위로 일반화한 것.
 #
 # 주의: target_entropy = -full_action_dim/2 는 마스킹을 모르기 때문에, 활성 차원이
-# 105/510 (20.6%) 이면 엔트로피 예산의 대부분이 아무 효과 없는 차원에 쓰인다.
+# 56/272 (20.6%) 이면 엔트로피 예산의 대부분이 아무 효과 없는 차원에 쓰인다.
 # EXPO-FT 원본도 같은 구조(4/7 활성)이므로 그대로 두고 `temperature` / `entropy` /
 # `select_ratio_with_residual` 지표로 관찰한다.
+# **비워 두면 전체 차원을 탐색한다** — 그 경우 target_entropy = -full_action_dim/2 가 되어
+# EXPO-FT 원본 공식과 정확히 일치한다 (openarm 28차원으로 확인: active 100%, -112).
 explore_groups:
   - right_arm_joints

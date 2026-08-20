@@ -286,13 +286,21 @@ def action_chunk(flat: Flat, idx: np.ndarray, horizon: int = 16) -> np.ndarray:
 
 
 def make_batch(flat: Flat, imgs, idx: np.ndarray, mod: Modality, replan_steps: int = 8,
-               action_horizon: int = 16, discount: float = 0.99, task: str = "") -> dict:
+               action_horizon: int = 16, discount: float = 0.99, task: str = "",
+               latency: int = 0) -> dict:
     """학습 배치 하나. EXPO-FT prepare_critic_batch 와 같은 분해.
 
     critic 계열은 원본 uint8 이미지를 채널로 이어붙여 쓰고 (인코더를 따로 학습하므로
     RLDX 프로세서를 통과시키지 않는다 — augmentation 이중 적용을 피한다),
     VLA 계열은 RLDX 프로세서에 넣을 nested dict 을 그대로 준다.
+
+    latency (RTC 지연) 만큼 critic 액션 창을 뒤로 민다. 추론이 경계보다 latency 스텝 먼저
+    돌고 앞 latency 개가 prefix 로 고정되므로, 실제로 실행되는 것은
+    chunk[latency : latency+replan_steps] 이다. actor BC 대상은 청크 전체.
     """
+    if action_horizon < latency + replan_steps:
+        raise ValueError(f"action_horizon({action_horizon}) < latency({latency}) + "
+                         f"replan_steps({replan_steps})")
     idx = np.asarray(idx, dtype=np.int64)
     n = nstep(flat, idx, replan_steps, discount)
     nxt = n["next_idx"]
@@ -316,7 +324,7 @@ def make_batch(flat: Flat, imgs, idx: np.ndarray, mod: Modality, replan_steps: i
         # --- critic / residual / 인코더 ---
         "obs": cat_cams(idx), "next_obs": cat_cams(nxt),
         "state": flat.state[idx], "next_state": flat.state[nxt],
-        "action": ch[:, :replan_steps].reshape(len(idx), replan_steps * A),   # (B, 224)
+        "action": ch[:, latency:latency + replan_steps].reshape(len(idx), replan_steps * A),
         # --- actor(VLA) ---
         "full_action": ch,                                                    # (B, 16, 28)
         "vla_obs": vla_obs(idx), "vla_next_obs": vla_obs(nxt),
