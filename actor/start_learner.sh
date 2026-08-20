@@ -3,7 +3,7 @@
 #
 #   ./actor/start_learner.sh [실험이름]     # 기본: openarm_red_block
 #
-# run id = <실험이름>_<날짜-시각>. 매번 새 이름이므로 이전 run 의 DONE/FAILED 와 절대
+# run id = <실험이름>_<날짜-시각(초까지)>. 매번 새 이름이므로 이전 run 의 DONE/FAILED 와 절대
 # 섞이지 않는다 — 같은 라운드 번호로 다시 테스트해도 리셋된 상태에서 시작한다.
 # run id 는 $A_RUNS/CURRENT 에 적어두고 send_round.py 가 기본값으로 읽는다.
 
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 source configs/paths.sh
 
 NAME="${1:-openarm_red_block}"
-RUN_ID="${NAME}_$(date +%Y%m%d-%H%M)"
+RUN_ID="${NAME}_$(date +%Y%m%d-%H%M%S)"
 # k8s 리소스 이름은 DNS-1123 (소문자·숫자·'-') 이라 밑줄을 '-' 로 바꾼다
 JOB_NAME="junmo-cho-rdrl-$(printf '%s' "$RUN_ID" | tr 'A-Z_' 'a-z-')"
 

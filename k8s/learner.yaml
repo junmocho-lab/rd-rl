@@ -1,8 +1,7 @@
 # rd-rl learner — 상시 대기 잡 (현재는 학습 stub, CPU 만).
 #
 # 라운드 메일박스를 폴링하다가 actor 가 READY 를 올리면 검증 → (학습) → DONE 을 쓴다.
-# 실제 학습을 붙일 때 바뀌는 것은 세 곳뿐: resources 에 GPU 추가, job-class 를 dedicated,
-# activeDeadlineSeconds 를 48h.
+# 실제 학습을 붙일 때 바뀌는 것은 두 곳뿐: resources 에 GPU 추가, activeDeadlineSeconds 를 48h.
 #
 #   제출: ./actor/start_learner.sh [실험이름]
 #         (이 yaml 은 __RUN_ID__ / __JOB_NAME__ 플레이스홀더가 있어 직접 apply 하면 안 된다)
@@ -18,10 +17,12 @@ metadata:
   name: __JOB_NAME__
   namespace: p-rlwrld
   labels:
-    # 지금은 CPU 만 쓰는 stub 이라 background. 실제 학습(GPU 상시)은 dedicated 로 올린다.
-    # background 가 preempt 되는지가 상시 잡의 미확인 리스크 — SIGTERM 로그로 관측된다.
-    mlxp/job-class: background
+    # normal — RLDX-1 학습 잡이 쓰는 클래스. background 로 올렸더니 플랫폼이 2분 만에
+    # Job 을 suspend 했다 (spec.suspend=true → 파드에 SIGTERM). 상시 대기 잡은 normal.
+    mlxp/job-class: normal
+    project-code: rd
     project-short-name: rd
+    user: junmo_cho
 spec:
   ttlSecondsAfterFinished: 3600
   # DeadlineExceeded 는 재시도되지 않는다 (다시 apply 해야 한다). 상태는 DDN 에 있으므로
@@ -31,8 +32,10 @@ spec:
   template:
     metadata:
       labels:
-        mlxp/job-class: background # 파드에도 필수 — Job 라벨만으론 fallback 된다
+        mlxp/job-class: normal # 파드에도 필수 — Job 라벨만으론 fallback 된다
+        project-code: rd
         project-short-name: rd
+        user: junmo_cho
       annotations:
         mlx.navercorp.com/zone: private-h200-rlwrld-0
         sidecar.istio.io/inject: "false"
