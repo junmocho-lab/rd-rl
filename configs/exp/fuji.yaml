@@ -1,0 +1,42 @@
+# 실험 하나. 라운드 manifest 에 그대로 기록된다.
+#
+# 여기 없는 것은 **데이터에서 온다** (손으로 적지 않는다):
+#   embodiment/차원/그룹/카메라  ← <세션>/meta/modality.json  (convert_data.py --modality 가 심음)
+#   language prompt              ← <세션>/meta/tasks.jsonl
+#   robot_type                   ← <세션>/meta/info.json
+# paths.sh 에도 두지 않는다 — 그건 "이 머신의 사실"이고 아래는 "이 실험의 사실"이다.
+
+name: fuji
+robot: rby1m_rh56f1          # 데이터의 robot_type 과 교차검증용
+
+# --- 정책 -------------------------------------------------------------------
+# $A_CKPT / $L_CKPT 아래 상대경로 (양쪽에서 같은 상대경로를 쓴다).
+# TODO: rby1m_rh56f1 BC 체크포인트 경로. 아직 없음.
+base_policy: ""
+
+# --- 액션 청크 --------------------------------------------------------------
+# 우리가 고르는 값이 아니라 외부 사실을 베끼는 것이다:
+#   action_horizon  = 모델 config 의 action_horizon
+#                     (learner 가 체크포인트 experiment_cfg/final_model_config.json 과 교차검증)
+#   replan_steps    = rrc controller 의 execution_horizon. 어긋나면 n-step 리턴과 실제 실행
+#                     길이가 달라져 critic 이 엉뚱한 것을 학습한다.
+#
+# 참고 (rrc configs/controllers/):
+#   openarm_rh56f1      chunk 16 / exec  8
+#   allex_p3            chunk 40 / exec 16
+#   rby1m_wujihand      chunk 40 / exec 15
+# TODO: rby1m_rh56f1 추론 컨트롤러가 rrc 에 아직 없다. 만들 때 값을 여기와 맞출 것.
+action_horizon: 40
+replan_steps: 15
+
+# --- 탐색 범위 --------------------------------------------------------------
+# residual(edit) policy 를 적용할 action 그룹. modality.json 의 그룹 이름을 쓴다.
+# 여기 없는 그룹은 residual 이 0 이 되어 base VLA 출력이 그대로 실행된다.
+# EXPO-FT 의 residual_action_xyzg (회전 3축 마스킹) 를 그룹 단위로 일반화한 것.
+#
+# 주의: target_entropy = -full_action_dim/2 는 마스킹을 모르기 때문에, 활성 차원이
+# 105/510 (20.6%) 이면 엔트로피 예산의 대부분이 아무 효과 없는 차원에 쓰인다.
+# EXPO-FT 원본도 같은 구조(4/7 활성)이므로 그대로 두고 `temperature` / `entropy` /
+# `select_ratio_with_residual` 지표로 관찰한다.
+explore_groups:
+  - right_arm_joints

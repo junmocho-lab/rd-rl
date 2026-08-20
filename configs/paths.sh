@@ -20,6 +20,5 @@ L_PY=/opt/conda/bin/python3
 L_NS=p-rlwrld
 L_POD=junmo-cho-data-pod
 
-# --- base policy (BC/SFT) ---
-# 0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp
-RDRL_BASE_POLICY=0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp
+# base policy 는 여기 없다 — 실험마다 다르므로 configs/exp/<이름>.yaml 에 둔다
+# (paths.sh 는 이 머신의 사실만 담는다).

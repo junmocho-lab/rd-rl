@@ -1,0 +1,76 @@
+{
+    "state": {
+        "torso_joints": {
+            "start": 4,
+            "end": 10,
+            "original_key": "observation.joint_position"
+        },
+        "right_arm_joints": {
+            "start": 10,
+            "end": 17,
+            "original_key": "observation.joint_position"
+        },
+        "right_hand_joints": {
+            "start": 17,
+            "end": 23,
+            "original_key": "observation.joint_position"
+        },
+        "left_arm_joints": {
+            "start": 23,
+            "end": 30,
+            "original_key": "observation.joint_position"
+        },
+        "left_hand_joints": {
+            "start": 30,
+            "end": 36,
+            "original_key": "observation.joint_position"
+        },
+        "neck_joints": {
+            "start": 36,
+            "end": 38,
+            "original_key": "observation.joint_position"
+        }
+    },
+    "action": {
+        "torso_joints": {
+            "start": 4,
+            "end": 10
+        },
+        "right_arm_joints": {
+            "start": 10,
+            "end": 17
+        },
+        "right_hand_joints": {
+            "start": 17,
+            "end": 23
+        },
+        "left_arm_joints": {
+            "start": 23,
+            "end": 30
+        },
+        "left_hand_joints": {
+            "start": 30,
+            "end": 36
+        },
+        "neck_joints": {
+            "start": 36,
+            "end": 38
+        }
+    },
+    "video": {
+        "camera_ego_left": {
+            "original_key": "observation.images.camera_ego_left"
+        },
+        "camera_ego_right": {
+            "original_key": "observation.images.camera_ego_right"
+        },
+        "wrist_left": {
+            "original_key": "observation.images.wrist_left"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}
