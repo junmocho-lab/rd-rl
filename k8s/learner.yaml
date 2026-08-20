@@ -84,5 +84,5 @@ spec:
             - name: ddn
               mountPath: /data
           resources:
-            requests: { cpu: "1", memory: "2Gi" }
-            limits: { cpu: "2", memory: "4Gi" }
+            requests: { cpu: "100m", memory: "512Mi" }
+            limits: { cpu: "500m", memory: "4Gi" }

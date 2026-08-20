@@ -14,85 +14,28 @@ usage:
         --collected-by base [--success 2] [--dry-run]
 
 경로 기본값은 configs/paths.sh 에서 읽는다 (source 없이도 동작한다).
+
+같은 라운드를 다시 보내면 원격 dataset/ 을 비우고 새로 올린다 (멱등).
+단 learner 가 그 라운드를 **처리 중**일 때 다시 보내지 말 것 — 읽는 중인 데이터가 사라진다.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _common import (  # noqa: E402
+    REPO, current_run, git_sha, kube, read_paths, remote_count, run,
+)
 from learner.loop import scan_sessions  # noqa: E402  (세는 방식의 단일 소스)
 
 
-def read_paths(path: Path) -> dict:
-    """configs/paths.sh 의 KEY=value 를 읽는다. paths.sh 가 경로의 단일 소스이므로
-    셸에서 source 하지 않고 실행해도 같은 값을 쓰게 한다."""
-    out = {}
-    if not path.is_file():
-        return out
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        if k.replace("_", "").isalnum():
-            out[k.strip()] = v.strip().strip('"').strip("'")
-    return out
-
-
-def current_run(runs_root: str | None) -> str | None:
-    """start_learner.sh 가 적어둔 현재 run id. --exp 를 매번 타이핑하지 않게 한다."""
-    if not runs_root:
-        return None
-    p = Path(runs_root) / "CURRENT"
-    return p.read_text().strip() if p.is_file() else None
-
-
-def run(cmd: list[str], dry: bool) -> str:
-    print("$ " + " ".join(cmd))
-    if dry:
-        return ""
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    if res.returncode != 0:
-        sys.exit(f"실패 (exit {res.returncode}): {res.stderr.strip() or res.stdout.strip()}")
-    return res.stdout
-
-
-def kube(ns: str, *args: str) -> list[str]:
-    return ["kubectl", "-n", ns, *args]
-
-
-def git_sha(repo: Path) -> str:
-    try:
-        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=repo,
-                           capture_output=True, text=True, check=True)
-        return r.stdout.strip()
-    except Exception:
-        return ""
-
-
-def remote_scan(ns: str, pod: str, remote_ds: str) -> tuple[int, int]:
-    """원격 dataset/ 의 (파일 수, 총 바이트). READY 를 올리기 전에 전송이 온전한지 본다.
-    learner 의 scan_dataset 과 같은 정의(dataset/ 아래 모든 일반 파일)."""
-    script = (
-        f"find {remote_ds} -type f -printf '%s\\n' 2>/dev/null "
-        "| awk '{s+=$1; n+=1} END {printf \"%d %d\\n\", n+0, s+0}'"
-    )
-    out = subprocess.run(kube(ns, "exec", pod, "--", "bash", "-lc", script),
-                         capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.exit(f"원격 스캔 실패: {out.stderr.strip()}")
-    n, b = out.stdout.split()
-    return int(n), int(b)
-
-
 def main() -> int:
-    paths = read_paths(REPO / "configs" / "paths.sh")
+    paths = read_paths()
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--exp", default=current_run(paths.get("A_RUNS")),
@@ -154,7 +97,18 @@ def main() -> int:
     print(f"  원격      {remote_ds}")
     print()
 
-    # 3) 원격 부모 디렉토리 (kubectl cp 는 없는 경로에 못 쓴다)
+    # 3) 원격을 먼저 비운다 — 같은 라운드를 다시 보내도 멱등하게.
+    #
+    # kubectl cp 는 대상 디렉토리가 이미 있으면 그 **안에** 복사한다 (tar 의미).
+    # 그래서 같은 세션을 두 번 보내면 dataset/<세션>/<세션>/ 으로 중첩되고 파일 수가
+    # 늘어 검증에서 걸린다. 지우고 새로 올려야 재실행이 깨끗하다.
+    #
+    # 안전장치: 지울 경로가 정말 이 라운드의 dataset 인지 확인한다.
+    if not remote_ds.endswith(f"/{a.exp}/{rnd}/dataset") or len(a.exp) < 3:
+        sys.exit(f"안전장치: 지우려는 경로가 예상과 다르다: {remote_ds}")
+    # READY 를 먼저 없앤다 — 데이터가 없어진 라운드를 learner 가 집어가지 않도록.
+    run(kube(a.namespace, "exec", a.pod, "--", "rm", "-f", f"{remote_round}/READY"), a.dry_run)
+    run(kube(a.namespace, "exec", a.pod, "--", "rm", "-rf", remote_ds), a.dry_run)
     run(kube(a.namespace, "exec", a.pod, "--", "mkdir", "-p", remote_ds), a.dry_run)
 
     # 4) 세션별 업로드
@@ -175,7 +129,7 @@ def main() -> int:
         "code": {"rd-rl": git_sha(REPO)},
     }
     if not a.dry_run:
-        n, b = remote_scan(a.namespace, a.pod, remote_ds)
+        n, b = remote_count(a.namespace, a.pod, remote_ds)
         if (n, b) != (stats["files"], stats["bytes"]):
             sys.exit(f"원격 불일치 — READY 를 올리지 않는다.\n"
                      f"  로컬 files={stats['files']} bytes={stats['bytes']}\n"
