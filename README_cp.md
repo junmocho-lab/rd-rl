@@ -2,6 +2,8 @@
 
 # 실행 순서
 
+창을 3개띄운다 (학습서버, 로컬 데이터 전송, 로컬 모델 열기)
+
 0. rd-rl git clone 받고 각 submodule 및 .venv 세팅 
 1. paths 세팅 후 `source ./configs/paths.sh`, modality 파일 추가 
 2. teleop data 세팅 (post-training에 활용) 학습서버 t0 지우고 시작. kubernetes 이슈.
@@ -17,7 +19,7 @@
    먼저 **base BC 정책만** 서빙한다 (RLDX 원본 서버. edit policy·critic 이 없는 순수 BC — 7번의 EXPO 서버와 다르다). 밑에 명령어 execution length 추가해야되나?
    ```
    cd third_party/RLDX-1
-   ROS_DOMAIN_ID=106 pixi run -e rldx python -u -m rldx.eval.run_rldx_server     --model-path $A_CKPT/rldx-img-curated/rldx_img_curated-0810-0818-r03/     --embodiment-tag GENERAL_EMBODIMENT     --host 127.0.0.1 --port 5555     --rtc-inference-mode trained     --rtc-inference-delay 3
+   ROS_DOMAIN_ID=106 pixi run -e rldx python -u -m rldx.eval.run_rldx_server     --model-path $A_CKPT/rldx-img-curated/rldx_img_curated-0810-0818-r03/     --embodiment-tag NEW_EMBODIMENT     --host 127.0.0.1 --port 5555     --rtc-inference-mode trained     --rtc-inference-delay 3
    ```
    `python rldx/eval/run_rldx_server.py` 가 아니라 `-m` 인 이유: 이 서브모듈의 pixi 환경에는
    rldx 가 설치돼 있지 않아 스크립트로 부르면 `ModuleNotFoundError: rldx` 가 난다
@@ -78,11 +80,7 @@
    base 정책 + edit policy + critic 을 함께 서빙한다)
    ```
    cd third_party/RLDX-1
-   PYTHONPATH="$PWD:$A_RL" pixi run -e rldx python -u -m rl.vla_rldx serve \
-       --exp openarm_rim \
-       --model-path $A_CKPT/0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
-       --artifacts $A_CKPT/expo/<run id>/init/theta.pt \
-       --host 127.0.0.1 --port 5555
+   ROS_DOMAIN_ID=106 PYTHONPATH="$PWD:$A_RL" pixi run -e rldx python -u -m rl.vla_rldx serve     --exp fuji     --model-path $A_CKPT/rldx-img-curated/rldx_img_curated-0810-0818-r03/     --artifacts $A_CKPT/expo/fuji_20260821-073310/init/theta.pt     --host 127.0.0.1 --port 5555
    ```
    `--model-path` 는 **base BC 정책**이고 라운드가 지나도 바뀌지 않는다 (13.8GB. 3번에서
    받은 그것). 라운드마다 바뀌는 것은 `--artifacts` 뿐이다:
@@ -116,8 +114,7 @@
 
 8. 롤아웃 + 사람이 에피소드별 성공/실패 라벨 (rrc-release) → 2번처럼 변환
    ```
-   uv run ./utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/<날짜>_openarm_rh56f1_inference \
-       -o ./rl-dataset/r<N> --modality modality/openarm_lefthand/modality.json
+   uv run ./utils/convert_data.py ../rrc-rollout-example/test/r<N> -o ./rl-dataset --modality modality/rby1m_rh56f1/modality.json
    ```
 
 9. 라운드 전송 (세션별로 올린 뒤 **맨 마지막에** READY)
