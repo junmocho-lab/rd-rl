@@ -4,30 +4,20 @@
 
 0. rd-rl git clone 받고 각 submodule 및 .venv 세팅 
 1. paths 세팅 후 `source ./configs/paths.sh`, modality 파일 추가 
-2. teleop data 세팅 (post-training에 활용)
+2. teleop data 세팅 (post-training에 활용) 학습서버 t0 지우고 시작. kubernetes 이슈.
    ```
-   uv run ./utils/convert_data.py ~/Code/rrc-release/data/user/0814/openarm_rh56f1_teleop -o ./rl-dataset/t0 --modality modality/openarm_lefthand/modality.json
+   uv run ./utils/convert_data.py ../rrc-rollout-example/test/t0 -o ./rl-dataset --modality modality/rby1m_rh56f1/modality.json
    ```
 3. teleop data 학습 서버에 업로드
    ```
    kubectl cp $A_DS/t0 $L_POD:$L_DS/t0
    ```
-3. bc policy 학습 서버에서 다운로드 받기
-   ```
-   kubectl cp $L_POD:$L_CKPT/0814-openarm-rh56f1-rldx-ptimg $A_CKPT/0814-openarm-rh56f1-rldx-ptimg
-   ```
-4. bc policy rollout 진행 및 위처럼 2. 처럼 inference data 세팅
+4. bc policy (bc policy는 학습서버에서 다운로드) rollout 진행 및 위처럼 2. 처럼 inference data 세팅
 
-   먼저 **base BC 정책만** 서빙한다 (RLDX 원본 서버. edit policy·critic 이 없는 순수 BC —
-   7번의 EXPO 서버와 다르다).
+   먼저 **base BC 정책만** 서빙한다 (RLDX 원본 서버. edit policy·critic 이 없는 순수 BC — 7번의 EXPO 서버와 다르다). 밑에 명령어 execution length 추가해야되나?
    ```
    cd third_party/RLDX-1
-   ROS_DOMAIN_ID=106 pixi run -e rldx python -u -m rldx.eval.run_rldx_server \
-       --model-path $A_CKPT/0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
-       --embodiment-tag GENERAL_EMBODIMENT \
-       --host 127.0.0.1 --port 5555 \
-       --rtc-inference-mode trained \
-       --rtc-inference-delay 2
+   ROS_DOMAIN_ID=106 pixi run -e rldx python -u -m rldx.eval.run_rldx_server     --model-path $A_CKPT/rldx-img-curated/rldx_img_curated-0810-0818-r03/     --embodiment-tag GENERAL_EMBODIMENT     --host 127.0.0.1 --port 5555     --rtc-inference-mode trained     --rtc-inference-delay 3
    ```
    `python rldx/eval/run_rldx_server.py` 가 아니라 `-m` 인 이유: 이 서브모듈의 pixi 환경에는
    rldx 가 설치돼 있지 않아 스크립트로 부르면 `ModuleNotFoundError: rldx` 가 난다
@@ -41,7 +31,7 @@
 
    그리고 롤아웃한 데이터를 변환한다.
    ```
-   uv run ./utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/0815_openarm_rh56f1_inference -o ./rl-dataset/r0 --modality modality/openarm_lefthand/modality.json
+   uv run ./utils/convert_data.py ../rrc-rollout-example/test/r0 -o ./rl-dataset --modality modality/rby1m_rh56f1/modality.json
    ```
 5. inference data 학습 서버에 업로드
    ```
@@ -50,7 +40,7 @@
 
 6. learner 상시 잡 띄우기 (**한 번만**. 라운드마다 다시 띄우지 않는다)
    ```
-   ./actor/start_learner.sh openarm_rim
+   ./actor/start_learner.sh fuji
    ```
    `run id = openarm_rim_<날짜-시각>` 이 `$A_RUNS/CURRENT` 에 적히고 이후 명령들이 그걸 기본값으로
    읽는다. 잡은 `$L_RUNS/<run id>/` 메일박스를 5초마다 폴링한다.

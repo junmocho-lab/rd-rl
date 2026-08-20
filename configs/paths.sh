@@ -1,8 +1,8 @@
 # --- actor (robot desktop) ---
-A_RL=/home/openarm14/ws/junmo_cho/rd-rl
-A_CKPT=/home/openarm14/ws/junmo_cho/checkpoints
-A_DS=/home/openarm14/ws/junmo_cho/rd-rl/rl-dataset
-A_RUNS=/home/openarm14/ws/junmo_cho/rd-rl/runs
+A_RL=/home/rd/ws/junmo_cho/rd-rl
+A_CKPT=/home/rd/ws/junmo_cho/checkpoints
+A_DS=/home/rd/ws/junmo_cho/rd-rl/rl-dataset
+A_RUNS=/home/rd/ws/junmo_cho/rd-rl/runs
 
 # --- learner (training server) ---
 L_RL=/data/junmo_cho/workspace/rd-rl
