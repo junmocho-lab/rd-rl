@@ -49,35 +49,22 @@ spec:
         - name: main
           image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
           env:
-            # yaml 에 박히는 절대경로는 이것 하나뿐 (부트스트랩). 나머지 경로는
-            # $L_RL/configs/paths.sh 에서 온다 — 경로의 단일 소스를 둘로 쪼개지 않는다.
-            - name: L_RL
-              value: /data/junmo_cho/workspace/rd-rl
+            # 잡 파라미터만 둔다. 경로·인터프리터는 configs/paths.sh 가 정본이다.
             - name: RDRL_EXP
               value: openarm_red_block
           command: ["/bin/bash", "-c"]
           args:
             - |
               set -euo pipefail
-
+              source /data/junmo_cho/workspace/rd-rl/configs/paths.sh
               cd "$L_RL"
-
-              # 재시작된 잡이 고친 코드를 집어 올리는 경로. 어느 커밋으로 돌았는지는
-              # 아래 SHA 로그와 라운드 meta.json 에 남는다.
-              git pull --ff-only || echo "[warn] git pull 실패 — 현재 체크아웃으로 계속"
-              echo "[code] rd-rl $(git rev-parse --short HEAD)"
-              git status --porcelain | head
-
-              # 경로 단일 소스. set -a 로 export 해서 python 인자로 넘긴다.
-              set -a
-              source configs/paths.sh
-              set +a
 
               echo "[paths] L_RUNS=$L_RUNS"
               echo "[paths] L_CKPT=$L_CKPT"
               echo "[paths] L_DS=$L_DS"
+              echo "[python] $L_PY $("$L_PY" -V 2>&1)"
 
-              exec ./.venv/bin/python learner/loop.py \
+              exec "$L_PY" learner/loop.py \
                   --exp "$RDRL_EXP" \
                   --runs-root "$L_RUNS" \
                   --ckpt-root "$L_CKPT" \
