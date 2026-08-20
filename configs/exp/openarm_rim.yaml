@@ -11,6 +11,9 @@ robot: openarm_rh56f1
 # (right_arm 과 left_hand 가 뒤바뀐다).
 rldx_data_config: rldx/configs/data/openarm_inspire_config.py
 
+# state/action 그룹 경계의 정본 (rd-rl 상대경로). 순서는 위 rldx_data_config 가 정한다.
+modality: modality/openarm_lefthand/modality.json
+
 # $A_CKPT / $L_CKPT 아래 상대경로. EXPO 는 이 BC 정책을 **감싼다** —
 # 백본 동결 + action expert LoRA + edit policy + critic 앙상블.
 base_policy: 0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp

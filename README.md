@@ -53,13 +53,34 @@
    ./actor/start_learner.sh openarm_rim
    ```
    `run id = openarm_rim_<날짜-시각>` 이 `$A_RUNS/CURRENT` 에 적히고 이후 명령들이 그걸 기본값으로
-   읽는다. 잡은 `$L_RUNS/<run id>/` 메일박스를 5초마다 폴링한다.
+   읽는다. 잡은 폴링을 시작하기 전에 **θ₀ 를 만들어 내보낸다**:
+
+   ```
+   $L_CKPT/expo/<run id>/init/{theta.pt, meta.json, DONE}      184MB
+   ```
+
+   θ₀ = 비전 인코더 + critic 앙상블 + target critic + edit policy + temperature.
+   `configs/exp/<이름>.yaml` 의 `modality` / `rldx_data_config` / `expo` 블록으로 만들고,
+   base 정책 체크포인트와 순서를 교차검증한다 (어긋나면 여기서 죽는다). `meta.json` 에
+   seed·sha256·torch 버전·코드 SHA 가 남는다. Job 이 재시작해도 `init/DONE` 이 있으면
+   **다시 만들지 않는다** — actor 가 롤아웃 중인 θ₀ 를 바꿔치기하면 안 되니까.
+
+   그리고 `$L_RUNS/<run id>/` 메일박스를 5초마다 폴링한다.
    잡 이름(`junmo-cho-rdrl-openarm-rim-<날짜-시각>`)과 로그·중단 명령은 스크립트가 출력해준다.
    ```
    kubectl -n $L_NS logs -f job/<잡 이름>                              # 로그
    kubectl -n $L_NS exec $L_POD -- tail -20 $L_RUNS/<run id>/learner.log
    kubectl -n $L_NS delete job <잡 이름>                               # 중단
    ```
+
+6b. θ₀ 를 로컬로 받는다 (**round 0 롤아웃 전에 한 번**)
+   ```
+   uv run ./actor/recv_round.py --round init
+   ```
+   → `$A_CKPT/expo/<run id>/init/` (learner 와 같은 상대경로). 이걸 받아야 actor 가
+   **learner 가 학습을 시작하는 것과 같은 파라미터로** round 0 을 돌 수 있다. 안 받고
+   띄우면 서버가 그 자리에서 랜덤 초기화하는데, 그러면 round 0 을 무엇으로 모았는지
+   기록할 수 없다 (off-policy 라 학습이 틀리는 건 아니지만 재현이 안 된다).
 
    ── 여기부터 7~10을 라운드마다 반복 ──
 
@@ -70,16 +91,23 @@
    PYTHONPATH="$PWD:$A_RL" pixi run -e rldx python -u -m rl.vla_rldx serve \
        --exp openarm_rim \
        --model-path $A_CKPT/0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
-       --modality $A_RL/modality/openarm_lefthand/modality.json \
-       --artifacts $A_CKPT/expo/<run id>/r<NNN>/critic.pt \
+       --artifacts $A_CKPT/expo/<run id>/init/theta.pt \
        --host 127.0.0.1 --port 5555
    ```
-   (`--artifacts` 를 만드는 learner 쪽은 아직 stub 이다 — 아래 참고. round 0 은 안 쓴다.)
+   `--model-path` 는 **base BC 정책**이고 라운드가 지나도 바뀌지 않는다 (13.8GB. 3번에서
+   받은 그것). 라운드마다 바뀌는 것은 `--artifacts` 뿐이다:
 
-   `--model-path` 는 **base BC 정책**이고 라운드가 지나도 바뀌지 않는다. 라운드마다 바뀌는 것은
-   `--artifacts` (critic + 인코더 + edit policy) 다. **round 0 은 `--artifacts` 없이** 띄운다 —
-   랜덤 critic·랜덤 residual 로 수집하는 EXPO-FT 의 warmup 과 같은 조건이고, edit 이 액션을
-   흔들어주는 덕에 탐색 데이터가 생긴다 (base BC 보다 성공률은 낮다).
+   | 라운드 | `--artifacts` | 들어있는 것 |
+   |---|---|---|
+   | 0 | `init/theta.pt` | 인코더 + critic + target + edit policy + temperature |
+   | 1~ | `r<NNN>/theta.pt` | 위 + **학습된 action expert LoRA** |
+
+   round 0 에 LoRA 가 없는 이유: PEFT 의 `lora_B` 가 0 초기화라 주입 직후 델타가
+   정확히 0 이다 (실측 `0.00e+00`). 즉 **round 0 의 VLA 출력은 base BC 와 같고**,
+   정책을 바꾸는 건 critic argmax + edit 뿐이다. 13.8GB 를 올려 0 을 저장할 이유가 없어
+   learner 가 θ₀ 에서 빼고, 서버 로더는 "있는 키만 채운다" 라서 이 차이가 코드 경로를
+   나누지 않는다. round 0 이 랜덤 critic·랜덤 residual 로 도는 것은 EXPO-FT 의 warmup 과
+   같은 조건이고, edit 이 액션을 흔들어주는 덕에 탐색 데이터가 생긴다 (성공률은 base BC 보다 낮다).
 
    `action_horizon` / `replan_steps` / `inference_latency` / `explore_groups` / EXPO 값은
    전부 `--exp` 의 yaml 에서 읽는다. RTC 는 `--rtc-inference-mode trained` (기본) 이고 지연은
@@ -159,12 +187,6 @@ edit_scale         0.2         ← edit 이 흔드는 크기 (base 다양성의 
   temperature ≈ 120MB) export, 주기적 체크포인트
 - **정책 서버 핫리로드** — 지금은 라운드마다 서버를 다시 띄워야 한다 (백본 13.8GB 로드에
   약 40초). `--artifacts` 만 다시 읽으면 되므로 나중에 붙인다
-- **θ₀ 왕복** — round 0 도 `--artifacts` 를 받게 해야 한다. 지금은 서버가 없으면 critic /
-  edit policy 를 그 자리에서 랜덤 초기화하는데, 그러면 learner 가 학습을 시작하는 θ₀ 와
-  **actor 가 실제로 롤아웃한 θ₀ 가 다르다.** off-policy 라 학습이 틀리는 건 아니지만 라운드
-  0 을 무엇으로 모았는지 기록할 수 없다. 계획: learner 가 뜰 때 `expo/<run id>/init/` 에
-  θ₀ 를 내보내고 actor 가 그것을 받아서 7번을 돈다 (~120MB. base 백본은 3번에서 이미 받았고
-  라운드마다 바뀌지 않는다). 초기화가 seed 로 재현되는 것은 먼저 맞춰뒀다 (rl/expo.py 검사 8)
 - **GPU 잡 yaml** — `k8s/learner.yaml` 은 CPU 전용이고 learner 환경도 py3.10(RLDX-1) 로 맞춰야 한다
 
 # BC Recipe

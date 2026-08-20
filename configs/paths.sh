@@ -11,10 +11,19 @@ L_DS=/data/junmo_cho/workspace/rd-rl/rl-dataset
 L_RUNS=/data/junmo_cho/workspace/rd-rl/runs
 # 학습서버에서 쓸 인터프리터. DDN 의 rd-rl/.venv 는 파드 안에서 uv sync 로 만들어져
 # bin/python 이 /root/.local/... (컨테이너 로컬)을 가리키므로 fresh 파드에서 못 쓴다.
-# (RLDX-1/.venv 는 home 이 /usr/bin 이라 Job 에서 동작한다.)
-# 실제 학습 단계에서는 RLDX-1 이 requires-python "==3.10.*" 이므로
-# /usr/bin/python3 (3.10.12) 기준 venv 를 만들고 이 값만 그리로 바꾼다.
-L_PY=/opt/conda/bin/python3
+#
+# 그래서 RLDX-1 학습 잡이 쓰는 venv 를 그대로 쓴다 — bin/python 이 /usr/bin/python3
+# 심볼릭 링크라 fresh 파드에서도 살아있고, RLDX-1 이 요구하는 파이썬·패키지가 다 있다:
+#   python 3.10.12 / torch 2.7.0+cu126 / peft 0.17.1 / torchcodec 0.4.0 / transformers 4.57.0
+# (참고: actor 로컬 pixi rldx 는 torch 2.8.0+cu128 이다. 버전이 달라 같은 seed 로도
+#  θ₀ 가 비트 단위로 같지 않을 수 있다 — 그래서 θ₀ 는 재구성하지 않고 파일로 옮긴다.)
+# 이미지의 /opt/conda/bin/python3 는 3.13.12 이고 torch 가 없다. 쓰지 말 것.
+L_PY=/data/junmo_cho/workspace/RLDX-1/.venv/bin/python
+
+# rldx 를 **우리가 pin 한 서브모듈**에서 import 하게 만든다. 이게 없으면 위 venv 에
+# 설치된 다른 체크아웃(/data/junmo_cho/workspace/RLDX-1)이 잡혀서, 라운드 기록에는
+# 우리 SHA 가 남는데 실제로는 다른 코드가 도는 상황이 된다.
+L_PYTHONPATH=$L_RL/third_party/RLDX-1:$L_RL
 
 # --- k8s ---
 L_NS=p-rlwrld

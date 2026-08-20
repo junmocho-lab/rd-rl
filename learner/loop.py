@@ -227,6 +227,101 @@ def code_provenance(repo: Path) -> dict:
     return prov
 
 
+def export_init(ckpt_exp: Path, log: Log, args) -> None:
+    """learner 가 뜰 때 θ₀ 를 내보낸다. actor 가 이걸 받아 round 0 을 돈다.
+
+    θ₀ = 비전 인코더 + critic 앙상블 + target critic + edit policy + temperature.
+
+    **action expert LoRA 는 넣지 않는다.** PEFT 의 lora_B 가 0 초기화라 주입 직후
+    델타가 정확히 0 이고 (실측: 주입 후 출력 변화 0.00e+00), 그래서 round 0 의 VLA
+    출력은 base BC 와 **정확히 같다**. 13.8GB 백본을 올려 0 을 저장할 이유가 없다.
+    r000 부터는 학습된 LoRA 가 산출물에 들어간다. actor 쪽 로더는 "있는 키만 채운다"
+    라서 이 차이가 코드 경로를 나누지 않는다.
+
+    VLA 자리에 DummyVLA 를 쓰는 이유: EXPOLearner 는 생성 시점에 vla 에서
+    action_horizon 하나만 읽는다 (latency+replan 검사). 그래서 θ₀ 를 만들 때는
+    base 정책을 로드할 필요가 없다.
+
+    이미 init/DONE 이 있으면 아무것도 하지 않는다 — Job 이 재시작해도 actor 가
+    롤아웃 중인 θ₀ 를 바꿔치기하면 안 된다.
+    """
+    out = ckpt_exp / "init"
+    if (out / "DONE").exists():
+        log(f"[init] θ₀ 이미 있다 → {out}")
+        return
+    if not args.exp_config:
+        log("[init] --exp-config 가 없어 θ₀ 를 만들지 않는다 (프레임워크 stub 모드)")
+        return
+    try:
+        import torch
+        import yaml
+
+        from rl.data import resolve_modality
+        from rl.expo import DummyVLA, EXPOLearner, ExpoConfig
+        from rl.nets import explore_spec
+    except ImportError as e:
+        log(f"[init] θ₀ 를 건너뛴다 — {e}")
+        log("       L_PY 가 torch 있는 python 3.10 인지, PYTHONPATH 에 rd-rl 과 "
+            "third_party/RLDX-1 이 있는지 확인할 것")
+        return
+
+    repo = Path(args.repo)
+    cfg_path = Path(args.exp_config)
+    if not cfg_path.is_absolute():
+        cfg_path = repo / cfg_path
+    exp = yaml.safe_load(cfg_path.read_text())
+    log(f"[init] {cfg_path.name}  torch {torch.__version__}  python {sys.version.split()[0]}")
+
+    # base 정책 체크포인트와 교차검증한다 — 등록 config 와 순서가 다르면 여기서 죽는다
+    # (openarm 은 실제로 modality.json 의 start 순과 모델 순서가 다르다).
+    base = args.ckpt_root / exp["base_policy"] if exp.get("base_policy") else None
+    if base is not None and not base.is_dir():
+        log(f"[init] base 정책이 없어 교차검증을 건너뜀: {base}")
+        base = None
+    mod, src = resolve_modality(repo, repo / exp["modality"], repo / "third_party" / "RLDX-1",
+                                exp["rldx_data_config"], base)
+    ecfg = ExpoConfig.from_dict(exp.get("expo"))
+    spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
+                        mod.action_dim, int(exp["replan_steps"]))
+    seed = int(args.seed)
+    L = EXPOLearner(DummyVLA(mod.action_dim, int(exp["action_horizon"])), spec, mod.state_dim,
+                    mod.n_cams, int(exp["replan_steps"]), ecfg, device="cpu", seed=seed,
+                    latency=int(exp["inference_latency"]))
+
+    out.mkdir(parents=True, exist_ok=True)
+    theta = out / "theta.pt"
+    torch.save({"enc": L.encoder.state_dict(), "critic": L.critic.state_dict(),
+                "target": L.target_critic.state_dict(), "residual": L.residual.state_dict(),
+                "temp": L.temp.state_dict()}, theta)
+    sha = hashlib.sha256(theta.read_bytes()).hexdigest()
+    n = sum(p.numel() for m in (L.encoder, L.critic, L.target_critic, L.residual, L.temp)
+            for p in m.parameters())
+    log(f"[init] θ₀ {theta.name} {theta.stat().st_size/1e6:.0f} MB  {n/1e6:.2f}M 파라미터")
+    log(f"       sha256 {sha[:16]}  seed={seed}  탐색 {list(spec.groups)}")
+    log(f"       {src}")
+
+    write_atomic(out / "meta.json", {
+        "kind": "init",
+        "exp_config": str(cfg_path.relative_to(repo)) if cfg_path.is_relative_to(repo)
+                      else str(cfg_path),
+        "seed": seed,
+        "theta_sha256": sha,
+        "params": n,
+        "artifacts": ["theta.pt"],
+        "keys": ["enc", "critic", "target", "residual", "temp"],
+        "lora": "zero-init (포함하지 않음 — 주입 직후 델타가 0 이라 base BC 와 동일)",
+        "torch": torch.__version__,
+        "expo_deviations": ecfg.deviations(),
+        "explore_groups": list(spec.groups),
+        "modality_source": src,
+        "code": code_provenance(repo),
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    write_atomic(out / "DONE", {"kind": "init", "theta_sha256": sha,
+                               "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    log(f"[init] DONE → {out}  (actor: ./actor/recv_round.py --round init)")
+
+
 def export_stub(ckpt_round: Path, log: Log, args, stats: dict, ready: dict) -> None:
     """실제 학습이 붙기 전의 자리. actor recv 를 시험할 수 있게 더미 페이로드를 쓴다."""
     payload_dir = ckpt_round / "payload"
@@ -309,6 +404,9 @@ def main() -> int:
     p.add_argument("--once", action="store_true", help="라운드 하나 처리하고 종료")
     p.add_argument("--updates-per-episode", type=int, default=11,
                    help="에피소드당 update() 횟수. EXPO-FT parity 환산값 (지금은 로그만)")
+    p.add_argument("--exp-config", default="",
+                   help="configs/exp/<이름>.yaml. 주면 시작할 때 θ₀ 를 init/ 로 내보낸다")
+    p.add_argument("--seed", type=int, default=0, help="θ₀ 초기화 seed (manifest 에 기록된다)")
     p.add_argument("--stub-seconds", type=float, default=5.0, help="stub 학습 소요 시간")
     p.add_argument("--stub-payload-mb", type=float, default=1.0)
     args = p.parse_args()
@@ -329,6 +427,9 @@ def main() -> int:
     log(f"  code     {code_provenance(Path(args.repo))}")
     runs_exp.mkdir(parents=True, exist_ok=True)
     ckpt_exp.mkdir(parents=True, exist_ok=True)
+
+    # 폴링 전에 θ₀ 를 내보낸다 — actor 가 이걸 받아야 round 0 을 돌 수 있다.
+    export_init(ckpt_exp, log, args)
 
     last_beat = 0.0
     processed = 0
