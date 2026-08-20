@@ -151,6 +151,19 @@ class EXPOLearner:
         c = self.cfg
         full = spec.full_dim
 
+        # 파라미터 초기화까지 seed 로 고정한다. self.gen 은 REDQ 부분집합 뽑기용이고
+        # nn.Linear/Conv 의 초기화는 전역 RNG 를 타므로 이게 없으면 **같은 seed 로도
+        # 매번 다른 θ₀** 가 나온다. 그러면 라운드 0 을 무엇으로 모았는지 기록할 수 없다
+        # (actor 와 learner 가 서로 다른 θ₀ 를 갖는다 — 실제 θ₀ 일치는 learner 가
+        # init 산출물을 내보내고 actor 가 그걸 로드해서 보장한다. 여기 seed 는 learner 가
+        # 재시작해도 같은 θ₀ 를 다시 만들 수 있게 하는 것).
+        #
+        # 모듈은 CPU 에서 만들어진 뒤 .to(device) 되므로 초기화는 CPU RNG 만 쓴다 =
+        # 기계·GPU 와 무관하다 (torch 버전은 같아야 한다). torch.manual_seed 는 CUDA
+        # 전역 RNG 도 같이 잡는데, 학습 시작 시점에 한 번 부르는 것이라 의도한 동작이다
+        # (VLA 디노이저 샘플링도 같은 seed 아래로 들어온다).
+        torch.manual_seed(seed)
+
         self.encoder = BatchEncoder(3 * n_cams, c.latent_dim_image, c.encoder_stage_sizes,
                                     c.encoder_num_filters).to(self.device)
         self.critic = CriticEnsemble(c.latent_dim_image, state_dim, full, c.num_qs,
@@ -480,6 +493,16 @@ def _verify() -> int:
         dev = c.deviations()
         check(f"7 {name}.yaml 의 expo 블록이 EXPO-FT 기본값과 동일", not dev,
               f"차이: {dev}" if dev else f"{len(_dc_fields(ExpoConfig))}개 항목 일치")
+
+    # 8) θ₀ 재현성 — seed 가 파라미터 초기화까지 잡는지
+    def theta(seed):
+        lr = EXPOLearner(DummyVLA(adim, 40), spec, adim, n_cams, replan, cfg, seed=seed,
+                         latency=latency)
+        return torch.cat([p.flatten() for p in lr.critic.parameters()][:2] +
+                         [p.flatten() for p in lr.residual.parameters()][:2])
+    same = torch.equal(theta(0), theta(0))
+    check("8 같은 seed → 같은 θ₀ (라운드 0 을 무엇으로 모았는지 기록하려면 필수)", same)
+    check("8 다른 seed → 다른 θ₀", not torch.equal(theta(0), theta(1)))
 
     print(f"\n{'전부 통과' if not fails else f'{len(fails)}개 실패: ' + ', '.join(fails)}")
     return 1 if fails else 0

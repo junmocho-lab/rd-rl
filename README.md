@@ -17,6 +17,29 @@
    kubectl cp $L_POD:$L_CKPT/0814-openarm-rh56f1-rldx-ptimg $A_CKPT/0814-openarm-rh56f1-rldx-ptimg
    ```
 4. bc policy rollout 진행 및 위처럼 2. 처럼 inference data 세팅
+
+   먼저 **base BC 정책만** 서빙한다 (RLDX 원본 서버. edit policy·critic 이 없는 순수 BC —
+   7번의 EXPO 서버와 다르다).
+   ```
+   cd third_party/RLDX-1
+   ROS_DOMAIN_ID=106 pixi run -e rldx python -u -m rldx.eval.run_rldx_server \
+       --model-path $A_CKPT/0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
+       --embodiment-tag GENERAL_EMBODIMENT \
+       --host 127.0.0.1 --port 5555 \
+       --rtc-inference-mode trained \
+       --rtc-inference-delay 2
+   ```
+   `python rldx/eval/run_rldx_server.py` 가 아니라 `-m` 인 이유: 이 서브모듈의 pixi 환경에는
+   rldx 가 설치돼 있지 않아 스크립트로 부르면 `ModuleNotFoundError: rldx` 가 난다
+   (`-m` 은 cwd 를 sys.path 에 넣는다).
+
+   `--rtc-inference-delay` 는 rrc 의 `inference_latency_steps` 와 같아야 한다
+   (openarm 2 / fuji·CJL 3 — `configs/exp/<실험>.yaml` 의 `inference_latency`).
+
+   실측 (로컬 5090, ZMQ 왕복 20회): 평균 118ms/회. 7번의 EXPO 서버는 같은 조건에서
+   121ms 였다 — 후보 8개를 뽑는 비용이 3ms 밖에 안 되는 건 백본이 시간을 다 쓰기 때문이다.
+
+   그리고 롤아웃한 데이터를 변환한다.
    ```
    uv run ./utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/0815_openarm_rh56f1_inference -o ./rl-dataset/r0 --modality modality/openarm_lefthand/modality.json
    ```
@@ -40,7 +63,8 @@
 
    ── 여기부터 7~10을 라운드마다 반복 ──
 
-7. 정책 서버 띄우기 (rrc 의 ZMQ 클라이언트가 붙는다)
+7. **EXPO** 정책 서버 띄우기 (rrc 의 ZMQ 클라이언트가 붙는다. 4번의 순수 BC 서버와 달리
+   base 정책 + edit policy + critic 을 함께 서빙한다)
    ```
    cd third_party/RLDX-1
    PYTHONPATH="$PWD:$A_RL" pixi run -e rldx python -u -m rl.vla_rldx serve \
@@ -135,6 +159,12 @@ edit_scale         0.2         ← edit 이 흔드는 크기 (base 다양성의 
   temperature ≈ 120MB) export, 주기적 체크포인트
 - **정책 서버 핫리로드** — 지금은 라운드마다 서버를 다시 띄워야 한다 (백본 13.8GB 로드에
   약 40초). `--artifacts` 만 다시 읽으면 되므로 나중에 붙인다
+- **θ₀ 왕복** — round 0 도 `--artifacts` 를 받게 해야 한다. 지금은 서버가 없으면 critic /
+  edit policy 를 그 자리에서 랜덤 초기화하는데, 그러면 learner 가 학습을 시작하는 θ₀ 와
+  **actor 가 실제로 롤아웃한 θ₀ 가 다르다.** off-policy 라 학습이 틀리는 건 아니지만 라운드
+  0 을 무엇으로 모았는지 기록할 수 없다. 계획: learner 가 뜰 때 `expo/<run id>/init/` 에
+  θ₀ 를 내보내고 actor 가 그것을 받아서 7번을 돈다 (~120MB. base 백본은 3번에서 이미 받았고
+  라운드마다 바뀌지 않는다). 초기화가 seed 로 재현되는 것은 먼저 맞춰뒀다 (rl/expo.py 검사 8)
 - **GPU 잡 yaml** — `k8s/learner.yaml` 은 CPU 전용이고 learner 환경도 py3.10(RLDX-1) 로 맞춰야 한다
 
 # BC Recipe
