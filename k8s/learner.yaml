@@ -1,0 +1,95 @@
+# rd-rl learner — 상시 대기 잡 (현재는 학습 stub, CPU 만).
+#
+# 라운드 메일박스를 폴링하다가 actor 가 READY 를 올리면 검증 → (학습) → DONE 을 쓴다.
+# 실제 학습을 붙일 때 바뀌는 것은 세 곳뿐: resources 에 GPU 추가, job-class 를 dedicated,
+# activeDeadlineSeconds 를 48h.
+#
+#   제출: kubectl apply -f k8s/learner.yaml
+#   로그: kubectl -n p-rlwrld logs -f job/junmo-cho-rdrl-learner
+#         (잡을 지워도 DDN 에 남는다: $L_RUNS/<exp>/learner.log)
+#   중단: kubectl -n p-rlwrld delete job junmo-cho-rdrl-learner
+#         → 컨테이너에 SIGTERM 이 가고 loop.py 가 그걸 로그에 남기고 종료한다
+#            (축출/preemption 과 크래시를 로그로 구분할 수 있게 해둔 이유)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: junmo-cho-rdrl-learner
+  namespace: p-rlwrld
+  labels:
+    # 지금은 CPU 만 쓰는 stub 이라 background. 실제 학습(GPU 상시)은 dedicated 로 올린다.
+    # background 가 preempt 되는지가 상시 잡의 미확인 리스크 — SIGTERM 로그로 관측된다.
+    mlxp/job-class: background
+    project-short-name: rd
+spec:
+  ttlSecondsAfterFinished: 3600
+  # DeadlineExceeded 는 재시도되지 않는다 (다시 apply 해야 한다). 상태는 DDN 에 있으므로
+  # 재제출하면 DONE/FAILED 없는 라운드부터 이어받는다.
+  activeDeadlineSeconds: 86400 # 24h. 실제 학습 잡은 172800 (48h)
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        mlxp/job-class: background # 파드에도 필수 — Job 라벨만으론 fallback 된다
+        project-short-name: rd
+      annotations:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mlxp-registry
+      nodeSelector:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+      containers:
+        - name: main
+          image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+          env:
+            # yaml 에 박히는 절대경로는 이것 하나뿐 (부트스트랩). 나머지 경로는
+            # $L_RL/configs/paths.sh 에서 온다 — 경로의 단일 소스를 둘로 쪼개지 않는다.
+            - name: L_RL
+              value: /data/junmo_cho/workspace/rd-rl
+            - name: RDRL_EXP
+              value: openarm_red_block
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              cd "$L_RL"
+
+              # 재시작된 잡이 고친 코드를 집어 올리는 경로. 어느 커밋으로 돌았는지는
+              # 아래 SHA 로그와 라운드 meta.json 에 남는다.
+              git pull --ff-only || echo "[warn] git pull 실패 — 현재 체크아웃으로 계속"
+              echo "[code] rd-rl $(git rev-parse --short HEAD)"
+              git status --porcelain | head
+
+              # 경로 단일 소스. set -a 로 export 해서 python 인자로 넘긴다.
+              set -a
+              source configs/paths.sh
+              set +a
+
+              echo "[paths] L_RUNS=$L_RUNS"
+              echo "[paths] L_CKPT=$L_CKPT"
+              echo "[paths] L_DS=$L_DS"
+
+              exec ./.venv/bin/python learner/loop.py \
+                  --exp "$RDRL_EXP" \
+                  --runs-root "$L_RUNS" \
+                  --ckpt-root "$L_CKPT" \
+                  --repo "$L_RL" \
+                  --poll-seconds 5 \
+                  --heartbeat-seconds 300 \
+                  --updates-per-episode 11 \
+                  --stub-seconds 5 \
+                  --stub-payload-mb 1
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+          resources:
+            requests: { cpu: "1", memory: "2Gi" }
+            limits: { cpu: "2", memory: "4Gi" }

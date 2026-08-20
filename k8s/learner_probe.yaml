@@ -1,0 +1,91 @@
+# rd-rl learner — CPU probe.
+#
+# GPU 없이 Job 경로(이미지·마운트·라벨·스케줄링)를 먼저 뚫기 위한 최소 잡.
+# 하는 일: 컨테이너 환경 사실 출력 + /data 메일박스 경로 쓰기 검증. 몇 초 돌고 끝난다.
+# 실제 학습 잡은 여기서 resources 에 GPU 를 붙이고 job-class 를 dedicated 로 올린다.
+#
+#   제출: kubectl apply -f k8s/learner_probe.yaml
+#   로그: kubectl -n p-rlwrld logs -f job/junmo-cho-rdrl-probe
+#   정리: kubectl -n p-rlwrld delete job junmo-cho-rdrl-probe   (ttl 로도 자동 삭제)
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: junmo-cho-rdrl-probe
+  namespace: p-rlwrld
+  labels:
+    # CPU 만 쓰는 짧은 잡이라 background. 실제 학습(GPU 상시)은 dedicated 로.
+    mlxp/job-class: background
+    # 과제코드 필수 (2026-07-29 시행). 배정 코드 없으면 RD 팀 = rd.
+    project-short-name: rd
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        mlxp/job-class: background # 파드에도 필수 — Job 라벨만으론 fallback 된다
+        project-short-name: rd
+      annotations:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mlxp-registry
+      # junmo-cho-data-pod 과 같은 zone. GPU 를 요청하지 않으므로 CPU 노드로 스케줄된다
+      # (data-pod 이 이 zone 에서 GPU 0장으로 도는 것과 같은 구성).
+      nodeSelector:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+      containers:
+        - name: main
+          image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+          env:
+            - name: L_RL
+              value: /data/junmo_cho/workspace/rd-rl
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+
+              echo "=== 이미지가 보장하는 것 (data-pod 이 아니라 fresh 파드 기준) ==="
+              echo -n "hostname : "; hostname
+              echo -n "id       : "; id
+              echo "-- python 후보 --"
+              for c in /usr/bin/python3 /usr/bin/python3.10 /opt/conda/bin/python3 python3; do
+                if command -v "$c" >/dev/null 2>&1; then
+                  printf "  %-26s %s\n" "$c" "$($c -V 2>&1)"
+                else
+                  printf "  %-26s 없음\n" "$c"
+                fi
+              done
+              echo "-- 도구 --"
+              for c in git ssh rsync uv curl tar; do
+                printf "  %-6s %s\n" "$c" "$(command -v $c || echo 없음)"
+              done
+
+              echo
+              echo "=== DDN 의 venv 가 이 파드에서 되나 ==="
+              V="$L_RL/.venv/bin/python"
+              echo -n "  rd-rl  : "; ($V -V 2>&1 | head -1) || echo "실패 (예상됨)"
+              echo -n "  RLDX-1 : "; (/data/junmo_cho/workspace/RLDX-1/.venv/bin/python -V 2>&1 | head -1) || echo 실패
+
+              echo
+              echo "=== git pull 을 https 로 (ssh 없이) ==="
+              cd "$L_RL"
+              git -c url."https://github.com/".insteadOf="git@github.com:" ls-remote origin main 2>&1 | head -2
+              echo "  exit=$?"
+
+              echo
+              echo "=== 끝 ==="
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+          resources:
+            requests: { cpu: "1", memory: "2Gi" }
+            limits:   { cpu: "2", memory: "4Gi" }

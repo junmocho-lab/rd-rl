@@ -2,11 +2,13 @@
 A_RL=/home/openarm14/ws/junmo_cho/rd-rl
 A_CKPT=/home/openarm14/ws/junmo_cho/checkpoints
 A_DS=/home/openarm14/ws/junmo_cho/rd-rl/rl-dataset
+A_RUNS=/home/openarm14/ws/junmo_cho/rd-rl/runs
 
 # --- learner (training server) ---
 L_RL=/data/junmo_cho/workspace/rd-rl
 L_CKPT=/data/rlwrld-unified-checkpoints/junmo_cho/checkpoints
 L_DS=/data/junmo_cho/workspace/rd-rl/rl-dataset
+L_RUNS=/data/junmo_cho/workspace/rd-rl/runs
 
 # --- k8s ---
 L_NS=p-rlwrld

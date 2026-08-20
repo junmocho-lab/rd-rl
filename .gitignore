@@ -7,3 +7,6 @@ claude_logs
 # python
 .venv/
 __pycache__/
+
+# 라운드 메일박스 (프레임워크가 만들고 관리하는 상태)
+runs/
