@@ -25,6 +25,70 @@
    kubectl cp $A_DS/r0 $L_POD:$L_DS/r0
    ```
 
+6. learner 상시 잡 띄우기 (**한 번만**. 라운드마다 다시 띄우지 않는다)
+   ```
+   ./actor/start_learner.sh openarm_rim
+   ```
+   `run id = openarm_rim_<날짜-시각>` 이 `$A_RUNS/CURRENT` 에 적히고 이후 명령들이 그걸 기본값으로
+   읽는다. 잡은 `$L_RUNS/<run id>/` 메일박스를 5초마다 폴링한다.
+   잡 이름(`junmo-cho-rdrl-openarm-rim-<날짜-시각>`)과 로그·중단 명령은 스크립트가 출력해준다.
+   ```
+   kubectl -n $L_NS logs -f job/<잡 이름>                              # 로그
+   kubectl -n $L_NS exec $L_POD -- tail -20 $L_RUNS/<run id>/learner.log
+   kubectl -n $L_NS delete job <잡 이름>                               # 중단
+   ```
+
+   ── 여기부터 7~10을 라운드마다 반복 ──
+
+7. 정책 서버 띄우기 (round 0 은 base BC, 이후는 10에서 회수한 산출물) — **⬜ 미구현**
+   rrc 의 ZMQ 클라이언트가 붙는다. 후보 N개 뽑기 + edit 더하기 + Q argmax + RTC prefix.
+
+8. 롤아웃 + 사람이 에피소드별 성공/실패 라벨 (rrc-release) → 2번처럼 변환
+   ```
+   uv run ./utils/convert_data.py ~/Code/rrc-release/data/junmo_cho/<날짜>_openarm_rh56f1_inference \
+       -o ./rl-dataset/r<N> --modality modality/openarm_lefthand/modality.json
+   ```
+
+9. 라운드 전송 (세션별로 올린 뒤 **맨 마지막에** READY)
+   ```
+   uv run ./actor/send_round.py --round <N> \
+       --dataset ./rl-dataset/r<N>/<데이터셋>/<세션>_320x192 \
+       --collected-by base          # 이후 라운드는 r000, r001, ... (어느 정책이 모았는지)
+   ```
+   `--dataset` 에 부모 디렉토리를 주면 그 안의 세션들로 펼쳐진다. 같은 라운드를 다시 보내면
+   원격을 비우고 새로 올린다(멱등) — 단 learner 가 그 라운드를 **처리 중**일 때는 금지.
+
+10. 학습 끝날 때까지 기다렸다 산출물 회수 (DONE 이 뜨면 완성된 것)
+    ```
+    uv run ./actor/recv_round.py --round <N> --timeout 3600
+    ```
+    → `$A_CKPT/expo/<run id>/r<NNN>/` (learner 와 같은 상대경로). 그리고 7로 돌아간다.
+
+## 라운드 번호
+
+send / learner / recv 가 **같은 번호**를 쓴다.
+
+```
+actor    $A_RUNS/<run id>/r000/                          보낸 기록
+learner  $L_RUNS/<run id>/r000/{dataset/,READY}          메일박스
+learner  $L_CKPT/expo/<run id>/r000/{payload/,meta.json,DONE}
+actor    $A_CKPT/expo/<run id>/r000/                     회수
+```
+
+learner 는 **READY 가 있고 DONE/FAILED 가 없는 가장 작은 번호**를 집는다 — 잡이 죽어도 이어받고,
+같은 번호를 다시 보내면 다시 처리한다 (READY 의 SHA 로 구분). READY 를 맨 마지막에 따로 올리는
+이유는 `kubectl cp` 가 원자적이지 않아서다 — learner 가 READY 의 숫자를 디스크와 대조해 절반만
+도착한 라운드를 걸러낸다.
+
+## 아직 stub 인 것
+
+- **learner 의 학습** — 지금 `learner/loop.py` 는 왕복(감지 → 검증 → 산출물 → DONE)만 검증하는
+  `export_stub` 이다. 실제 `update()` 로 교체해야 한다: 라운드 누적 리플레이 버퍼 →
+  `rl/data.py` × `rl/expo.py` × `rl/vla_rldx.py`, 산출물(LoRA + critic + encoder + residual +
+  temperature ≈ 120MB) export, 주기적 체크포인트
+- **정책 서버** (7번) — 새 라운드가 오면 13.8GB 백본 재로드 없이 핫리로드해야 한다
+- **GPU 잡 yaml** — `k8s/learner.yaml` 은 CPU 전용이고 learner 환경도 py3.10(RLDX-1) 로 맞춰야 한다
+
 # BC Recipe
 ## Openarm
 ```
