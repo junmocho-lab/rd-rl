@@ -22,6 +22,8 @@ runtime 훅)를 그대로 쓰기 때문이다.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -310,7 +312,36 @@ class ExpoServer:
         """
         if path is None:
             return []
-        sd = torch.load(path, map_location=self.learner.device, weights_only=True)
+        path = Path(path)
+        if not path.is_file():
+            raise SystemExit(f"산출물이 없다: {path}")
+
+        # 옆의 meta.json 과 대조한다. 안 하면 잘려서 온 파일이 torch 내부 에러
+        # (PytorchStreamReader ... failed finding central directory) 로만 드러나서
+        # "학습이 깨졌나" 로 오해하게 된다. learner 가 sha256 을 남기는 이유가 이것.
+        meta = path.parent / "meta.json"
+        size = path.stat().st_size
+        if meta.is_file():
+            rec = json.loads(meta.read_text())
+            want = rec.get("theta_sha256")
+            if want:
+                got = hashlib.sha256(path.read_bytes()).hexdigest()
+                if got != want:
+                    raise SystemExit(
+                        f"산출물이 manifest 와 다르다 — 전송이 잘렸을 가능성이 크다.\n"
+                        f"  파일   {path} ({size:,} 바이트)\n"
+                        f"  sha256 {got}\n"
+                        f"  기대   {want}\n"
+                        f"  → 다시 받을 것: ./actor/recv_round.py --round "
+                        f"{'init' if path.parent.name == 'init' else path.parent.name}")
+                print(f"  [산출물] sha256 대조 OK ({size/1e6:.0f} MB)")
+        else:
+            print(f"  [산출물] meta.json 이 없어 sha256 대조를 건너뜀 ({size/1e6:.0f} MB)")
+
+        try:
+            sd = torch.load(path, map_location=self.learner.device, weights_only=True)
+        except Exception as e:
+            raise SystemExit(f"{path} 를 torch 로 읽을 수 없다 ({size:,} 바이트): {e}")
         pairs = {"enc": self.learner.encoder, "critic": self.learner.critic,
                  "target": self.learner.target_critic, "residual": self.learner.residual,
                  "temp": self.learner.temp}
