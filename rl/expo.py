@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
+from dataclasses import fields as _dc_fields
 
 import torch
 import torch.nn as nn
@@ -111,6 +112,27 @@ class ExpoConfig:
     utd_ratio: int = 20
     freeze_critic_encoder: bool = False
     actor_success_only: bool = True
+
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ExpoConfig":
+        """실험 yaml 의 expo 블록 → ExpoConfig. 모르는 키는 실패시킨다."""
+        d = dict(d or {})
+        fields = {f.name for f in _dc_fields(cls)}
+        unknown = set(d) - fields
+        if unknown:
+            raise ValueError(f"expo 블록에 모르는 키: {sorted(unknown)} (가능: {sorted(fields)})")
+        for k in ("hidden_dims", "encoder_stage_sizes"):
+            if k in d:
+                d[k] = tuple(d[k])
+        return cls(**d)
+
+    def deviations(self) -> dict:
+        """EXPO-FT 원본 기본값과 다른 항목. 라운드 manifest 에 기록해 눈에 보이게 한다."""
+        base = ExpoConfig()
+        return {f.name: (getattr(base, f.name), getattr(self, f.name))
+                for f in _dc_fields(ExpoConfig)
+                if getattr(base, f.name) != getattr(self, f.name)}
 
 
 class EXPOLearner:
@@ -431,6 +453,18 @@ def _verify() -> int:
           f"critic_loss={info['critic_loss']:.4f}  temperature={info.get('temperature', 0):.4f}")
     print(f"  [수치] select_with_residual={info['select_ratio_with_residual']:.2f}  "
           f"entropy={info.get('entropy', 0):.1f} (target {spec.target_entropy})")
+    # 7) 실험 yaml 의 expo 블록이 원본 기본값과 어긋나지 않는지
+    import yaml as _yaml
+    for name in ("openarm_rim", "fuji"):
+        f = repo / "configs" / "exp" / f"{name}.yaml"
+        if not f.is_file():
+            continue
+        d = _yaml.safe_load(f.read_text())
+        c = ExpoConfig.from_dict(d.get("expo"))
+        dev = c.deviations()
+        check(f"7 {name}.yaml 의 expo 블록이 EXPO-FT 기본값과 동일", not dev,
+              f"차이: {dev}" if dev else f"{len(_dc_fields(ExpoConfig))}개 항목 일치")
+
     print(f"\n{'전부 통과' if not fails else f'{len(fails)}개 실패: ' + ', '.join(fails)}")
     return 1 if fails else 0
 

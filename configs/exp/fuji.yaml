@@ -99,3 +99,51 @@ inference_latency: 3
 # EXPO-FT 원본 공식과 정확히 일치한다 (openarm 28차원으로 확인: active 100%, -112).
 explore_groups:
   - right_arm_joints
+
+# --- EXPO-FT 알고리즘 값 ----------------------------------------------------
+# openarm_rim.yaml 과 같은 블록. 원본 값이고 바꾸지 않는다 (바꾸면 파일에 보이고
+# 라운드 manifest 에 기록된다).
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.2
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+  discount: 0.99          # 실효 0.99^8 = 0.9227 → 유효 지평 12.9 매크로 스텝
+  tau: 0.005
+  actor_lr: 3.0e-4        # ★ residual(edit) actor 의 lr
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
+  batch_size: 64
+  utd_ratio: 20
+  freeze_critic_encoder: false
+  actor_success_only: true
+
+vla:
+  lora_rank: 16
+  lora_lr: 3.0e-4
+  freeze_backbone: true
+
+# --- 라운드 운영 ------------------------------------------------------------
+# 주의: 이 태스크는 에피소드가 약 1200 프레임(150 매크로 스텝)이다. openarm(31)의 4.8배라
+#   - 유효 지평 12.9 스텝이 에피소드의 8.6% 밖에 안 덮는다 (openarm 은 42%)
+#   - 에피소드당 transition 이 많아 라운드당 학습량이 같은 updates_per_episode 로도 커진다
+#   - 이미지가 3카메라라 프레임당 저장량이 openarm 의 1.5배
+# Phase D 에서 "에피소드 구간별 Q 기울기" 를 보고 discount 를 논의한다.
+round:
+  episodes_per_round: 5
+  updates_per_episode: 3
+  seed_teleop_episodes: 10
+  offline_ratio: 0.0
+  min_online_episodes: 10
+  warmup_n_edit_samples: 8
+  buffer_capacity: 100000

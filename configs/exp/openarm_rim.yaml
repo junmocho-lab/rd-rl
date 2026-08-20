@@ -1,0 +1,83 @@
+# openarm 리그로 "빨간 블록을 림에 넣기" 태스크. 기존 롤아웃 419 에피소드가 있어
+# Phase D(critic 오프라인 학습) 를 이 실험으로 먼저 돌린다.
+#
+# 자동/수동 구분과 제약은 configs/exp/fuji.yaml 헤더 참고 (같은 규칙).
+
+name: openarm_rim
+robot: openarm_rh56f1
+
+# state/action/video concat 순서와 embodiment_tag 의 정본 (third_party/RLDX-1 기준 상대경로).
+# 이 파일이 없으면 modality.json 의 start 순을 쓰게 되는데 openarm 은 그게 실제로 다르다
+# (right_arm 과 left_hand 가 뒤바뀐다).
+rldx_data_config: rldx/configs/data/openarm_inspire_config.py
+
+# $A_CKPT / $L_CKPT 아래 상대경로. EXPO 는 이 BC 정책을 **감싼다** —
+# 백본 동결 + action expert LoRA + edit policy + critic 앙상블.
+base_policy: 0814-openarm-rh56f1-rldx-ptimg/openarm_0814_rh56f1_teleop_all200ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp
+
+# rrc configs/controllers/ros_openarm_rh56f1_left_inference.yaml 과 일치해야 한다
+action_horizon: 16      # 모델 config
+replan_steps: 8         # execution_horizon
+inference_latency: 2    # inference_latency_steps
+
+# --- 탐색 범위 --------------------------------------------------------------
+# 실측(0815 롤아웃 262 에피소드)으로 정했다. 프레임 간 |Δ| 평균:
+#   left_arm 0.01043 / left_hand 0.01012  ← 활성
+#   right_arm 0.00033 / right_hand 0.00000 / neck 0.00000  ← 안 움직임
+# 안 움직이는 15차원을 탐색 대상에 넣으면 (1) 엔트로피 예산의 54% 가 아무 효과 없는
+# 차원에 쓰이고 (2) residual 이 정지해야 할 관절을 움직이라고 명령한다.
+# 비워 두면 전체 = EXPO-FT 원본 공식.
+explore_groups:
+  - left_arm_joints
+  - left_hand_joints
+
+# --- EXPO-FT 알고리즘 값 ----------------------------------------------------
+# 원본 configs/model/expo_ft_pi_config.py + train_pi_robo.py 기본값. **바꾸지 않는다.**
+# 여기 적어두는 이유: 태스크마다 다르게 쓸 수 있게 하고, 원본에서 벗어나면 그 사실이
+# 파일에 보이고 라운드 manifest 에 기록되도록.
+expo:
+  N: 8                    # 관측당 base 후보 수
+  n_edit_samples: 8       # edit 후보 수. 원본 롤아웃 경로는 N 과 같다고 가정한다
+  edit_scale: 0.2         # 편집 크기. 정규화된 액션 스케일(std 0.5)의 40%
+  num_qs: 10              # Q 앙상블 크기
+  num_min_qs: 2           # REDQ 부분집합 min
+  critic_layer_norm: true
+  discount: 0.99          # 실효 할인은 discount**replan_steps (0.99^8 = 0.9227)
+  tau: 0.005              # target critic polyak
+  actor_lr: 3.0e-4        # ★ residual(edit) actor 의 lr (VLA 가 아니다)
+  critic_lr: 3.0e-4       # critic + 비전 인코더
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]   # ResNetV2-50 급. 입력은 내부에서 224x224
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
+  batch_size: 64
+  utd_ratio: 20           # update() 한 번의 critic 미니배치 수
+  freeze_critic_encoder: false
+  actor_success_only: true  # actor BC 배치를 성공 에피소드에서만
+
+# --- VLA 학습 표면 ----------------------------------------------------------
+vla:
+  lora_rank: 16           # action expert LoRA (4.78M / 1.25B = 0.38%)
+  lora_lr: 3.0e-4         # BC 사전학습은 1e-4 를 썼다
+  freeze_backbone: true   # 필수 — 아니면 backbone_features 캐싱이 무효가 되고
+                          # 라운드마다 상위 LLM 레이어 1.54GB 를 전송해야 한다
+
+# --- 라운드 운영 ------------------------------------------------------------
+# EXPO-FT 의 온라인 루프(에피소드마다 업데이트) 를 라운드로 옮긴 값들.
+round:
+  episodes_per_round: 5       # 라운드당 롤아웃 에피소드
+  updates_per_episode: 3      # EXPO-FT num_updates. 에피소드당 update() 호출 수
+  seed_teleop_episodes: 10    # EXPO-FT --num_data. 성공 시연을 버퍼에 시드
+                              # (없으면 actor_success_only 배치가 비어 첫 update 가 터진다)
+  offline_ratio: 0.0          # EXPO-FT --offline_ratio. 0 = 시연을 온라인 버퍼에 넣는다
+  min_online_episodes: 10     # EXPO-FT can_update 의 ep_count >= 10
+  warmup_n_edit_samples: 8    # min_online_episodes 를 채우는 동안의 edit 후보 수.
+                              # 원본은 8 유지(랜덤 critic·랜덤 residual 로 수집).
+                              # 0 으로 두면 base 후보만 → BC 와 통계적으로 동일해
+                              # 초기 성공률 손실이 없지만 edit 영역의 critic 커버리지가 없다.
+  buffer_capacity: 100000     # 원형 버퍼 프레임 수 (EXPO-FT capacity=max_steps)
