@@ -39,6 +39,21 @@
 name: fuji
 robot: rby1m_rh56f1          # 데이터의 robot_type 과 교차검증용
 
+# --- 모달리티 레이아웃의 정본 -------------------------------------------------
+# BC 학습에 쓴 RLDX 등록 config (third_party/RLDX-1 기준 상대경로).
+#
+# **state/action/video 의 concat 순서는 이 파일이 정본이다.** modality.json 의
+# start/end 는 raw 컬럼에서 잘라낼 때만 쓴다. 두 순서가 같다는 보장이 없다:
+#   openarm_inspire       등록: neck, left_arm, right_arm, left_hand, right_hand
+#                    modality.json(start 순): neck, left_arm, left_hand, right_arm, right_hand  ← 다름
+#   rby1_f1               둘이 우연히 일치
+# 어긋난 채로 쓰면 모델 공간과 critic 입력의 관절이 조용히 뒤섞이고, explore_groups 도
+# 다른 관절을 가리킨다 (openarm 이면 right_arm 대신 left_hand 를 탐색하게 된다).
+#
+# 다른 embodiment: openarm → openarm_inspire_config.py,
+#                  rby1m_wuji2 → rby1_wujihand2_data_config_egostereo_general_embodiment.py
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+
 # --- 정책 -------------------------------------------------------------------
 # $A_CKPT / $L_CKPT 아래 상대경로 (양쪽에서 같은 상대경로를 쓴다).
 # TODO: rby1m_rh56f1 BC 체크포인트 경로. 아직 없음.

@@ -48,10 +48,12 @@ class Modality:
       rby1m_wuji2       state 0:66 (66), 카메라 2
     """
 
-    state: list[tuple[str, str, int, int]]   # (그룹명, original_key, start, end)
+    state: list[tuple[str, str, int, int]]   # (그룹명, original_key, start, end) — canonical 순
     action: list[tuple[str, str, int, int]]
-    video: list[tuple[str, str]]             # (카메라명, original_key)
+    video: list[tuple[str, str]]             # (카메라명, original_key) — canonical 순
     task_key: str = "annotation.human.task_description"
+    embodiment_tag: str = ""                 # 등록 config 가 정한다 (손으로 적지 않는다)
+    layout_source: str = "modality.json(start 순)"
 
     @property
     def state_dim(self) -> int:
@@ -78,20 +80,63 @@ class Modality:
         return sorted(keys) + RL_COLUMNS
 
 
-def parse_modality(m: dict) -> Modality:
+def rldx_layout(rldx_root: Path, rel_config: str) -> tuple[str, dict[str, list[str]]]:
+    """RLDX 등록 config 를 로드해 (embodiment_tag, {modality: modality_keys}) 를 얻는다.
+
+    **concat 순서의 정본은 이 파일이다.** modality.json 의 start/end 는 raw 컬럼에서
+    잘라낼 때만 쓴다 (두 순서가 같다는 보장이 없다 — openarm 은 3·4번째가 뒤바뀐다).
+    embodiment_tag 도 config 파일이 정하므로 등록 결과에서 읽는다 (openarm_inspire →
+    GENERAL_EMBODIMENT, rby1_f1 → NEW_EMBODIMENT). 태그별로 하나만 등록할 수 있다.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(rldx_root))
+    from rldx.configs.data.embodiment_configs import MODALITY_CONFIGS
+    from rldx.experiment.utils import load_modality_config
+
+    path = rldx_root / rel_config
+    before = set(MODALITY_CONFIGS)
+    load_modality_config(str(path))
+    added = set(MODALITY_CONFIGS) - before
+    if len(added) != 1:
+        raise ValueError(f"{rel_config}: 등록된 embodiment 태그를 특정할 수 없다 (added={added}). "
+                         "같은 프로세스에서 다른 config 를 이미 로드했을 수 있다")
+    tag = added.pop()
+    cfg = MODALITY_CONFIGS[tag]
+    return tag, {mod: list(cfg[mod].modality_keys) for mod in ("video", "state", "action")
+                 if mod in cfg}
+
+
+def parse_modality(m: dict, order: dict[str, list[str]] | None = None,
+                   tag: str = "", source: str = "modality.json(start 순)") -> Modality:
     def groups(mod: str, default_key: str) -> list[tuple[str, str, int, int]]:
         out = []
         for name, v in m.get(mod, {}).items():
             out.append((name, v.get("original_key", default_key), int(v["start"]), int(v["end"])))
-        return sorted(out, key=lambda g: g[2])
+        keys = (order or {}).get(mod)
+        if keys is None:
+            return sorted(out, key=lambda g: g[2])          # 정본이 없으면 start 순 (경고용 기본)
+        have = {g[0] for g in out}
+        if have != set(keys):
+            raise ValueError(f"{mod}: modality.json 과 등록 config 의 그룹이 다르다\n"
+                             f"  modality.json: {sorted(have)}\n  등록 config : {keys}")
+        by = {g[0]: g for g in out}
+        return [by[k] for k in keys]                        # ★ canonical 순
 
-    video = [(name, v.get("original_key", f"observation.images.{name}"))
-             for name, v in m.get("video", {}).items()]
+    vid = [(name, v.get("original_key", f"observation.images.{name}"))
+           for name, v in m.get("video", {}).items()]
+    vkeys = (order or {}).get("video")
+    if vkeys is not None:
+        have = {n for n, _ in vid}
+        if have != set(vkeys):
+            raise ValueError(f"video: modality.json {sorted(have)} != 등록 config {vkeys}")
+        byv = {n: (n, k) for n, k in vid}
+        vid = [byv[k] for k in vkeys]
+    video = vid
     task = next((f"annotation.{k}" for k in m.get("annotation", {})),
                 "annotation.human.task_description")
     return Modality(state=groups("state", "observation.state"),
                     action=groups("action", DEFAULT_ACTION_KEY),
-                    video=video, task_key=task)
+                    video=video, task_key=task, embodiment_tag=tag, layout_source=source)
 
 
 def load_modality(path: Path) -> Modality:
@@ -102,7 +147,8 @@ def load_modality(path: Path) -> Modality:
     return parse_modality(json.loads(path.read_text()))
 
 
-def modality_from_sessions(sessions: list[Path]) -> Modality:
+def modality_from_sessions(sessions: list[Path], order: dict[str, list[str]] | None = None,
+                           tag: str = "", source: str = "modality.json(start 순)") -> Modality:
     """embodiment 는 데이터에서 온다 — convert_data.py --modality 가 각 데이터셋의
     meta/modality.json 에 심어둔 것을 읽는다. 세션들이 서로 다르면 (다른 로봇을 한 버퍼에
     섞는 것) 즉시 실패한다."""
@@ -122,14 +168,64 @@ def modality_from_sessions(sessions: list[Path]) -> Modality:
                              "(embodiment 를 한 버퍼에 섞을 수 없다)")
     if len(set(robots.values())) > 1:
         raise ValueError(f"세션들의 robot_type 이 다르다: {robots}")
-    return parse_modality(first)
+    return parse_modality(first, order, tag, source)
 
 
-def resolve_modality(root: Path, override: Path | None = None) -> tuple[Modality, str]:
+def checkpoint_layout(ckpt: Path, tag: str) -> dict[str, list[str]] | None:
+    """체크포인트가 실제 학습에 쓴 modality_keys. 최종 안전장치.
+
+    processor/processor_config.json 에 embodiment 별로 저장돼 있다. 등록 config 와 다르면
+    (학습 후 config 파일이 바뀌었다면) 모델 공간 레이아웃이 어긋나므로 실패시킨다.
+    """
+    p = Path(ckpt) / "processor" / "processor_config.json"
+    if not p.is_file():
+        return None
+    mc = json.loads(p.read_text()).get("processor_kwargs", {}).get("modality_configs", {})
+    if tag not in mc:
+        raise ValueError(f"체크포인트 processor_config 에 embodiment '{tag}' 가 없다 "
+                         f"(있는 것 예: {sorted(mc)[:5]})")
+    return {mod: list(v["modality_keys"]) for mod, v in mc[tag].items()
+            if mod in ("video", "state", "action")}
+
+
+def resolve_modality(root: Path, override: Path | None = None,
+                     rldx_root: Path | None = None, rldx_config: str | None = None,
+                     base_policy: Path | None = None) -> tuple[Modality, str]:
+    """그룹 경계는 데이터(modality.json), **순서와 태그는 RLDX 등록 config** 에서.
+
+    rldx_config 는 필수다. 없으면 start 순으로 조용히 잘못될 수 있고 (openarm 은 실제로
+    3·4번째가 뒤바뀐다) 그 결과가 explore_groups 가 다른 관절을 가리키는 것이다.
+    """
+    if not rldx_config:
+        raise SystemExit(
+            "rldx_config 가 필요하다 (예: rldx/configs/data/openarm_inspire_config.py).\n"
+            "  concat 순서와 embodiment_tag 의 정본이다. 없으면 modality.json 의 start 순을\n"
+            "  쓰게 되는데 그게 모델과 다를 수 있다 (openarm: right_arm 과 left_hand 가 뒤바뀜).")
+    tag, order = rldx_layout(Path(rldx_root), rldx_config)
+    src = f"meta/modality.json + 순서/태그는 {rldx_config} ({tag})"
+
+    if base_policy is not None:
+        ck = checkpoint_layout(Path(base_policy), tag)
+        if ck is None:
+            print(f"  [경고] {base_policy} 에 processor/processor_config.json 이 없어 "
+                  "체크포인트 교차검증을 건너뜀")
+        else:
+            for mod, keys in order.items():
+                if mod in ck and ck[mod] != keys:
+                    raise SystemExit(
+                        f"{mod} 순서가 등록 config 와 체크포인트에서 다르다 — 모델 공간이 어긋난다\n"
+                        f"  등록 config: {keys}\n  체크포인트 : {ck[mod]}")
+            src += " + 체크포인트 교차검증 OK"
+
     if override is not None:
-        return load_modality(override), f"덮어쓰기 {override}"
-    sessions = find_sessions(root)
-    return modality_from_sessions(sessions), "데이터셋의 meta/modality.json"
+        return parse_modality(json.loads(_modality_path(override).read_text()), order,
+                              tag, src), f"덮어쓰기 {override}"
+    return modality_from_sessions(find_sessions(root), order, tag, src), src
+
+
+def _modality_path(path: Path) -> Path:
+    path = Path(path)
+    return path / "modality.json" if path.is_dir() and not (path / "meta").is_dir() else path
 
 
 @dataclass
@@ -528,7 +624,10 @@ def verify(root: Path, mod: Modality, replan_steps: int = 8, discount: float = 0
     sessions = find_sessions(root)
     print(f"세션 {len(sessions)}개  ({root})")
     print(f"modality: state {mod.state_dim}차원 {len(mod.state)}그룹 / action {mod.action_dim}차원 "
-          f"/ 카메라 {mod.n_cams}개")
+          f"/ 카메라 {mod.n_cams}개  tag={mod.embodiment_tag or '(없음)'}")
+    print(f"레이아웃 출처: {mod.layout_source}")
+    print(f"  action concat 순서: {[n for n, _, _ in mod.offsets('action')]}")
+    print(f"  카메라 순서       : {[n for n, _ in mod.video]}")
     print(f"robot_type: "
           f"{json.loads((sessions[0] / 'meta' / 'info.json').read_text()).get('robot_type')}")
     flat = build_flat(sessions, mod)
@@ -655,6 +754,13 @@ USAGE = """
   check-batch   <세션부모> <출력.mm>  [--modality <경로>]
   show-modality <세션부모 | modality 경로>
 
+공통 옵션:
+  --rldx-config <RLDX-1 기준 상대경로>   **필수.** concat 순서와 embodiment_tag 의 정본
+                                          (예: rldx/configs/data/openarm_inspire_config.py)
+  --base-policy <체크포인트 경로>          있으면 processor_config 와 순서를 교차검증
+  --rldx-root   <경로>                    기본 third_party/RLDX-1
+  --modality    <경로>                    modality.json 덮어쓰기
+
 embodiment 는 기본적으로 **데이터셋에서** 읽는다 (<세션>/meta/modality.json, convert_data.py
 --modality 가 심어둔 것). 세션들이 서로 다르면 실패한다. --modality 로 덮어쓸 수 있다.
 """
@@ -663,11 +769,22 @@ if __name__ == "__main__":
     if len(sys.argv) < 3:
         sys.exit(__doc__ + USAGE)
     argv = sys.argv[1:]
-    override = None
-    if "--modality" in argv:
-        i = argv.index("--modality")
-        override = Path(argv[i + 1])
-        argv = argv[:i] + argv[i + 2:]
+    override = rldx_config = None
+    rldx_root = Path(__file__).resolve().parent.parent / "third_party" / "RLDX-1"
+    base_policy = None
+    for flag in ("--modality", "--rldx-config", "--rldx-root", "--base-policy"):
+        if flag in argv:
+            i = argv.index(flag)
+            val = argv[i + 1]
+            if flag == "--modality":
+                override = Path(val)
+            elif flag == "--rldx-config":
+                rldx_config = val
+            elif flag == "--base-policy":
+                base_policy = Path(val)
+            else:
+                rldx_root = Path(val)
+            argv = argv[:i] + argv[i + 2:]
     cmd, pos = argv[0], argv[1:]
 
     if cmd == "show-modality":
@@ -686,7 +803,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     root = Path(pos[0])
-    mod, src = resolve_modality(root, override)
+    mod, src = resolve_modality(root, override, rldx_root, rldx_config, base_policy)
     print(f"[modality] {src}")
     if cmd == "verify":
         sys.exit(verify(root, mod))
