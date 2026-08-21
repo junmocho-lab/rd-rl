@@ -80,6 +80,9 @@ class Modality:
         return sorted(keys) + RL_COLUMNS
 
 
+_LAYOUT_CACHE: dict[tuple[str, str], tuple[str, dict[str, list[str]]]] = {}
+
+
 def rldx_layout(rldx_root: Path, rel_config: str) -> tuple[str, dict[str, list[str]]]:
     """RLDX 등록 config 를 로드해 (embodiment_tag, {modality: modality_keys}) 를 얻는다.
 
@@ -89,6 +92,14 @@ def rldx_layout(rldx_root: Path, rel_config: str) -> tuple[str, dict[str, list[s
     GENERAL_EMBODIMENT, rby1_f1 → NEW_EMBODIMENT). 태그별로 하나만 등록할 수 있다.
     """
     import sys as _sys
+
+    # 같은 프로세스에서 같은 config 를 두 번 물으면 두 번째는 등록될 것이 없어
+    # added 가 비고, 그러면 아래 검사에 걸린다 (learner 는 θ₀ 를 낼 때와 학습을
+    # 시작할 때 각각 부른다). 태그는 (root, config) 로 결정되므로 캐시한다.
+    key = (str(Path(rldx_root).resolve()), rel_config)
+    if key in _LAYOUT_CACHE:
+        return _LAYOUT_CACHE[key]
+
     _sys.path.insert(0, str(rldx_root))
     from rldx.configs.data.embodiment_configs import MODALITY_CONFIGS
     from rldx.experiment.utils import load_modality_config
@@ -102,8 +113,9 @@ def rldx_layout(rldx_root: Path, rel_config: str) -> tuple[str, dict[str, list[s
                          "같은 프로세스에서 다른 config 를 이미 로드했을 수 있다")
     tag = added.pop()
     cfg = MODALITY_CONFIGS[tag]
-    return tag, {mod: list(cfg[mod].modality_keys) for mod in ("video", "state", "action")
-                 if mod in cfg}
+    _LAYOUT_CACHE[key] = (tag, {mod: list(cfg[mod].modality_keys)
+                                for mod in ("video", "state", "action") if mod in cfg})
+    return _LAYOUT_CACHE[key]
 
 
 def parse_modality(m: dict, order: dict[str, list[str]] | None = None,

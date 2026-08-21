@@ -12,7 +12,14 @@ cd "$(dirname "$0")/.."
 source configs/paths.sh
 
 NAME="${1:-openarm_red_block}"
-RUN_ID="${NAME}_$(date +%Y%m%d-%H%M%S)"
+# 두 번째 인자로 기존 run id 를 주면 **그 실험을 이어받는다** — 메일박스·버퍼·init/·
+# 지난 라운드 산출물이 모두 run id 아래 있으므로, 코드를 고쳐 잡을 다시 띄울 때는
+# 새 run id 를 만들면 안 된다 (전부 처음부터 다시 모아야 한다).
+RUN_ID="${2:-${NAME}_$(date +%Y%m%d-%H%M%S)}"
+if [ -n "${2:-}" ]; then
+    echo "[이어받기] run id $RUN_ID — 기존 메일박스/버퍼/산출물을 그대로 쓴다"
+    echo "           FAILED 로 남은 라운드가 있으면 그 파일을 지워야 다시 처리한다"
+fi
 # k8s 리소스 이름은 DNS-1123 (소문자·숫자·'-') 이라 밑줄을 '-' 로 바꾼다
 JOB_NAME="junmo-cho-rdrl-$(printf '%s' "$RUN_ID" | tr 'A-Z_' 'a-z-')"
 
