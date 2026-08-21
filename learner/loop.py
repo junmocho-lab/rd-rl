@@ -396,7 +396,39 @@ class Trainer:
                  f"탐색 {list(spec.groups)} {spec.active_dim}/{mod.action_dim}차원")
         self._load_theta()
         self.rng = np.random.default_rng(int(self.args.seed))
+        self.updates = 0
+        self._wandb_init(exp, spec, base)
         self.built = True
+
+    def _wandb_init(self, exp: dict, spec, base: Path) -> None:
+        """WANDB_API_KEY 가 있으면 붙는다 (없으면 조용히 로그 파일만).
+
+        id=run id / resume="allow" 로 두는 이유: Job 이 재시작해도 같은 wandb run 에
+        이어 붙어야 라운드 간 추세가 끊기지 않는다 (버퍼·산출물도 run id 로 이어받는다).
+        """
+        self.wb = None
+        if self.args.no_wandb or not os.environ.get("WANDB_API_KEY"):
+            self.log("[wandb] WANDB_API_KEY 가 없어 붙지 않는다 (로그 파일만)")
+            return
+        try:
+            import wandb
+        except ImportError:
+            self.log("[wandb] wandb 가 설치돼 있지 않다 — 건너뛴다")
+            return
+        self.wb = wandb.init(
+            project=self.args.wandb_project, id=self.args.exp, name=self.args.exp,
+            resume="allow", config={
+                "exp": exp.get("name"), "robot": exp.get("robot"),
+                "base_policy": exp.get("base_policy"), "run_id": self.args.exp,
+                "action_horizon": self.horizon, "replan_steps": self.replan,
+                "inference_latency": self.latency,
+                "explore_groups": list(spec.groups), "active_dim": spec.active_dim,
+                "target_entropy": spec.target_entropy,
+                "seed": int(self.args.seed),
+                **{f"expo.{k}": v for k, v in vars(self.cfg).items()},
+                **{f"round.{k}": v for k, v in self.rnd_cfg.items()},
+            })
+        self.log(f"[wandb] {self.args.wandb_project}/{self.args.exp} → {self.wb.url}")
 
     def _latest_theta(self) -> Path | None:
         """가장 최근 산출물. 프로세스가 살아있는 동안은 메모리 상태가 최신이지만, Job 이
@@ -517,6 +549,11 @@ class Trainer:
             last = self.L.update(self._batch(c.batch_size * c.utd_ratio),
                                  actor_batch=(self._batch(c.batch_size, success_only=True)
                                               if c.actor_success_only else None))
+            self.updates += 1
+            if self.wb is not None:
+                self.wb.log({f"train/{k}": v for k, v in last.items()
+                             if isinstance(v, (int, float))},
+                            step=self.updates)
             if i == 0 or (i + 1) % 5 == 0 or i == n_updates - 1:
                 self.log(f"  [{i+1}/{n_updates}] critic_loss={last.get('critic_loss', 0):.4f} "
                          f"q={last.get('q', 0):+.3f} q_max={last.get('q_max', 0):+.3f} "
@@ -529,6 +566,18 @@ class Trainer:
             if last.get("q_max", 0) > 1.2:
                 self.log(f"  [경고] q_max={last['q_max']:.2f} > 1.2 — sparse terminal reward 의 "
                          "리턴 상한이 1 이므로 발산 신호다")
+        if self.wb is not None:
+            n_ep = int(stats["episodes"])
+            succ = ready.get("success")
+            row = {"round/number": ready.get("round"), "round/episodes": n_ep,
+                   "round/updates": n_updates, "round/seconds": round(time.time() - t0, 1),
+                   "buffer/frames": buf["frames"], "buffer/episodes": buf["episodes"],
+                   "buffer/success_episodes": buf["success_episodes"]}
+            # 사람이 라벨한 성공 수 — 이 루프의 실제 목표다. --success 를 준 라운드만 남는다.
+            if succ is not None and n_ep:
+                row["round/success"] = int(succ)
+                row["round/success_rate"] = int(succ) / n_ep
+            self.wb.log(row, step=self.updates)
         self.export(ckpt_round, stats, ready, buf, n_updates, last)
 
     def export(self, ckpt_round: Path, stats: dict, ready: dict, buf: dict,
@@ -664,6 +713,8 @@ def main() -> int:
     p.add_argument("--exp-config", default="",
                    help="configs/exp/<이름>.yaml. 주면 시작할 때 θ₀ 를 init/ 로 내보낸다")
     p.add_argument("--seed", type=int, default=0, help="θ₀ 초기화 seed (manifest 에 기록된다)")
+    p.add_argument("--wandb-project", default="rd-rl-expo")
+    p.add_argument("--no-wandb", action="store_true", help="WANDB_API_KEY 가 있어도 붙지 않는다")
     p.add_argument("--stub-seconds", type=float, default=5.0, help="stub 학습 소요 시간")
     p.add_argument("--stub-payload-mb", type=float, default=1.0)
     args = p.parse_args()

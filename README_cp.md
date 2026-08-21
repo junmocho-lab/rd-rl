@@ -1,5 +1,7 @@
 # rd-rl
 
+지표와 튜닝은 [METRICS.md](METRICS.md) — 학습 중에는 wandb `rd-rl-expo` 프로젝트를 본다.
+
 # 실행 순서
 
 창을 3개띄운다 (학습서버, 로컬 데이터 전송, 로컬 모델 열기)
