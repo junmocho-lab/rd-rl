@@ -3,6 +3,8 @@
 rl-dataset/*
 !rl-dataset/.gitkeep
 claude_logs
+wandb
+.claude
 
 # python
 .venv/
