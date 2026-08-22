@@ -258,6 +258,13 @@ class Flat:
     sessions: list[str] = field(default_factory=list)
     ep_success: list[bool] = field(default_factory=list)
     ep_length: list[int] = field(default_factory=list)
+    # 세션 i 의 전역 에피소드 번호 시작값. episode[t] - ep_offset[session[t]] 이 그
+    # 세션 안에서의 원래 episode_index 이고, 그게 곧 videos/.../episode_%06d.mp4 다.
+    # min(episode) 로 되돌리면 안 된다 — 에피소드를 골라 담은 세션(시드 데모)은 0번이
+    # 빠져 있을 수 있어서 세션 안 번호가 통째로 밀린다.
+    ep_offset: list[int] = field(default_factory=list)
+    # 세션 i 에서 실제로 담은 원래 episode_index 들 (오름차순). 전부 담았으면 range 와 같다.
+    ep_kept: list[list[int]] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.reward)
@@ -290,11 +297,51 @@ def _gather(df: pd.DataFrame, groups: list[tuple[str, str, int, int]]) -> np.nda
     return np.concatenate(parts, axis=1)
 
 
-def load_session(path: Path, mod: Modality) -> dict:
-    """한 세션의 에피소드들을 시간 순으로 읽어 프레임 배열을 만든다."""
-    files = sorted(path.glob("data/chunk-*/episode_*.parquet"))
-    if not files:
+def episode_files(path: Path) -> dict[int, Path]:
+    """원래 episode_index → parquet 경로. 파일 하나가 에피소드 하나다."""
+    out = {}
+    for f in sorted(path.glob("data/chunk-*/episode_*.parquet")):
+        out[int(f.stem.split("_")[-1])] = f
+    return out
+
+
+def episode_success(path: Path) -> dict[int, bool]:
+    """세션의 에피소드별 성공 여부. 시드 데모를 고를 때 쓴다 (프레임은 읽지 않는다)."""
+    return {e: bool(pd.read_parquet(f, columns=["next.success"])
+                    ["next.success"].to_numpy(dtype=bool).any())
+            for e, f in episode_files(path).items()}
+
+
+def select_seed_episodes(path: Path, n: int, success_only: bool) -> list[int]:
+    """시드로 담을 에피소드를 고른다 — 성공 우선, 원래 순서 유지, 최대 n 개.
+
+    EXPO-FT 는 성공 데모만 시드했다 (`DATA_DIR=.../success`, `--num_data=10`). 여기 데이터는
+    성공·실패가 한 세션에 섞여 있어서 이 함수가 그 필터 역할을 한다. 성공이 n 개보다 적으면
+    있는 만큼만 담는다 (실패로 채우지 않는다 — actor 배치가 성공 프레임에서만 뽑히므로
+    실패를 채워 넣어도 actor 쪽에는 쓸모가 없고 critic 쪽 분포만 바꾼다).
+    """
+    succ = episode_success(path)
+    pool = [e for e in sorted(succ) if succ[e]] if success_only else sorted(succ)
+    return pool[:n] if n > 0 else pool
+
+
+def load_session(path: Path, mod: Modality, keep: list[int] | None = None) -> dict:
+    """한 세션의 에피소드들을 시간 순으로 읽어 프레임 배열을 만든다.
+
+    keep 을 주면 그 원래 episode_index 들만 담는다 (시드 데모용). episode_index 값 자체는
+    바꾸지 않는다 — 그래야 videos/ 의 파일 번호와 계속 맞는다.
+    """
+    avail = episode_files(path)
+    if not avail:
         raise ValueError(f"parquet 없음: {path}")
+    if keep is None:
+        eps = sorted(avail)
+    else:
+        eps = sorted(keep)
+        missing = [e for e in eps if e not in avail]
+        if missing:
+            raise ValueError(f"{path.name}: 없는 에피소드를 담으라고 했다: {missing[:5]}")
+    files = [avail[e] for e in eps]
     parts = []
     for f in files:
         d = pd.read_parquet(f, columns=mod.columns())
@@ -309,16 +356,22 @@ def load_session(path: Path, mod: Modality) -> dict:
         "episode": df["episode_index"].to_numpy(dtype=np.int64).reshape(-1),
         "frame": df["frame_index"].to_numpy(dtype=np.int64).reshape(-1),
         "n_episodes": len(files),
+        "kept": eps,
     }
 
 
-def build_flat(sessions: list[Path], mod: Modality) -> Flat:
+def build_flat(sessions: list[Path], mod: Modality,
+               keep: dict[str, list[int]] | None = None) -> Flat:
+    """keep[세션이름] 이 있으면 그 세션에서 그 에피소드들만 담는다 (시드 데모용)."""
     R, M, D, TR, S, EP, FR, SE, AC, ST = [], [], [], [], [], [], [], [], [], []
     names, ep_success, ep_length = [], [], []
+    offsets, kept_all = [], []
     ep_offset = 0
     for si, path in enumerate(sessions):
-        d = load_session(path, mod)
+        d = load_session(path, mod, keep=(keep or {}).get(path.name))
         names.append(path.name)
+        offsets.append(ep_offset)
+        kept_all.append(list(d["kept"]))
         succ, done = d["success"], d["done"]
         local_ep = d["episode"]
         # 에피소드 단위 성공 플래그를 프레임으로 펼친다 (actor 배치용)
@@ -357,6 +410,7 @@ def build_flat(sessions: list[Path], mod: Modality) -> Flat:
         truncated=np.concatenate(TR), is_success=np.concatenate(S),
         episode=np.concatenate(EP), frame=np.concatenate(FR), session=np.concatenate(SE),
         sessions=names, ep_success=ep_success, ep_length=ep_length,
+        ep_offset=offsets, ep_kept=kept_all,
     )
 
 
@@ -502,8 +556,12 @@ def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality,
         old_bytes = 1
         for d in old.get("shape", [0]):
             old_bytes *= int(d)
+        # 담은 에피소드 목록도 접두사 판정에 넣는다 — 세션 이름이 같아도 시드 선택이
+        # 바뀌었으면 프레임 배치가 통째로 달라지므로 이어받으면 안 된다.
+        old_eps = old.get("episodes")
+        eps_ok = old_eps is None or old_eps == [list(x) for x in flat.ep_kept[:k]]
         if (old.get("keys") == keys and list(old.get("shape", [])[1:]) == list(shape[1:])
-                and k <= len(names) and old["sessions"] == names[:k]
+                and k <= len(names) and old["sessions"] == names[:k] and eps_ok
                 and out.stat().st_size == old_bytes):
             n_done = k
 
@@ -519,9 +577,13 @@ def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality,
         mm = np.memmap(out, dtype=np.uint8, mode="w+", shape=shape)
 
     t0 = time.time()
-    for path in sessions[n_done:]:
-        n_ep = len(sorted(path.glob("data/chunk-*/episode_*.parquet")))
-        for e in range(n_ep):
+    for si in range(n_done, len(sessions)):
+        path = sessions[si]
+        # flat 이 실제로 담은 에피소드만, 담은 순서대로. 시드 세션은 성공만 골라 담기 때문에
+        # range(n_ep) 로 돌면 안 된다 (프레임과 비디오가 통째로 어긋난다).
+        eps = flat.ep_kept[si]
+        n_ep = len(eps)
+        for e in eps:
             L = flat.ep_length[ep_global]
             for ci, k in enumerate(keys):
                 fr = get_frames_by_indices(str(video_path(path, k, e)), np.arange(L),
@@ -535,6 +597,7 @@ def build_images(sessions: list[Path], flat: Flat, out: Path, mod: Modality,
     mm.flush()
     meta = {"path": str(out), "shape": list(shape), "dtype": "uint8",
             "keys": keys, "sessions": [p.name for p in sessions],
+            "episodes": [list(x) for x in flat.ep_kept],
             "bytes": nbytes, "seconds": round(time.time() - t0, 1)}
     out.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
     return meta
@@ -546,11 +609,12 @@ def open_images(out: Path) -> tuple[np.memmap, dict]:
     return mm, meta
 
 
-def verify_images(root: Path, out: Path, mod: Modality, n_probe: int = 24) -> int:
+def verify_images(root: Path, out: Path, mod: Modality, n_probe: int = 24,
+                  keep: dict[str, list[int]] | None = None) -> int:
     from rldx.utils.video_utils import get_frames_by_indices
 
     sessions = find_sessions(root)
-    flat = build_flat(sessions, mod)
+    flat = build_flat(sessions, mod, keep=keep)
     mm, meta = open_images(out)
     fails = []
 
@@ -571,9 +635,9 @@ def verify_images(root: Path, out: Path, mod: Modality, n_probe: int = 24) -> in
     strict_bad, loose_max = 0, 0.0
     for i in idx:
         si = int(flat.session[i]); e_local = int(flat.episode[i]); fr = int(flat.frame[i])
-        # 전역 에피소드 번호를 세션 내 번호로 되돌린다
-        base = min(int(x) for x in flat.episode[flat.session == si])
-        e = e_local - base
+        # 전역 에피소드 번호를 세션 내 번호로 되돌린다. min(episode) 이 아니라 기록해 둔
+        # 세션 시작 오프셋을 쓴다 — 시드 세션은 0번이 빠져 있을 수 있다.
+        e = e_local - flat.ep_offset[si]
         for ci, k in enumerate(meta["keys"]):
             vp = video_path(sessions[si], k, e)
             got = np.asarray(mm[i, ci])

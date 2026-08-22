@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from rl import ddp
 from rl.data import Modality, rldx_layout
 from rl.expo import VLA
 
@@ -62,6 +63,7 @@ class RLDXVLA(VLA):
                                              self.action_horizon))
         self._orig_gawf = self.model.action_model.get_action_with_features
         self.opt = None
+        self._trainable: list = []
 
     # --- 액션 공간 변환 ------------------------------------------------------
     def _split(self, x: np.ndarray, which: str) -> dict:
@@ -160,6 +162,7 @@ class RLDXVLA(VLA):
                             torch.tensor(float(am.config.noise_beta_beta)))
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.opt = torch.optim.Adam(trainable, lr=lr)
+        self._trainable = trainable          # train_step 에서 rank 평균을 낼 대상
         n_tr = sum(p.numel() for p in trainable)
         n_bb = sum(int(p.requires_grad) for p in self.model.backbone.parameters())
         return {"trainable_params": n_tr, "trainable_tensors": len(trainable),
@@ -202,6 +205,7 @@ class RLDXVLA(VLA):
 
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
+        ddp.all_reduce_grads(self._trainable)     # 멀티 GPU 일 때만 실제로 통신한다
         self.opt.step()
         return {"actor_loss": float(loss.detach())}
 

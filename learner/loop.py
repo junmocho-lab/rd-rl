@@ -49,12 +49,22 @@ def _on_term(signum, _frame):
 # 로깅 — Job 로그는 잡을 지우면 사라지므로 DDN 파일에도 남긴다
 # --------------------------------------------------------------------------- #
 class Log:
-    def __init__(self, path: Path | None):
-        self.path = path
-        if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
+    """rank 0 만 기록한다.
+
+    torchrun 아래에서는 4개 프로세스가 같은 라운드를 같은 순서로 처리하므로 4벌을 남기면
+    로그가 4배가 될 뿐 새 정보가 없다. rank 별로 갈리는 상황(한 rank 만 죽는다)은 예외
+    traceback 이 stderr 로 나오고 torchrun 이 거기에 rank 를 붙여준다.
+    """
+
+    def __init__(self, path: Path | None, enabled: bool = True):
+        self.path = path if enabled else None
+        self.enabled = enabled
+        if self.path:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def __call__(self, msg: str) -> None:
+        if not self.enabled:
+            return
         line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}"
         print(line, flush=True)
         if self.path:
@@ -340,13 +350,15 @@ class Trainer:
     후보를 뽑고, critic 이 보는 구간은 어차피 [latency, latency+replan) 로 같다.
     """
 
-    def __init__(self, args, log: Log):
+    def __init__(self, args, log: Log, device=None):
         self.args, self.log = args, log
         self.buf = args.runs_root / args.exp / "buffer"
         self.ckpt_exp = args.ckpt_root / "expo" / args.exp
         self.built = False
         self.flat = self.imgs = self.actnorm = None
         self.task = ""
+        # rank 마다 자기 GPU. 단일 프로세스면 cuda:0.
+        self.device = str(device) if device is not None else "cuda"
 
     # --- 1회 생성 -----------------------------------------------------------
     def _build(self) -> None:
@@ -356,6 +368,7 @@ class Trainer:
         import numpy as np
         import yaml
 
+        from rl import ddp
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -387,15 +400,27 @@ class Trainer:
         self.log(f"[학습] 정책 로드 {base.name}")
         t0 = time.time()
         self.vla = RLDXVLA(base, mod, self.rldx_root, exp["rldx_data_config"],
-                           device="cuda", rtc_inference_mode="none")
+                           device=self.device, rtc_inference_mode="none")
         info = self.vla.setup_training(lr=float((exp.get("vla") or {}).get("lora_lr", 3e-4)))
         self.L = EXPOLearner(self.vla, spec, mod.state_dim, mod.n_cams, self.replan, self.cfg,
-                             device="cuda", seed=int(self.args.seed), latency=self.latency)
+                             device=self.device, seed=int(self.args.seed), latency=self.latency)
         self.log(f"[학습] {time.time()-t0:.0f}s  LoRA {info['trainable_params']/1e6:.2f}M "
                  f"(백본 trainable {info['backbone_trainable_tensors']})  "
                  f"탐색 {list(spec.groups)} {spec.active_dim}/{mod.action_dim}차원")
         self._load_theta()
-        self.rng = np.random.default_rng(int(self.args.seed))
+
+        # rank 0 의 파라미터로 전부 맞춘다. 여기서 어긋난 채 시작하면 gradient 만 평균되고
+        # 파라미터는 영원히 갈라진 상태로 학습된다 (rl/ddp.py 머리말 참고).
+        ddp.broadcast_params([self.L.encoder, self.L.critic, self.L.target_critic,
+                              self.L.residual, self.L.temp, self.vla.model])
+
+        # 배치 추출만 rank 마다 달라야 한다 — 같으면 4장이 똑같은 미니배치를 돌아서
+        # 실효 배치가 늘지 않는다. 스트림이 겹치지 않게 rank 마다 멀리 떨어뜨린다.
+        self.rng = np.random.default_rng(int(self.args.seed) + 1_000_003 * ddp.rank())
+        if ddp.enabled():
+            self.log(f"[학습] 분산 world={ddp.world_size()}  "
+                     f"critic 미니배치 {self.cfg.batch_size}/rank "
+                     f"→ 실효 {self.cfg.batch_size * ddp.world_size()}")
         self.updates = 0
         self._wandb_init(exp, spec, base)
         self.built = True
@@ -406,7 +431,10 @@ class Trainer:
         id=run id / resume="allow" 로 두는 이유: Job 이 재시작해도 같은 wandb run 에
         이어 붙어야 라운드 간 추세가 끊기지 않는다 (버퍼·산출물도 run id 로 이어받는다).
         """
+        from rl import ddp
         self.wb = None
+        if not ddp.is_main():
+            return                    # 4개 rank 가 같은 run id 로 붙으면 서로 덮어쓴다
         if self.args.no_wandb or not os.environ.get("WANDB_API_KEY"):
             self.log("[wandb] WANDB_API_KEY 가 없어 붙지 않는다 (로그 파일만)")
             return
@@ -425,6 +453,10 @@ class Trainer:
                 "explore_groups": list(spec.groups), "active_dim": spec.active_dim,
                 "target_entropy": spec.target_entropy,
                 "seed": int(self.args.seed),
+                # expo.batch_size 는 **rank 당** 값이다. 실제로 한 critic 스텝이 보는
+                # 표본 수는 아래 effective_batch_size — GPU 수를 바꾸면 이게 바뀐다.
+                "world_size": ddp.world_size(),
+                "effective_batch_size": self.cfg.batch_size * ddp.world_size(),
                 **{f"expo.{k}": v for k, v in vars(self.cfg).items()},
                 **{f"round.{k}": v for k, v in self.rnd_cfg.items()},
             })
@@ -459,28 +491,100 @@ class Trainer:
         self.log(f"[학습] 이어받기 {path.parent.name}/{path.name} → {got}")
 
     # --- 버퍼 ---------------------------------------------------------------
-    def ingest(self, round_dir: Path) -> dict:
+    def _seed_records(self) -> list[dict]:
+        """시드 데모(teleop) 세션 기록. 버퍼가 비어 있을 때 **맨 앞에** 한 번만 들어간다.
+
+        EXPO-FT 의 `--num_data=10` 자리다 (train_pi_robo.py → BatchProcessor 가
+        offline_ratio=0 일 때 `replay_buffer.insert_dataset(dataset)` 으로 온라인 버퍼에
+        바로 섞는다). 원본은 성공 데모 디렉토리를 통째로 받지만 우리 teleop 세션은
+        성공·실패가 섞여 있어서 여기서 고른다.
+
+        맨 앞에 고정해야 하는 이유: images.mm 은 세션 순서대로 이어붙인 memmap 이고
+        이어받기가 **접두사 일치**로 판정된다. 시드가 중간에 끼면 접두사가 깨져 매 라운드
+        수십 GB 를 다시 디코딩한다.
+        """
+        from rl.data import find_sessions, select_seed_episodes
+
+        rc = self.rnd_cfg
+        root = rc.get("seed_dataset")
+        if not root:
+            return []
+        n = int(rc.get("seed_teleop_episodes", 0))
+        success_only = bool(rc.get("seed_success_only", True))
+        path = Path(root)
+        if not path.is_absolute():
+            path = self.repo / path
+        if not path.is_dir():
+            raise SystemExit(f"round.seed_dataset 이 없다: {path}")
+
+        out = []
+        for s in find_sessions(path):
+            eps = select_seed_episodes(s, n, success_only)
+            if not eps:
+                self.log(f"[시드] {s.name}: 담을 에피소드가 없다 "
+                         f"(success_only={success_only}) — 건너뛴다")
+                continue
+            out.append({"path": str(s), "kind": "seed", "episodes": eps})
+            self.log(f"[시드] {s.name}: {len(eps)}개 담는다 {eps}"
+                     + (f"  (요청 {n}개, 성공만)" if success_only and len(eps) < n else ""))
+        return out
+
+    def ingest(self, round_dir: Path, round_no: int) -> dict:
         import numpy as np
+        from rl import ddp
         from rl.data import build_flat, build_images, find_sessions, open_images
         from rl.offline_critic import normalize_all
 
-        self.buf.mkdir(parents=True, exist_ok=True)
         manifest = self.buf / "sessions.json"
-        known = json.loads(manifest.read_text()) if manifest.is_file() else []
-        have = {Path(p).name for p in known}
-        new = [str(s) for s in find_sessions(round_dir / "dataset") if s.name not in have]
-        if new:
-            known += new
-            manifest.write_text(json.dumps(known, indent=2) + "\n")
-        paths = [Path(p) for p in known]
+        records = new = None
+        if ddp.is_main():
+            self.buf.mkdir(parents=True, exist_ok=True)
+            records = json.loads(manifest.read_text()) if manifest.is_file() else []
+            # 예전 형식(문자열 목록)을 만나면 online 으로 읽는다.
+            records = [r if isinstance(r, dict) else {"path": r, "kind": "online"}
+                       for r in records]
+            if not records:
+                records = self._seed_records()
+            have = {Path(r["path"]).name for r in records}
+            new = [{"path": str(s), "kind": "online", "round": round_no}
+                   for s in find_sessions(round_dir / "dataset") if s.name not in have]
+            records += new
+            new = len(new)
+        # 매니페스트는 여기서 쓰지 않는다 — 이 세션들이 실제로 읽히는지(해상도·카메라·
+        # 파손 여부) 아래 build_flat/build_images 를 통과해야 안다. 먼저 커밋하면 못 쓰는
+        # 세션이 버퍼에 영구히 등록돼서 **이후 모든 라운드가 같은 파일에서 계속 실패한다.**
+        records, new = ddp.broadcast_object((records, new))
+
+        paths = [Path(r["path"]) for r in records]
+        keep = {Path(r["path"]).name: r["episodes"] for r in records if r.get("episodes")}
         gone = [p for p in paths if not p.is_dir()]
         if gone:
             raise SystemExit(f"버퍼에 등록된 세션이 사라졌다 (순서가 깨지면 memmap 이 어긋난다): "
                              f"{[p.name for p in gone][:3]}")
-        self.log(f"[버퍼] 새 세션 {len(new)}개 / 누적 {len(paths)}개")
+        n_seed_s = sum(1 for r in records if r["kind"] == "seed")
+        self.log(f"[버퍼] 새 세션 {new}개 / 누적 {len(paths)}개 "
+                 f"(시드 {n_seed_s} / 온라인 {len(paths)-n_seed_s})")
 
-        self.flat = build_flat(paths, self.mod)
-        build_images(paths, self.flat, self.buf / "images.mm", self.mod, resume=True)
+        self.flat = build_flat(paths, self.mod, keep=keep)
+
+        # 비디오 디코딩과 memmap·캐시 쓰기는 rank 0 만 (4개가 같은 파일에 쓰면 깨진다).
+        # 여기서 나는 예외를 그냥 올리면 rank 0 만 빠져나가고 나머지 3개는 아래 집합통신에서
+        # 영원히 기다린다. 그래서 잡아서 전 rank 에 알린 뒤 **같이** 실패한다.
+        err = None
+        if ddp.is_main():
+            try:
+                build_images(paths, self.flat, self.buf / "images.mm", self.mod, resume=True)
+                normalize_all(self.vla, self.flat, self.horizon, cache=self.buf / "actnorm.npy")
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+        errs = [e for e in ddp.gather_object(err) if e]
+        if errs:
+            raise RuntimeError(f"버퍼 준비 실패 (매니페스트에 등록하지 않는다): {errs[0]}")
+
+        # 여기까지 왔으면 이 세션들은 실제로 읽힌다. 그때 비로소 버퍼 등록을 확정한다.
+        if ddp.is_main():
+            manifest.write_text(json.dumps(records, indent=2) + "\n")
+
         self.imgs, _ = open_images(self.buf / "images.mm")
         self.actnorm = normalize_all(self.vla, self.flat, self.horizon,
                                      cache=self.buf / "actnorm.npy")
@@ -490,10 +594,18 @@ class Trainer:
         self.succ_idx = np.nonzero(self.flat.is_success)[0]
         n_ep = len(self.flat.ep_length)
         n_succ_ep = int(sum(self.flat.ep_success))
-        self.log(f"[버퍼] 프레임 {len(self.flat)}  에피소드 {n_ep} (성공 {n_succ_ep})  "
+        # 시드는 게이트 계산에서 빼야 한다. EXPO-FT 의 can_update 는 training_log.ep_count
+        # (온라인 롤아웃만; insert_dataset 은 이걸 올리지 않는다) 를 본다.
+        n_seed_ep = sum(len(r["episodes"]) for r in records
+                        if r["kind"] == "seed" and r.get("episodes"))
+        n_online_ep = n_ep - n_seed_ep
+        self.log(f"[버퍼] 프레임 {len(self.flat)}  에피소드 {n_ep} "
+                 f"(시드 {n_seed_ep} + 온라인 {n_online_ep}, 성공 {n_succ_ep})  "
                  f"성공 프레임 {len(self.succ_idx)}")
-        return {"sessions": len(paths), "new_sessions": len(new), "frames": len(self.flat),
-                "episodes": n_ep, "success_episodes": n_succ_ep}
+        return {"sessions": len(paths), "new_sessions": new,
+                "frames": len(self.flat), "episodes": n_ep,
+                "seed_episodes": n_seed_ep, "online_episodes": n_online_ep,
+                "success_episodes": n_succ_ep}
 
     # --- 배치 ---------------------------------------------------------------
     def _batch(self, n: int, success_only: bool = False) -> dict:
@@ -534,13 +646,18 @@ class Trainer:
     # --- 라운드 -------------------------------------------------------------
     def run_round(self, round_dir: Path, ckpt_round: Path, stats: dict, ready: dict) -> None:
         self._build()
-        buf = self.ingest(round_dir)
+        buf = self.ingest(round_dir, int(ready.get("round", 0)))
         c, rc = self.cfg, self.rnd_cfg
         min_ep = int(rc.get("min_online_episodes", 0))
         n_updates = int(rc.get("updates_per_episode", 1)) * int(stats["episodes"])
-        if buf["episodes"] < min_ep:
-            self.log(f"[학습] 에피소드 {buf['episodes']} < min_online_episodes {min_ep} — "
-                     "이번 라운드는 버퍼에만 넣고 학습은 건너뛴다 (EXPO-FT can_update)")
+        # 게이트는 **온라인 롤아웃 에피소드 누적** 으로 센다. 시드 teleop 은 세지 않는다 —
+        # EXPO-FT 의 can_update 가 보는 training_log.ep_count 가 그렇고(insert_dataset 은
+        # 올리지 않는다), 시드를 세면 데이터를 한 번도 모으기 전에 학습이 시작된다.
+        if buf["online_episodes"] < min_ep:
+            self.log(f"[학습] 온라인 에피소드 {buf['online_episodes']} < "
+                     f"min_online_episodes {min_ep} — 이번 라운드는 버퍼에만 넣고 학습은 "
+                     f"건너뛴다 (EXPO-FT can_update). 시드 {buf['seed_episodes']}개는 "
+                     f"세지 않는다")
             n_updates = 0
 
         t0 = time.time()
@@ -572,6 +689,8 @@ class Trainer:
             row = {"round/number": ready.get("round"), "round/episodes": n_ep,
                    "round/updates": n_updates, "round/seconds": round(time.time() - t0, 1),
                    "buffer/frames": buf["frames"], "buffer/episodes": buf["episodes"],
+                   "buffer/seed_episodes": buf["seed_episodes"],
+                   "buffer/online_episodes": buf["online_episodes"],
                    "buffer/success_episodes": buf["success_episodes"]}
             # 사람이 라벨한 성공 수 — 이 루프의 실제 목표다. --success 를 준 라운드만 남는다.
             if succ is not None and n_ep:
@@ -583,6 +702,10 @@ class Trainer:
     def export(self, ckpt_round: Path, stats: dict, ready: dict, buf: dict,
                n_updates: int, last: dict) -> None:
         import torch
+        from rl import ddp
+        # 파라미터는 rank 사이에서 같으므로 rank 0 것을 쓰면 된다 (rl/ddp.py 머리말).
+        if not ddp.is_main():
+            return
         ckpt_round.mkdir(parents=True, exist_ok=True)
         lora = {k: v.detach().cpu() for k, v in self.vla.model.state_dict().items()
                 if "lora_" in k}
@@ -607,6 +730,10 @@ class Trainer:
             "keys": ["enc", "critic", "target", "residual", "temp", "lora"],
             "seed": int(self.args.seed),
             "torch": torch.__version__,
+            # expo.batch_size 는 rank 당 값이다. 실제로 한 critic 스텝이 본 표본 수는
+            # 이 둘의 곱이므로 라운드마다 기록해 둔다 (GPU 수를 바꾸면 달라진다).
+            "world_size": ddp.world_size(),
+            "effective_batch_size": self.cfg.batch_size * ddp.world_size(),
             "expo_deviations": self.cfg.deviations(),
             "code": code_provenance(Path(self.args.repo)),
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -638,49 +765,76 @@ def export_stub(ckpt_round: Path, log: Log, args, stats: dict, ready: dict) -> N
 # --------------------------------------------------------------------------- #
 def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args,
                   trainer: "Trainer | None" = None) -> str:
+    from rl import ddp
     log(f"[r{n:03d}] 감지: {round_dir}")
-    fingerprint = ready_fingerprint(round_dir)
 
-    # 같은 번호를 다시 처리하는 경우 이전 센티넬을 먼저 없앤다 — DONE 과 FAILED 가
-    # 동시에 남아 상태가 모순되는 것을 막는다.
-    for name in ("DONE", "FAILED"):
-        stale = ckpt_round / name
-        if stale.exists():
-            log(f"[r{n:03d}] 이전 {name} 제거 (READY 가 바뀌어 재처리)")
-            stale.unlink()
+    # 검증과 센티넬 쓰기는 rank 0 만 한다. rank 마다 따로 validate 하면 파일이 아직
+    # 늘어나는 중일 때 서로 다른 결론을 낼 수 있고, FAILED 를 4개가 동시에 쓰게 된다.
+    verdict = None
+    if ddp.is_main():
+        fingerprint = ready_fingerprint(round_dir)
 
-    try:
-        ready = json.loads((round_dir / "READY").read_text())
-    except json.JSONDecodeError as exc:
-        write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
-                                             "reason": f"READY JSON 파싱 실패: {exc}"})
-        log(f"[r{n:03d}] FAILED — READY JSON 파싱 실패")
+        # 같은 번호를 다시 처리하는 경우 이전 센티넬을 먼저 없앤다 — DONE 과 FAILED 가
+        # 동시에 남아 상태가 모순되는 것을 막는다.
+        for name in ("DONE", "FAILED"):
+            stale = ckpt_round / name
+            if stale.exists():
+                log(f"[r{n:03d}] 이전 {name} 제거 (READY 가 바뀌어 재처리)")
+                stale.unlink()
+
+        try:
+            ready = json.loads((round_dir / "READY").read_text())
+        except json.JSONDecodeError as exc:
+            write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                                 "reason": f"READY JSON 파싱 실패: {exc}"})
+            log(f"[r{n:03d}] FAILED — READY JSON 파싱 실패")
+            verdict = {"ok": False}
+
+        if verdict is None:
+            stats, problems = validate(round_dir, ready)
+            if problems:
+                write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                                     "reason": "검증 실패", "problems": problems})
+                for p in problems:
+                    log(f"[r{n:03d}]   ✗ {p}")
+                log(f"[r{n:03d}] FAILED — 학습하지 않음")
+                verdict = {"ok": False}
+            else:
+                verdict = {"ok": True, "ready": ready, "stats": stats,
+                           "fingerprint": fingerprint}
+
+    verdict = ddp.broadcast_object(verdict)
+    if not verdict["ok"]:
         return "failed"
-
-    stats, problems = validate(round_dir, ready)
-    if problems:
-        write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
-                                             "reason": "검증 실패", "problems": problems})
-        for p in problems:
-            log(f"[r{n:03d}]   ✗ {p}")
-        log(f"[r{n:03d}] FAILED — 학습하지 않음")
-        return "failed"
+    ready, stats, fingerprint = verdict["ready"], verdict["stats"], verdict["fingerprint"]
 
     log(f"[r{n:03d}] 검증 통과: 세션 {len(stats['sessions'])}개 / 에피소드 {stats['episodes']} / "
         f"프레임 {stats['frames']} / {stats['bytes']/1e6:.1f} MB")
 
     if trainer is not None:
+        err = None
         try:
             trainer.run_round(round_dir, ckpt_round, stats, ready)
         except Exception as exc:                       # 학습 실패를 라운드 상태로 남긴다
             import traceback
-            tb = traceback.format_exc()
-            write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
-                                                 "reason": f"학습 실패: {exc}",
-                                                 "traceback": tb.splitlines()[-12:]})
-            for line in tb.splitlines()[-12:]:
-                log(f"[r{n:03d}]   {line}")
-            log(f"[r{n:03d}] FAILED — 학습 실패")
+            err = (str(exc), traceback.format_exc())
+            if not ddp.is_main():
+                # rank 0 이 아니면 로그가 꺼져 있다. torchrun 이 rank 를 붙여 stderr 로 낸다.
+                print(f"[rank{ddp.rank()}] r{n:03d} 학습 실패\n{err[1]}",
+                      file=sys.stderr, flush=True)
+        # 실패는 rank 사이에서 합의한다 — 한쪽만 FAILED 로 빠져나가면 다음 라운드에서
+        # 서로 다른 지점의 all-reduce 를 만나 멈춘다. (보통은 데이터·shape 문제라 모든
+        # rank 가 같은 자리에서 같이 실패한다.)
+        anyerr = any(x is not None for x in ddp.gather_object(err))
+        if anyerr:
+            if ddp.is_main():
+                reason, tb = err if err else ("다른 rank 에서 실패", "")
+                write_atomic(ckpt_round / "FAILED", {"round": n, "ready_sha": fingerprint,
+                                                     "reason": f"학습 실패: {reason}",
+                                                     "traceback": tb.splitlines()[-12:]})
+                for line in tb.splitlines()[-12:]:
+                    log(f"[r{n:03d}]   {line}")
+                log(f"[r{n:03d}] FAILED — 학습 실패")
             return "failed"
         stub = False
     else:
@@ -688,12 +842,16 @@ def process_round(n: int, round_dir: Path, ckpt_round: Path, log: Log, args,
         log(f"[r{n:03d}] [STUB] --exp-config 가 없어 학습을 생략한다. 실제로는 "
             f"update() {planned}회")
         time.sleep(args.stub_seconds)
-        export_stub(ckpt_round, log, args, stats, ready)
+        if ddp.is_main():
+            export_stub(ckpt_round, log, args, stats, ready)
         stub = True
 
-    write_atomic(ckpt_round / "DONE", {"round": n, "stub": stub, "ready_sha": fingerprint,
-                                       "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
-    log(f"[r{n:03d}] DONE → {ckpt_round}")
+    # DONE 은 actor 가 기다리는 신호다. 산출물(theta.pt)을 다 쓴 뒤에, rank 0 만 쓴다.
+    ddp.barrier()
+    if ddp.is_main():
+        write_atomic(ckpt_round / "DONE", {"round": n, "stub": stub, "ready_sha": fingerprint,
+                                           "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        log(f"[r{n:03d}] DONE → {ckpt_round}")
     return "done"
 
 
@@ -719,10 +877,15 @@ def main() -> int:
     p.add_argument("--stub-payload-mb", type=float, default=1.0)
     args = p.parse_args()
 
+    # torchrun 으로 띄우면 rank 마다 GPU 하나씩. 단일 프로세스로 띄우면 world=1 이라
+    # 아래 분기들이 전부 통과 상태가 된다 (같은 코드가 양쪽에서 돈다).
+    from rl import ddp
+    rank, world, device = ddp.init()
+
     runs_exp = args.runs_root / args.exp
     ckpt_exp = args.ckpt_root / "expo" / args.exp
     # 로그는 runs/<exp>/ 밖에 둔다 — 라운드 디렉토리를 지워도 남아야 한다.
-    log = Log(args.runs_root / f"{args.exp}.learner.log")
+    log = Log(args.runs_root / f"{args.exp}.learner.log", enabled=ddp.is_main())
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
@@ -730,25 +893,44 @@ def main() -> int:
     log("=" * 70)
     log(f"learner 시작  exp={args.exp}")
     log(f"  python   {sys.version.split()[0]}  pid={os.getpid()}")
+    log(f"  분산     world={world} device={device}"
+        + (f"  실효 배치 = expo.batch_size × {world}" if world > 1 else "  (단일 GPU)"))
     log(f"  runs     {runs_exp}")
     log(f"  ckpt     {ckpt_exp}")
     log(f"  code     {code_provenance(Path(args.repo))}")
-    runs_exp.mkdir(parents=True, exist_ok=True)
-    ckpt_exp.mkdir(parents=True, exist_ok=True)
+    if ddp.is_main():
+        runs_exp.mkdir(parents=True, exist_ok=True)
+        ckpt_exp.mkdir(parents=True, exist_ok=True)
+    ddp.barrier()
 
     # 폴링 전에 θ₀ 를 내보낸다 — actor 가 이걸 받아야 round 0 을 돌 수 있다.
-    export_init(ckpt_exp, log, args)
+    # 파일을 쓰는 것은 rank 0 뿐이다 (같은 경로에 4개가 동시에 쓰면 안 된다).
+    if ddp.is_main():
+        export_init(ckpt_exp, log, args)
+    ddp.barrier()
 
     # VLA(13.8GB) 와 학습기는 프로세스 수명 동안 한 번만 만든다 (라운드마다 재로드 금지).
     # 실제 로드는 첫 라운드가 올 때 (_build) — 데이터가 없으면 GPU 를 점유하지 않는다.
-    trainer = Trainer(args, log) if args.exp_config else None
+    trainer = Trainer(args, log, device=device) if args.exp_config else None
     if trainer is None:
         log("[경고] --exp-config 가 없어 학습 stub 으로 동작한다")
 
     last_beat = 0.0
     processed = 0
-    while not _stop:
-        found = find_next_round(runs_exp, ckpt_exp)
+    while True:
+        # 어느 라운드를 처리할지는 rank 0 이 정해서 알린다. rank 마다 각자 폴링하면
+        # READY 를 보는 시점이 갈려 한쪽만 학습에 들어가고, 그 상태로 all-reduce 를
+        # 만나면 통신이 맞물리지 않아 그대로 멈춘다. 종료 신호도 같이 보낸다.
+        decision = None
+        if ddp.is_main():
+            found = find_next_round(runs_exp, ckpt_exp)
+            decision = {"stop": _stop, "round": None if found is None else
+                        (found[0], str(found[1]))}
+        decision = ddp.broadcast_object(decision)
+        if decision["stop"]:
+            break
+        found = decision["round"]
+
         if found is None:
             now = time.time()
             if now - last_beat >= args.heartbeat_seconds:
@@ -759,7 +941,7 @@ def main() -> int:
             time.sleep(args.poll_seconds)
             continue
 
-        n, round_dir = found
+        n, round_dir = found[0], Path(found[1])
         process_round(n, round_dir, ckpt_exp / round_dir.name, log, args, trainer)
         processed += 1
         last_beat = 0.0
@@ -767,6 +949,7 @@ def main() -> int:
             break
 
     log(f"learner 종료 (처리한 라운드 {processed}개)")
+    ddp.shutdown()
     return 0
 
 

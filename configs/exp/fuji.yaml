@@ -109,7 +109,7 @@ explore_groups:
 expo:
   N: 8
   n_edit_samples: 8
-  edit_scale: 0.2
+  edit_scale: 0.01
   num_qs: 10
   num_min_qs: 2
   critic_layer_norm: true
@@ -142,11 +142,41 @@ vla:
 #   - 에피소드당 transition 이 많아 라운드당 학습량이 같은 updates_per_episode 로도 커진다
 #   - 이미지가 3카메라라 프레임당 저장량이 openarm 의 1.5배
 # Phase D 에서 "에피소드 구간별 Q 기울기" 를 보고 discount 를 논의한다.
+#
+# EXPO-FT 프로토콜과의 대응 (third_party/expo-ft/scripts/pick/run_server.sh):
+#   seed_dataset + seed_teleop_episodes   ← --num_data=10. BC SFT 에 쓴 성공 데모를
+#                                            온라인 리플레이 버퍼에 그대로 섞는다
+#                                            (offline_ratio=0 경로 = 우리 유일한 경로)
+#   updates_per_episode                   ← --num_updates=3 / --update_type=episode
+#   min_online_episodes                   ← can_update 의 `ep_count >= 10` (하드코딩)
+#
+# 원본과 다른 점: 원본은 에피소드 하나가 끝날 때마다 3회 업데이트한다. 우리는 로봇이
+# 원격이라 라운드(에피소드 여러 개)로 묶어 3 × 라운드에피소드수 를 한꺼번에 돈다. 총
+# 업데이트 수는 같지만 한 라운드 안의 에피소드는 전부 같은 θ 로 수집된다 (그만큼 덜
+# on-policy 다). episodes_per_round 는 actor 가 몇 개씩 보낼지에 대한 약속이고 learner 는
+# 받은 만큼 학습한다 — 코드가 강제하지 않는다.
 round:
   episodes_per_round: 5
   updates_per_episode: 3
+
+  # --- 시드 데모 (라운드 0 전에 버퍼에 미리 들어간다) --------------------------
+  # repo 상대경로. 이 아래의 LeRobot 세션들에서 에피소드를 골라 버퍼 **맨 앞**에 넣는다.
+  # 비우면 시드 없이 시작한다.
+  seed_dataset: rl-dataset/t0
+  # 세션당 최대 개수. 성공이 이보다 적으면 있는 만큼만 담는다 (실패로 채우지 않는다).
+  # t0 는 18개 중 성공 6개라 지금은 6개가 들어간다.
   seed_teleop_episodes: 10
-  offline_ratio: 0.0
+  # 성공 에피소드만 담는다. EXPO-FT 는 성공 데모 디렉토리(.../success)를 통째로 받았고,
+  # actor 배치가 actor_success_only 로 성공 프레임에서만 뽑히므로 실패를 채워 넣어도
+  # actor 쪽에는 쓸모가 없고 critic 쪽 분포만 바꾼다.
+  seed_success_only: true
+
+  # --- 학습 시작 게이트 --------------------------------------------------------
+  # **온라인 롤아웃** 에피소드 누적이 이 수에 닿기 전에는 버퍼에만 넣고 학습하지 않는다.
+  # 시드 teleop 은 세지 않는다 (원본 ep_count 와 같은 의미).
   min_online_episodes: 10
-  warmup_n_edit_samples: 8
+
+  # TODO: 아직 코드가 읽지 않는다. 버퍼는 라운드마다 무한히 누적된다 (EXPO-FT 는
+  # capacity=max_steps 인 링버퍼). fuji 는 에피소드가 1200 프레임이라 100k 면 약
+  # 83 에피소드에서 걸린다 — 그 근처에 가기 전에 붙일 것.
   buffer_capacity: 100000

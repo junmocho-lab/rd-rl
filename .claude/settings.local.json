@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi --query-gpu=index,name,memory.total --format=csv)",
+      "Bash(env)",
+      "Bash(/data/junmo_cho/workspace/RLDX-1/.venv/bin/python -V)",
+      "Bash(command -v kubectl)",
+      "Read(//root/**)",
+      "Bash(command -v tmux)",
+      "Bash(tmux -V)",
+      "Bash(tmux ls *)",
+      "Bash(nvidia-smi --query-compute-apps=pid,used_memory --format=csv)",
+      "Bash(chmod +x learner/start.sh)",
+      "Bash(bash -n learner/start.sh)",
+      "Bash(git -C /data/junmo_cho/workspace/rd-rl status --short)",
+      "Bash(cd *)",
+      "Bash(tmux kill-session *)",
+      "Bash(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv)",
+      "Bash(sed -n '/^round:/,/^[a-z]/p' configs/exp/fuji.yaml)",
+      "Bash(ps -o pid,stat,etime,time,%cpu,rss -p 7462)",
+      "Bash(git restore *)",
+      "Bash(/data/junmo_cho/workspace/RLDX-1/.venv/bin/python -c ' *)",
+      "Bash(./learner/start.sh fuji *)",
+      "Read(//data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/expo/**)",
+      "Read(//data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/expo/fuji_20260821-022417/**)",
+      "Bash(nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader)"
+    ]
+  }
+}

@@ -1,0 +1,189 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            24nqb1z6cqcl9ueyccdcxlybzmkhrez4:
+                args:
+                    - --exp
+                    - fuji_20260821-022417
+                    - --exp-config
+                    - configs/exp/fuji.yaml
+                    - --runs-root
+                    - /data/junmo_cho/workspace/rd-rl/runs
+                    - --ckpt-root
+                    - /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints
+                    - --repo
+                    - /data/junmo_cho/workspace/rd-rl
+                    - --poll-seconds
+                    - "5"
+                    - --heartbeat-seconds
+                    - "300"
+                    - --updates-per-episode
+                    - "11"
+                codePath: learner/loop.py
+                codePathLocal: learner/loop.py
+                cpu_count: 64
+                cpu_count_logical: 128
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "46086056050688"
+                        used: "1475154661376"
+                email: junmokane@kaist.ac.kr
+                executable: /data/junmo_cho/workspace/RLDX-1/.venv/bin/python
+                git:
+                    commit: 7f6ff349637a0ab68b2e9870ed85ffb21db3faba
+                    remote: git@github.com:junmocho-lab/rd-rl.git
+                gpu: NVIDIA H200
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "150754820096"
+                      name: NVIDIA H200
+                      uuid: GPU-648b5576-02fe-8e3e-347e-716b5c5c1b00
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "150754820096"
+                      name: NVIDIA H200
+                      uuid: GPU-b4e9da60-e512-4eb1-3530-c700ed2e32e1
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "150754820096"
+                      name: NVIDIA H200
+                      uuid: GPU-0f673eaa-4660-e0ec-c82b-d0bdd1188040
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "150754820096"
+                      name: NVIDIA H200
+                      uuid: GPU-3afbcdcc-cc6a-73db-1d4d-3d1a7c30c6f0
+                host: junmo-cho-data-pod-2
+                memory:
+                    total: "2163980394496"
+                os: Linux-6.8.0-71-generic-x86_64-with-glibc2.35
+                program: /data/junmo_cho/workspace/rd-rl/learner/loop.py
+                python: CPython 3.10.12
+                root: /data/junmo_cho/workspace/rd-rl
+                startedAt: "2026-08-21T02:35:32.931086Z"
+                writerId: 24nqb1z6cqcl9ueyccdcxlybzmkhrez4
+        m: []
+        python_version: 3.10.12
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 71
+                - 80
+                - 83
+                - 98
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 71
+                - 80
+                - 83
+                - 98
+            "3":
+                - 13
+                - 14
+                - 16
+                - 61
+            "4": 3.10.12
+            "5": 0.23.0
+            "6": 4.57.0
+            "12": 0.23.0
+            "13": linux-x86_64
+action_horizon:
+    value: 40
+active_dim:
+    value: 7
+base_policy:
+    value: rldx-img-curated/rldx_img_curated-0810-0818-r03
+exp:
+    value: fuji
+explore_groups:
+    value:
+        - right_arm_joints
+expo.N:
+    value: 8
+expo.actor_lr:
+    value: 0.0003
+expo.actor_success_only:
+    value: true
+expo.batch_size:
+    value: 64
+expo.critic_layer_norm:
+    value: true
+expo.critic_lr:
+    value: 0.0003
+expo.discount:
+    value: 0.99
+expo.edit_scale:
+    value: 0.2
+expo.encoder_num_filters:
+    value: 64
+expo.encoder_stage_sizes:
+    value:
+        - 3
+        - 4
+        - 6
+        - 3
+expo.entropy_scale:
+    value: 1
+expo.freeze_critic_encoder:
+    value: false
+expo.hidden_dims:
+    value:
+        - 256
+        - 256
+        - 256
+expo.include_state:
+    value: true
+expo.init_temperature:
+    value: 1
+expo.latent_dim_image:
+    value: 512
+expo.latent_dim_state:
+    value: 64
+expo.n_edit_samples:
+    value: 8
+expo.num_min_qs:
+    value: 2
+expo.num_qs:
+    value: 10
+expo.tau:
+    value: 0.005
+expo.temp_lr:
+    value: 0.0003
+expo.utd_ratio:
+    value: 20
+inference_latency:
+    value: 3
+replan_steps:
+    value: 8
+robot:
+    value: rby1m_rh56f1
+round.buffer_capacity:
+    value: 100000
+round.episodes_per_round:
+    value: 5
+round.min_online_episodes:
+    value: 10
+round.offline_ratio:
+    value: 0
+round.seed_teleop_episodes:
+    value: 10
+round.updates_per_episode:
+    value: 3
+round.warmup_n_edit_samples:
+    value: 8
+run_id:
+    value: fuji_20260821-022417
+seed:
+    value: 0
+target_entropy:
+    value: -28

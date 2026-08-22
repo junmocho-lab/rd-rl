@@ -84,23 +84,32 @@ spec:
               export NO_ALBUMENTATIONS_UPDATE=1
               echo "[pythonpath] $PYTHONPATH"
 
-              exec "$L_PY" learner/loop.py \
+              # rank 하나가 GPU 하나. 아래 resources 의 nvidia.com/gpu 와 반드시 같아야
+              # 한다 (RLDX-1 학습 잡의 NUM_GPUS 와 같은 규칙). 실효 배치가
+              # expo.batch_size × NUM_GPUS 로 커진다 — meta.json 에 기록된다.
+              export NUM_GPUS=4
+              export OMP_NUM_THREADS=4
+
+              exec "$L_PY" -m torch.distributed.run \
+                  --standalone --nnodes=1 --nproc_per_node=$NUM_GPUS \
+                  learner/loop.py \
                   --exp "$RDRL_EXP" \
                   --exp-config "configs/exp/__EXP_NAME__.yaml" \
                   --runs-root "$L_RUNS" \
                   --ckpt-root "$L_CKPT" \
                   --repo "$L_RL" \
                   --poll-seconds 5 \
-                  --heartbeat-seconds 300 \
-                  --updates-per-episode 11 \
-                  --stub-seconds 5 \
-                  --stub-payload-mb 1
+                  --heartbeat-seconds 300
           volumeMounts:
             - name: ddn
               mountPath: /data
           resources:
-            # GPU 1개면 된다 — 백본은 동결이고 학습 대상은 action expert LoRA(4.78M) +
-            # critic 앙상블 + 인코더뿐이다. 백본 13.8GB 를 올려 추론만 돌린다.
-            # 메모리는 백본 + uint8 이미지 배치(64프레임 × 카메라수) 기준.
-            requests: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }
-            limits: { cpu: "16", memory: "128Gi", nvidia.com/gpu: "1" }
+            # GPU 4개 — 위 NUM_GPUS 와 반드시 일치시킬 것. rank 하나가 GPU 하나를 잡고
+            # gradient 를 rank 평균으로 맞춘다 (rl/ddp.py).
+            #
+            # 메모리 한 장 기준: 백본 13.8GB(동결, 추론만) + LoRA(4.78M) + critic 앙상블
+            # + 인코더 + uint8 이미지 배치(batch_size 프레임 × 카메라수). 실측 34GB/장.
+            # 학습 대상 자체는 작아서 1장으로도 들어가지만, 라운드 학습 시간이 GPU 수에
+            # 거의 반비례한다 (실측: 배치 64/1장 82.9s → 실효 256/4장 68.0s per update).
+            requests: { cpu: "32", memory: "256Gi", nvidia.com/gpu: "4" }
+            limits: { cpu: "32", memory: "256Gi", nvidia.com/gpu: "4" }

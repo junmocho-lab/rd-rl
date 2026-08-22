@@ -29,6 +29,7 @@ from dataclasses import fields as _dc_fields
 import torch
 import torch.nn as nn
 
+from rl import ddp
 from rl.nets import BatchEncoder, CriticEnsemble, ExploreSpec, ResidualActor, Temperature
 
 
@@ -182,6 +183,13 @@ class EXPOLearner:
         self.opt_temp = torch.optim.Adam(self.temp.parameters(), lr=c.temp_lr)
         self.steps = {"critic": 0, "actor": 0, "residual": 0, "temp": 0}
 
+        # 멀티 GPU 에서 backward 뒤 opt.step() 전에 gradient 를 rank 평균으로 맞춘다.
+        # 단일 프로세스면 ddp.all_reduce_grads 가 즉시 반환하므로 분기하지 않는다.
+        # (자세한 이유는 rl/ddp.py 머리말)
+        self._critic_params = list(self.critic.parameters()) + list(self.encoder.parameters())
+        self._residual_params = list(self.residual.parameters())
+        self._temp_params = list(self.temp.parameters())
+
     # --- 공통 ---------------------------------------------------------------
     def encode(self, obs: torch.Tensor, stop_gradient: bool) -> torch.Tensor:
         return self.encoder(obs, stop_gradient=stop_gradient)
@@ -267,6 +275,9 @@ class EXPOLearner:
 
         self.opt_critic.zero_grad(set_to_none=True)
         loss.backward()
+        # rank 평균은 clip 전에 한다 — grad norm 은 로그용 지표이므로 실효 배치(평균 뒤)의
+        # 값이어야 rank 수를 바꿔도 같은 것을 보게 된다.
+        ddp.all_reduce_grads(self._critic_params)
         gnorm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), float("inf"))
         self.opt_critic.step()
 
@@ -293,6 +304,7 @@ class EXPOLearner:
 
         self.opt_residual.zero_grad(set_to_none=True)
         loss.backward()
+        ddp.all_reduce_grads(self._residual_params)
         self.opt_residual.step()
         self.steps["residual"] += 1
         entropy = float(-log_prob.mean().detach())
@@ -304,6 +316,9 @@ class EXPOLearner:
         loss = self.temp() * (entropy - self.spec.target_entropy)
         self.opt_temp.zero_grad(set_to_none=True)
         loss.backward()
+        # entropy 는 rank 마다 자기 배치의 값이다. gradient 를 평균하면 결과적으로 실효
+        # 배치의 평균 엔트로피로 갱신한 것과 같아진다 (loss 가 entropy 에 선형이라서).
+        ddp.all_reduce_grads(self._temp_params)
         self.opt_temp.step()
         self.steps["temp"] += 1
         return {"temperature": float(self.temp().detach()), "temperature_loss": float(loss.detach())}

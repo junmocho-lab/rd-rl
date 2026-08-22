@@ -1,0 +1,9 @@
+{"time":"2026-08-21T06:18:58.413737309Z","level":"INFO","msg":"stream: starting","core version":"0.23.0"}
+{"time":"2026-08-21T06:18:58.921042904Z","level":"INFO","msg":"stream: created new stream","id":"fuji_20260821-053725"}
+{"time":"2026-08-21T06:18:58.921372622Z","level":"INFO","msg":"handler: started","stream_id":"fuji_20260821-053725"}
+{"time":"2026-08-21T06:18:58.923194088Z","level":"INFO","msg":"stream: started","id":"fuji_20260821-053725"}
+{"time":"2026-08-21T06:18:58.923200919Z","level":"INFO","msg":"writer: started","stream_id":"fuji_20260821-053725"}
+{"time":"2026-08-21T06:18:58.923202221Z","level":"INFO","msg":"sender: started","stream_id":"fuji_20260821-053725"}
+{"time":"2026-08-21T06:52:30.45866283Z","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/junmokane/rd-rl-expo/fuji_20260821-053725/file_stream\": read tcp 198.18.151.162:34322->34.8.250.101:443: read: connection reset by peer"}
+{"time":"2026-08-21T07:01:00.457894506Z","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/junmokane/rd-rl-expo/fuji_20260821-053725/file_stream\": read tcp 198.18.151.162:41958->34.8.250.101:443: read: connection reset by peer"}
+{"time":"2026-08-21T07:10:45.45910257Z","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/junmokane/rd-rl-expo/fuji_20260821-053725/file_stream\": read tcp 198.18.151.162:39152->34.8.250.101:443: read: connection reset by peer"}
