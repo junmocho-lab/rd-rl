@@ -126,7 +126,7 @@ expo:
   encoder_num_filters: 64
   init_temperature: 1.0
   entropy_scale: 1.0
-  batch_size: 64
+  batch_size: 128
   utd_ratio: 20
   freeze_critic_encoder: false
   actor_success_only: true

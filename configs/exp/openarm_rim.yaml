@@ -58,7 +58,7 @@ expo:
   encoder_num_filters: 64
   init_temperature: 1.0
   entropy_scale: 1.0
-  batch_size: 64
+  batch_size: 128
   utd_ratio: 20           # update() 한 번의 critic 미니배치 수
   freeze_critic_encoder: false
   actor_success_only: true  # actor BC 배치를 성공 에피소드에서만

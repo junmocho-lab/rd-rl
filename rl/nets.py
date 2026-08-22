@@ -237,14 +237,20 @@ class ExploreSpec:
     """어느 액션 차원을 residual(edit) 로 탐색할지.
 
     modality 의 action 그룹 이름으로 선언한다 (configs/exp/<이름>.yaml 의 explore_groups).
-    비어 있으면 전체 = EXPO-FT 원본과 동일.
+    비어 있으면 전체 그룹 = EXPO-FT 원본과 동일.
+
+    full_dim 은 **critic 과 같은 액션 벡터** 다: 청크 [0, latency+replan_steps) 를 평탄화한
+    것. 앞 latency 스텝(prefix)은 이미 커밋되어 편집할 수 없으므로 index 에서 빠지고,
+    scatter 가 그 자리에 0 을 넣는다 = 마스킹. 그래서 critic 과 edit policy 가 같은 입력을
+    보면서도 편집은 실행 구간에만 들어간다.
     """
 
-    index: torch.Tensor        # (active_dim*replan,) full_action 안의 위치
+    index: torch.Tensor        # (active_dim*replan,) 액션 벡터 안의 편집 가능 위치
     active_dim: int            # 스텝당 활성 차원 수
-    full_dim: int              # replan_steps * action_dim
+    full_dim: int              # (latency + replan_steps) * action_dim
     replan_steps: int
     groups: tuple[str, ...]
+    latency: int = 0
 
     @property
     def out_dim(self) -> int:
@@ -263,18 +269,23 @@ class ExploreSpec:
 
 
 def explore_spec(offsets: list[tuple[str, int, int]], groups: list[str] | tuple[str, ...],
-                 action_dim: int, replan_steps: int) -> ExploreSpec:
-    """offsets 는 rl.data.Modality.offsets("action") 결과."""
+                 action_dim: int, replan_steps: int, latency: int = 0) -> ExploreSpec:
+    """offsets 는 rl.data.Modality.offsets("action") 결과.
+
+    latency > 0 이면 액션 벡터가 prefix 를 포함해 (latency+replan)*action_dim 으로 넓어지고,
+    편집 가능 위치는 스텝 [latency, latency+replan) 에만 잡힌다.
+    """
     names = [n for n, _, _ in offsets]
     unknown = [g for g in groups if g not in names]
     if unknown:
         raise ValueError(f"모르는 action 그룹: {unknown} (가능: {names})")
     sel = list(groups) if groups else names
     per_step = [i for n, s, e in offsets if n in sel for i in range(s, e)]
-    idx = [t * action_dim + i for t in range(replan_steps) for i in per_step]
+    idx = [t * action_dim + i
+           for t in range(latency, latency + replan_steps) for i in per_step]
     return ExploreSpec(index=torch.tensor(idx, dtype=torch.long), active_dim=len(per_step),
-                       full_dim=replan_steps * action_dim, replan_steps=replan_steps,
-                       groups=tuple(sel))
+                       full_dim=(latency + replan_steps) * action_dim,
+                       replan_steps=replan_steps, groups=tuple(sel), latency=latency)
 
 
 class ResidualActor(nn.Module):
@@ -355,13 +366,13 @@ def _verify() -> int:
     torch.manual_seed(0)
     B = 4
 
-    for name, mod_name, groups, replan in (
-            ("openarm (전체 탐색)", "openarm_lefthand", [], 8),
-            ("fuji (오른팔만)", "rby1m_rh56f1", ["right_arm_joints"], 15)):
+    for name, mod_name, groups, replan, latency in (
+            ("openarm (전체 탐색, latency 2)", "openarm_lefthand", [], 8, 2),
+            ("fuji (오른팔만)", "rby1m_rh56f1", ["right_arm_joints"], 15, 0)):
         print(f"\n=== {name} ===")
         offs, adim = offsets_of(mod_name)
-        spec = explore_spec(offs, groups, adim, replan)
-        full = replan * adim
+        spec = explore_spec(offs, groups, adim, replan, latency)
+        full = (latency + replan) * adim
         print(f"  action_dim={adim} replan={replan} full={full} "
               f"active={spec.out_dim} ({spec.out_dim/full:.1%}) target_entropy={spec.target_entropy}")
         check("spec.full_dim", spec.full_dim == full, str(spec.full_dim))

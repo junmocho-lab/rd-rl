@@ -5,6 +5,9 @@ rl-dataset/*
 claude_logs
 wandb
 .claude
+checkpoints
+out
+sbatch
 
 # python
 .venv/

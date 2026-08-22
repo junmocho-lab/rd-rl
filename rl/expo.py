@@ -150,7 +150,15 @@ class EXPOLearner:
         self.device = torch.device(device)
         self.gen = torch.Generator(device="cpu").manual_seed(seed)
         c = self.cfg
+        # critic 과 residual 이 **같은 액션 벡터**를 본다: 청크 [0, latency+replan) 평탄화
+        # (= spec.full_dim). prefix(이미 커밋된 latency 스텝)는 결정의 일부가 아니지만
+        # 결정 이후 실제로 실행되는 액션이라 Q 의 인자에 들어가야 하고 (그래야 보상 창
+        # [t, t+replan) 을 일으킨 액션이 전부 입력에 있다), 편집은 spec.index 가 실행
+        # 구간만 가리켜 scatter 가 prefix 자리에 0 을 넣는 것으로 막는다.
+        # rrc 도 prefix 를 버리므로 편집해봐야 실행되지 않고, critic 은 학습에서 항상
+        # **실제 실행된** prefix 를 봤으므로 편집된 값을 넣으면 학습 분포 밖으로 나간다.
         full = spec.full_dim
+        self.prefix_dim = latency * (full // (latency + spec.replan_steps))
 
         # 파라미터 초기화까지 seed 로 고정한다. self.gen 은 REDQ 부분집합 뽑기용이고
         # nn.Linear/Conv 의 초기화는 전역 RNG 를 타므로 이게 없으면 **같은 seed 로도
@@ -199,6 +207,7 @@ class EXPOLearner:
 
     # --- 후보 생성 + Q argmax (원본 sample_batch_actions) --------------------
     def select_from_chunks(self, chunks: torch.Tensor, latent: torch.Tensor, state: torch.Tensor,
+                           prefix: torch.Tensor | None = None,
                            ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """이미 만들어진 후보 청크 (B,N,H,A) → 실행 구간 argmax.
 
@@ -211,11 +220,15 @@ class EXPOLearner:
         """
         c = self.cfg
         B = latent.shape[0]
-        # RTC 지연: 앞 latency 개는 prefix 가 붙잡아 후보끼리 거의 같다. 실제로 실행되고
-        # 후보끼리 다른 구간 [latency, latency+replan) 만 critic 에 넣는다.
         s = self.latency
         n_base = chunks.shape[1]
-        acts = chunks[:, :, s:s + self.replan_steps].reshape(B, n_base, -1)  # (B,N,full)
+        acts = chunks[:, :, :s + self.replan_steps].reshape(B, n_base, -1)   # (B,N,full)
+        if self.prefix_dim and prefix is not None:
+            # 학습 경로는 **로그된** prefix 를 넘긴다 — 학습 때는 RTC 를 끄고 샘플링하므로
+            # 청크의 앞 latency 개가 실제 커밋된 값이 아니다. 서빙에서는 RTC 가 후보 전부에
+            # 같은 prefix 를 박아 두므로 청크에 들어 있는 그대로 쓴다 (prefix=None).
+            acts = acts.clone()
+            acts[:, :, :self.prefix_dim] = prefix[:, None, :]
 
         if c.n_edit_samples > 0:
             k = min(c.n_edit_samples, n_base)
@@ -244,6 +257,7 @@ class EXPOLearner:
         }
 
     def candidate_actions(self, vla_obs, latent: torch.Tensor, state: torch.Tensor,
+                          prefix: torch.Tensor | None = None,
                           ) -> tuple[torch.Tensor, dict]:
         """관측에서 후보 N + n_edit 개를 만들고 target critic 으로 argmax.
 
@@ -252,18 +266,21 @@ class EXPOLearner:
         """
         with torch.no_grad():
             chunks = self.vla.sample(vla_obs, num_samples=self.cfg.N)        # (B,N,H,A)
-        chosen, _, info = self.select_from_chunks(chunks, latent, state)
+        chosen, _, info = self.select_from_chunks(chunks, latent, state, prefix)
         return chosen, info
 
     # --- critic (원본 update_critic) ----------------------------------------
     def update_critic(self, b: dict) -> dict:
         c = self.cfg
         next_lat = self.encode(b["next_obs"], stop_gradient=True)
-        next_action, sel = self.candidate_actions(b["vla_next_obs"], next_lat, b["next_state"])
+        next_pre = b.get("next_action_prefix")
+        next_action, sel = self.candidate_actions(b["vla_next_obs"], next_lat, b["next_state"],
+                                                 next_pre)
 
         with torch.no_grad():
             members = self._members()
-            next_qs = self.target_critic(next_lat, b["next_state"], next_action, members=members)
+            next_qs = self.target_critic(next_lat, b["next_state"], next_action,
+                                         members=members)
             next_q = next_qs.min(dim=0).values
             nan = torch.isnan(next_q)
             next_q = torch.where(nan, torch.zeros_like(next_q), next_q)
@@ -353,9 +370,10 @@ class EXPOLearner:
 
     # --- 롤아웃 (원본 sample_actions) ---------------------------------------
     @torch.no_grad()
-    def act(self, vla_obs, obs: torch.Tensor, state: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def act(self, vla_obs, obs: torch.Tensor, state: torch.Tensor,
+            prefix: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
         lat = self.encode(obs, stop_gradient=True)
-        return self.candidate_actions(vla_obs, lat, state)
+        return self.candidate_actions(vla_obs, lat, state, prefix)
 
 
 def _sub(v, sl: slice):
@@ -418,7 +436,7 @@ def _verify() -> int:
     for n, s, e in groups:
         offs.append((n, cum, cum + (e - s))); cum += e - s
     adim, replan, n_cams, latency = cum, 8, 3, 3
-    spec = explore_spec(offs, ["right_arm_joints"], adim, replan)
+    spec = explore_spec(offs, ["right_arm_joints"], adim, replan, latency)
 
     torch.manual_seed(0)
     B, UTD = 8, 4
@@ -434,6 +452,7 @@ def _verify() -> int:
             "next_obs": torch.randint(0, 255, (n, 192, 320, 3 * n_cams), dtype=torch.uint8),
             "state": torch.randn(n, adim), "next_state": torch.randn(n, adim),
             "action": torch.rand(n, spec.full_dim) * 2 - 1,
+            "next_action_prefix": torch.rand(n, latency * adim) * 2 - 1,
             "full_action": torch.rand(n, 40, adim) * 2 - 1,
             "reward": (torch.rand(n) < 0.1).float(),
             "mask": (torch.rand(n) > 0.1).float(),
@@ -459,9 +478,9 @@ def _verify() -> int:
     # 3) target_q 공식 — candidate_actions 를 고정 액션으로 바꿔치기해 정확히 대조
     b = batch(B)
     fixed = torch.zeros(B, spec.full_dim)
-    L.candidate_actions = lambda vo, lat, st: (fixed, {"select_ratio_with_residual": 0.0,
-                                                       "select_ratio_without_residual": 1.0,
-                                                       "candidate_q_std": 0.0})
+    L.candidate_actions = lambda vo, lat, st, pre=None: (
+        fixed, {"select_ratio_with_residual": 0.0, "select_ratio_without_residual": 1.0,
+                "candidate_q_std": 0.0})
     with torch.no_grad():
         nl = L.encode(b["next_obs"], stop_gradient=True)
         allq = L.target_critic(nl, b["next_state"], fixed)
@@ -509,10 +528,11 @@ def _verify() -> int:
     mask = torch.zeros(spec.full_dim, dtype=torch.bool); mask[spec.index] = True
     with torch.no_grad():
         lat = L2.encode(bb["obs"], stop_gradient=True)
-        base = L2.vla.sample(bb["vla_obs"], 1)[:, 0, latency:latency + replan].reshape(4, -1)
+        base = L2.vla.sample(bb["vla_obs"], 1)[:, 0, :latency + replan].reshape(4, -1)
         edit, _ = L2.residual.sample(lat, bb["state"], base, cfg.edit_scale)
-    check("6 편집은 활성 차원에만 (비활성 차원 변화 0)", bool((edit[:, ~mask] == 0).all()),
-          f"비활성 {int((~mask).sum())}차원")
+    check("6 편집은 활성 차원에만 — prefix 와 비탐색 그룹은 변화 0",
+          bool((edit[:, ~mask] == 0).all()),
+          f"비활성 {int((~mask).sum())}차원 (그중 prefix {L2.prefix_dim})")
 
     print(f"\n  [수치] γ^{replan}={cfg.discount**replan:.4f}  q={info['q']:.4f}  "
           f"critic_loss={info['critic_loss']:.4f}  temperature={info.get('temperature', 0):.4f}")

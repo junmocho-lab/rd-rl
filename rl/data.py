@@ -457,8 +457,12 @@ def make_batch(flat: Flat, imgs, idx: np.ndarray, mod: Modality, replan_steps: i
     VLA 계열은 RLDX 프로세서에 넣을 nested dict 을 그대로 준다.
 
     latency (RTC 지연) 만큼 critic 액션 창을 뒤로 민다. 추론이 경계보다 latency 스텝 먼저
-    돌고 앞 latency 개가 prefix 로 고정되므로, 실제로 실행되는 것은
+    돌고 앞 latency 개가 prefix 로 고정되므로, 편집·선택 대상은
     chunk[latency : latency+replan_steps] 이다. actor BC 대상은 청크 전체.
+
+    critic 과 residual 이 보는 액션("action")은 그보다 넓다 — prefix 를 포함한
+    chunk[0 : latency+replan_steps]. 결정 이후 실제로 실행되는 액션 전부라서 보상 창
+    [t, t+replan) 을 일으킨 액션이 입력에 다 들어온다. 편집만 실행 구간으로 제한된다.
     """
     if action_horizon < latency + replan_steps:
         raise ValueError(f"action_horizon({action_horizon}) < latency({latency}) + "
@@ -467,6 +471,7 @@ def make_batch(flat: Flat, imgs, idx: np.ndarray, mod: Modality, replan_steps: i
     n = nstep(flat, idx, replan_steps, discount)
     nxt = n["next_idx"]
     ch = action_chunk(flat, idx, action_horizon)          # (B, H, A)
+    ch_n = action_chunk(flat, nxt, action_horizon)
     A = ch.shape[-1]
 
     def cat_cams(i):
@@ -486,7 +491,12 @@ def make_batch(flat: Flat, imgs, idx: np.ndarray, mod: Modality, replan_steps: i
         # --- critic / residual / 인코더 ---
         "obs": cat_cams(idx), "next_obs": cat_cams(nxt),
         "state": flat.state[idx], "next_state": flat.state[nxt],
-        "action": ch[:, latency:latency + replan_steps].reshape(len(idx), replan_steps * A),
+        # critic/residual 이 함께 보는 액션 = 청크 [0, latency+replan). 앞 latency 스텝
+        # (prefix, 이미 커밋됨) 은 편집되지 않는다 — rl/nets.explore_spec 이 마스킹한다.
+        "action": ch[:, :latency + replan_steps].reshape(len(idx), (latency + replan_steps) * A),
+        # 다음 상태의 prefix. 타깃 액션은 정책 후보에서 뽑으므로 그 앞 latency 스텝을
+        # **로그된 값**으로 덮어써야 한다 (학습 샘플링은 RTC 를 끈다).
+        "next_action_prefix": ch_n[:, :latency].reshape(len(idx), latency * A),
         # --- actor(VLA) ---
         "full_action": ch,                                                    # (B, 16, 28)
         "vla_obs": vla_obs(idx), "vla_next_obs": vla_obs(nxt),
@@ -687,7 +697,8 @@ def verify_batch(root: Path, out: Path, mod: Modality, batch_size: int = 64,
     check("a next_obs shape 동일", b["next_obs"].shape == b["obs"].shape)
     check("a state shape (B, state_dim)", b["state"].shape == (B, mod.state_dim),
           f"{b['state'].shape} (modality state_dim={mod.state_dim})")
-    check("a action shape (B, replan*A)", b["action"].shape == (B, replan_steps * A), str(b["action"].shape))
+    check("a action shape (B, (latency+replan)*A)",
+          b["action"].shape == (B, replan_steps * A), str(b["action"].shape))   # latency=0
     check("a full_action shape (B,H_a,A)", b["full_action"].shape == (B, action_horizon, A),
           str(b["full_action"].shape))
 

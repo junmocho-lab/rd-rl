@@ -292,7 +292,8 @@ def export_init(ckpt_exp: Path, log: Log, args) -> None:
                                 exp["rldx_data_config"], base)
     ecfg = ExpoConfig.from_dict(exp.get("expo"))
     spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
-                        mod.action_dim, int(exp["replan_steps"]))
+                        mod.action_dim, int(exp["replan_steps"]),
+                        int(exp["inference_latency"]))
     seed = int(args.seed)
     L = EXPOLearner(DummyVLA(mod.action_dim, int(exp["action_horizon"])), spec, mod.state_dim,
                     mod.n_cams, int(exp["replan_steps"]), ecfg, device="cpu", seed=seed,
@@ -355,7 +356,7 @@ class Trainer:
         self.buf = args.runs_root / args.exp / "buffer"
         self.ckpt_exp = args.ckpt_root / "expo" / args.exp
         self.built = False
-        self.flat = self.imgs = self.actnorm = None
+        self.flat = self.imgs = self.actnorm = self.statenorm = None
         self.task = ""
         # rank 마다 자기 GPU. 단일 프로세스면 cuda:0.
         self.device = str(device) if device is not None else "cuda"
@@ -395,7 +396,7 @@ class Trainer:
         self.mod = mod
         self.cfg = ExpoConfig.from_dict(exp.get("expo"))
         spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
-                            mod.action_dim, self.replan)
+                            mod.action_dim, self.replan, self.latency)
         self.log(f"[학습] {src}")
         self.log(f"[학습] 정책 로드 {base.name}")
         t0 = time.time()
@@ -533,6 +534,7 @@ class Trainer:
         import numpy as np
         from rl import ddp
         from rl.data import build_flat, build_images, find_sessions, open_images
+        from rl.vla_rldx import normalize_states
         from rl.offline_critic import normalize_all
 
         manifest = self.buf / "sessions.json"
@@ -588,6 +590,9 @@ class Trainer:
         self.imgs, _ = open_images(self.buf / "images.mm")
         self.actnorm = normalize_all(self.vla, self.flat, self.horizon,
                                      cache=self.buf / "actnorm.npy")
+        # state 도 모델 공간으로. 벡터 연산 한 번이라 캐시하지 않는다 (액션 청크와 달리
+        # 프레임당 python 루프가 없다). rl/vla_rldx.normalize_states 의 주석 참고.
+        self.statenorm = normalize_states(self.vla.proc, self.vla.tag, self.mod, self.flat.state)
         tasks = json.loads((paths[0] / "meta" / "tasks.jsonl").read_text().splitlines()[0])
         self.task = tasks["task"]
 
@@ -629,9 +634,12 @@ class Trainer:
         b = make_batch(self.flat, self.imgs, idx, self.mod, replan_steps=self.replan,
                        action_horizon=self.horizon, discount=self.cfg.discount,
                        task=self.task, latency=self.latency)
-        # critic 이 보는 액션만 모델 공간으로 갈아끼운다. full_action(actor BC 대상) 은 raw.
+        # critic 이 보는 액션/상태를 모델 공간으로 갈아끼운다. full_action(actor BC 대상) 은 raw.
         L, R, A = self.latency, self.replan, self.mod.action_dim
-        b["action"] = self.actnorm[idx][:, L:L + R].reshape(len(idx), R * A)
+        b["action"] = self.actnorm[idx][:, :L + R].reshape(len(idx), (L + R) * A)
+        b["next_action_prefix"] = self.actnorm[b["next_idx"]][:, :L].reshape(len(idx), L * A)
+        b["state"] = self.statenorm[idx]
+        b["next_state"] = self.statenorm[b["next_idx"]]
         dev = self.L.device
         out = {}
         for k, v in b.items():

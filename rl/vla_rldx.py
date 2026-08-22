@@ -36,6 +36,41 @@ from rl.data import Modality, rldx_layout
 from rl.expo import VLA
 
 
+def load_state_action_processor(model_path: Path | str, rldx_root: Path | str,
+                                rldx_config: str):
+    """가중치 없이 StateActionProcessor 만 로드한다.
+
+    정규화 통계(statistics.json)와 modality_configs 는 processor 에만 있고 모델 가중치와
+    무관하다. state/action 정규화만 필요할 때 1.25B 를 올리지 않는 경로다.
+    """
+    import rldx  # noqa: F401  — AutoProcessor 레지스트리가 import 부수효과로 채워진다
+    from transformers import AutoProcessor
+
+    rldx_layout(Path(rldx_root), rldx_config)          # embodiment 태그 등록
+    p = Path(model_path)
+    pdir = p / "processor" if (p / "processor").is_dir() else p
+    return AutoProcessor.from_pretrained(pdir).state_action_processor
+
+
+def normalize_states(proc, tag: str, mod: Modality, raw_state: np.ndarray) -> np.ndarray:
+    """(..., S) 원본 상태 → 모델 공간. apply_state = q01/q99 minmax + clip (또는 sincos).
+
+    critic 의 state 입력을 여기 통과시킨다. raw 라디안을 그대로 넣으면 그룹별 스케일이
+    5배까지 벌어지는데 (fuji: torso std 0.13 vs right_hand 0.49) critic 의 LayerNorm 은
+    Linear **이후** latent 에 걸려서 입력 차원별 스케일을 보정하지 못한다. 안 움직이는
+    관절(openarm 은 28차원 중 15차원)도 raw 로는 0 이 아닌 상수로 들어간다 — 정규화하면
+    lo == hi 라서 정확히 0 이 된다.
+
+    **학습과 롤아웃 질의가 같은 함수를 타야 한다** (rl/offline_critic_0.py, learner/loop.py,
+    ExpoServer._critic_obs). 한쪽만 바꾸면 에러 없이 조용히 어긋난다.
+    sincos 그룹이 선언된 config 면 반환 차원이 늘어난다 (지금 쓰는 세 config 는 없다).
+    """
+    off = mod.offsets("state")
+    x = np.asarray(raw_state, np.float32)
+    out = proc.apply_state({n: x[..., s:e] for n, s, e in off}, tag)
+    return np.concatenate([out[n] for n, _, _ in off], axis=-1).astype(np.float32)
+
+
 class RLDXVLA(VLA):
     def __init__(self, model_path: Path | str, mod: Modality, rldx_root: Path | str,
                  rldx_config: str, device: str = "cuda", rtc_inference_mode: str = "none",
@@ -272,7 +307,7 @@ class ExpoServer:
         self.vla = RLDXVLA(model_path, mod, rldx_root, cfg_rel, device=device,
                            rtc_inference_mode=rtc_mode, rtc_inference_delay=self.latency)
         spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
-                            mod.action_dim, self.replan)
+                            mod.action_dim, self.replan, self.latency)
         self.cfg = ExpoConfig.from_dict(exp.get("expo"))
         self.learner = EXPOLearner(self.vla, spec, mod.state_dim, mod.n_cams, self.replan,
                                    self.cfg, device=device, seed=seed, latency=self.latency)
@@ -379,7 +414,8 @@ class ExpoServer:
             f = x.permute(0, 3, 1, 2).float()
             f = F.interpolate(f, size=(h, w), mode="bilinear", align_corners=False)
             x = f.round_().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
-        st = torch.from_numpy(_cat_state(obs, self.mod)).to(dev)
+        st = torch.from_numpy(normalize_states(self.vla.proc, self.vla.tag, self.mod,
+                                              _cat_state(obs, self.mod))).to(dev)
         return x, st
 
     def _run_inference(self, request, collated, B, reset_memory):
@@ -403,7 +439,10 @@ class ExpoServer:
             j = int(best[0])
             src = j if j < n else j - n            # edit 후보는 base 후보 (j-n) 에서 나왔다
             out = a[src:src + 1].clone()                          # (1, H, max_action_dim)
-            out[0, self.latency:self.latency + self.replan, :A] = chosen[0].view(self.replan, A)
+            # chosen 은 청크 [0, latency+replan) 이다. prefix 는 편집되지 않았으므로
+            # (explore_spec 이 마스킹) 실행 구간만 잘라 꽂는다.
+            out[0, self.latency:self.latency + self.replan, :A] = \
+                chosen[0, self.latency * A:].view(self.replan, A)
 
         pred = dict(pred)
         pred["action_pred"] = out
