@@ -13,7 +13,7 @@ base_policy 가 이 아래 상대경로), 산출물도 여기 <exp>-critic/ 에 
 usage:
   source configs/kakao_path.sh
   PYTHONPATH="$L_PYTHONPATH" $L_PY -u -m rl.offline_critic_0 --exp openarm_rim --data $L_DS/0815_openarm_rh56f1_inference --checkpoints $L_CKPT
-  PYTHONPATH="$L_PYTHONPATH" $L_PY -u -m rl.offline_critic_0 --exp fuji --data $L_DS/fuji-rl-dataset --checkpoints $L_CKPT/temp --holdout 0.2
+  PYTHONPATH="$L_PYTHONPATH" $L_PY -u -m rl.offline_critic_0 --exp fuji --data $L_DS/fuji-rl-dataset --checkpoints $L_CKPT --holdout 0.2
 
 **-u 를 붙일 것.** 리다이렉트하면 stdout 이 블록 버퍼링되어 돌고 있는데도 얼어붙어 보인다.
 """
@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
+import os
+import time
 from pathlib import Path
 
 import cv2
@@ -51,6 +54,9 @@ p.add_argument("--steps", type=int, default=20000)
 p.add_argument("--checkpoints", type=Path, required=True)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--eval-every", type=int, default=1000)
+p.add_argument("--images", default="gpu", choices=("gpu", "mmap"),
+               help="gpu: images.mm 을 통째로 VRAM 에 올린다. NFS 랜덤읽기가 스텝의 96%% 였다 "
+                    "(배치당 0.7~1.9s vs GPU 계산 81ms). 여유 없으면 mmap 으로 떨어진다")
 p.add_argument("--holdout", default="eval",
                help="세션 이름에 이 문자열이 있으면 평가 전용. 숫자(예: 0.2)를 주면 그 비율의 "
                     "에피소드를 균등 간격으로 뺀다 (이름에 eval 이 없는 데이터용)")
@@ -76,7 +82,22 @@ print(f"[exp] {a.exp} replan={R} latency={LAT} horizon={H}\n[modality] {src}")
 sessions = find_sessions(a.data)
 flat = build_flat(sessions, mod)
 build_images(sessions, flat, work / "images.mm", mod)
-imgs, _ = open_images(work / "images.mm")  # (N, n_cam, 192, 320, 3) e.g. (64619, 2, 192, 320, 3)
+imgs, meta = open_images(work / "images.mm")  # (N, n_cam, 192, 320, 3) e.g. (64619, 2, 192, 320, 3)
+# 이미지를 VRAM 에 상주시킨다 (openarm 23.8GB / fuji 30.7GB). 순차 업로드 364~469 MB/s.
+GI = None
+if a.images == "gpu":
+    need = int(np.prod(meta["shape"]))
+    freeb = torch.cuda.mem_get_info()[0]
+    if freeb < need * 1.15:
+        print(f"[이미지] VRAM 부족 (여유 {freeb/1e9:.1f}GB < 필요 {need*1.15/1e9:.1f}GB) → mmap")
+    else:
+        t0 = time.time()
+        GI = torch.empty(tuple(meta["shape"]), dtype=torch.uint8, device=dev)
+        for c in range(0, meta["shape"][0], 2048):
+            GI[c:c + 2048] = torch.from_numpy(np.array(imgs[c:c + 2048])).to(dev)
+        print(f"[이미지] VRAM 상주 {need/1e9:.1f}GB  {time.time()-t0:.0f}s  "
+              f"(남은 여유 {torch.cuda.mem_get_info()[0]/1e9:.1f}GB)")
+FPS = json.loads((sessions[0] / "meta/info.json").read_text())["fps"]   # openarm 20 / fuji 30
 
 # critic 의 액션/상태는 롤아웃 때와 같은 모델 공간이어야 한다 (rl/vla_rldx.normalize_states).
 # 상태는 processor 만으로 되고(가중치 불필요) 벡터 연산 한 번이라 캐시하지 않는다.
@@ -111,14 +132,22 @@ if not n_ok or n_ok == len(eps):                     # 500스텝 뒤에 죽지 �
     raise SystemExit("평가셋에 성공/실패가 한쪽뿐이라 AUC 를 못 낸다 — --holdout 을 바꿀 것 "
                      "(세션 이름 문자열, 또는 0.2 처럼 비율)")
 
+# 액션/상태도 GPU 상주 (fuji 83MB / 7.5MB). 스텝 안에서 CPU 가 하는 일은 nstep 뿐이 된다.
+NORM = torch.from_numpy(np.ascontiguousarray(np.asarray(norm[:, :LAT + R]))).to(dev)
+SNORM = torch.from_numpy(snorm).to(dev)
+
 def obs(i):                                          # (B, H, W, 3*n_cams) — 카메라를 채널로
-    x = np.asarray(imgs[i])                          # memmap fancy-index 는 한 번만
-    return torch.from_numpy(np.concatenate([x[:, c] for c in range(x.shape[1])], -1)).to(dev)
+    """concat 을 **GPU 에서** 한다 — CPU concat 은 142MB 복사에 340ms 였다."""
+    if GI is not None:
+        x = GI[torch.as_tensor(i, device=dev)]
+    else:
+        x = torch.from_numpy(np.ascontiguousarray(np.asarray(imgs[i]))).to(dev)
+    return torch.cat([x[:, c] for c in range(x.shape[1])], -1)
 
 # critic 이 보는 액션 = 청크 [0, LAT+R) — prefix(이미 커밋된 LAT 스텝) + 새로 커밋하는
 # R 스텝. 결정 이후 실제로 실행되는 전부이고, 보상 창 [t, t+R) 을 일으킨 액션이 다 들어온다.
-act = lambda i: torch.from_numpy(norm[i][:, :LAT + R].reshape(len(i), -1)).to(dev)
-st = lambda i: torch.from_numpy(snorm[i]).to(dev)
+act = lambda i: NORM[torch.as_tensor(i, device=dev)].reshape(len(i), -1)
+st = lambda i: SNORM[torch.as_tensor(i, device=dev)]
 
 # --- 2. 학습 (behavior policy 의 Q^pi 를 TD 로) ------------------------------
 enc = BatchEncoder(3 * mod.n_cams, cfg.latent_dim_image, cfg.encoder_stage_sizes,
@@ -142,7 +171,7 @@ def q_at(idx, bs=256):                               # 앙상블 10개의 min (a
                            .min(0).values.float().cpu().numpy()
                            for j in np.array_split(idx, max(1, len(idx) // bs))])
 
-def video(path, fr, q, title, fps=20, ph=170, hd=24):
+def video(path, fr, q, title, fps=None, ph=170, hd=24):
     """카메라 프레임 + Q 곡선. 시간축은 프레임 그대로 (정규화 없음).
 
     축·격자·기준선은 matplotlib 로 **에피소드당 한 번** 렌더하고, 프레임마다 지나온
@@ -154,6 +183,7 @@ def video(path, fr, q, title, fps=20, ph=170, hd=24):
     """
     x0 = np.asarray(imgs[fr[0]])                     # (n_cams, H, W, 3)
     Hc, W = x0.shape[1], x0.shape[2] * x0.shape[0]
+    fps = fps or FPS
     fig = plt.figure(figsize=(W / 100, ph / 100), dpi=100)
     ax = fig.add_axes([0.055, 0.21, 0.935, 0.75])
     ax.plot(q, color="0.8", lw=1.2)                                    # 전체 곡선 (미리보기)
@@ -182,6 +212,21 @@ def video(path, fr, q, title, fps=20, ph=170, hd=24):
         vw.append_data(np.concatenate([head, cams, pan], axis=0))
     vw.close()
 
+def save(step):
+    """항상 같은 파일에 덮어쓴다 (최신 하나만 남긴다).
+
+    tmp 로 쓰고 os.replace 로 바꿔치기한다 — 덮어쓰다 죽으면 잘린 파일이 남고, 그걸
+    ExpoServer._load 가 물면 torch 내부 에러("failed finding central directory")로만
+    드러나서 학습이 깨진 것으로 오해하게 된다.
+    """
+    tmp = work / "critic.pt.tmp"
+    torch.save({"enc": enc.state_dict(), "critic": critic.state_dict(),
+                "target": target.state_dict(), "step": step, "exp": a.exp, "seed": a.seed,
+                "latency": LAT, "replan": R, "action_dim": mod.action_dim,
+                "state_dim": snorm.shape[1]}, tmp)
+    os.replace(tmp, work / "critic.pt")
+    print(f"  [저장] {work / 'critic.pt'} (step {step}, "
+          f"{(work / 'critic.pt').stat().st_size / 1e6:.0f}MB)")
 
 def evaluate(step):
     q = {e: q_at(fr) for e, fr, _ in eps}
@@ -196,7 +241,9 @@ def evaluate(step):
         ax.plot(np.arange(len(fr)), q[e], lw=1, alpha=0.5,
                 color="tab:green" if o else "tab:red")
     ax.axhline(0, color="gray", lw=0.5); ax.axhline(1, color="gray", lw=0.5)
-    ax.set_xlabel("frame in episode (정규화 없음)"); ax.set_ylabel("Q (min of ensemble)")
+    # matplotlib 에 넘기는 문자열은 ASCII 만 — 기본 폰트에 한글 글리프가 없다
+    ax.set_xlabel("frame in episode (raw, no time normalization)")
+    ax.set_ylabel("Q (min of ensemble)")
     ax.set_title(f"step {step}  AUC {auc:.3f}   green=success  red=failure")
     fig.tight_layout(); fig.savefig(ev / f"{step:06d}_q.png", dpi=110); plt.close(fig)
     for e, fr, o in vids:
@@ -224,9 +271,10 @@ for step in range(1, a.steps + 1):
         print(f"  step {step:5d}  loss {float(loss):.5f}  q {float(q.mean()):+.4f}")
     if step % a.eval_every == 0 or step == a.steps:
         evaluate(step)
+        save(step)                                   # 평가와 같은 주기로 최신 하나만
 
 # --- 3. 저장 -----------------------------------------------------------------
-torch.save({"enc": enc.state_dict(), "critic": critic.state_dict(),
-            "target": target.state_dict(), "step": a.steps, "exp": a.exp, "seed": a.seed},
-           work / "critic.pt")
-print(f"[저장] {work / 'critic.pt'}")
+# 루프 안에서 eval_every 마다 (그리고 마지막 스텝에) 이미 저장했다. 옵티마이저 상태는
+# 넣지 않는다 — 이 파일의 용도는 ExpoServer 에 enc/critic/target 을 넘기는 것이고,
+# Adam 모멘트까지 넣으면 파일이 3배가 된다 (이어서 학습하려면 그때 추가).
+print(f"[완료] {a.steps} 스텝 / 산출물 {work}")

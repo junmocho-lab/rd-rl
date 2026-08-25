@@ -113,7 +113,7 @@ expo:
   num_qs: 10
   num_min_qs: 2
   critic_layer_norm: true
-  discount: 0.99          # 실효 0.99^8 = 0.9227 → 유효 지평 12.9 매크로 스텝
+  discount: 0.999          # 실효 0.99^8 = 0.9227 → 유효 지평 12.9 매크로 스텝
   tau: 0.005
   actor_lr: 3.0e-4        # ★ residual(edit) actor 의 lr
   critic_lr: 3.0e-4
@@ -126,7 +126,7 @@ expo:
   encoder_num_filters: 64
   init_temperature: 1.0
   entropy_scale: 1.0
-  batch_size: 128
+  batch_size: 256
   utd_ratio: 20
   freeze_critic_encoder: false
   actor_success_only: true
