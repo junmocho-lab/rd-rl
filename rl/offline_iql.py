@@ -49,6 +49,8 @@ usage:
   --exp fuji --data rl-dataset/fuji-rl-dataset --checkpoints checkpoints \
   --discount 0.999 --bins 128 --expectile 0.7 \
   --steps 40000 --holdout 0.2 --eval-every 2500
+
+  PYTHONPATH="$PWD/third_party/RLDX-1:$PWD" NO_ALBUMENTATIONS_UPDATE=1 third_party/RLDX-1/.venv/bin/python -u -m rl.offline_iql   --exp fuji --data rl-dataset/fuji-rl-dataset --checkpoints ./checkpoints/rldx-img-curated/rldx_img_curated-0810-0818-r03/   --features cogfeat.npy   --discount 0.999 --bins 128 --expectile 0.7 --steps 100000 --holdout 0.2 --eval-every 5000
 """
 
 from __future__ import annotations
@@ -105,6 +107,10 @@ p.add_argument("--num-qs", type=int, default=0,
 p.add_argument("--v-min", default="all", choices=("all", "sub"),
                help="V 타깃의 Q 앙상블 축약. all = 전체 min (PA-RL: iql.py 의 jnp.min(q,axis=0)), "
                     "sub = 무작위 num_min_qs 개 min (REDQ 식)")
+p.add_argument("--features", default="",
+               help="cogfeat.npy 파일명. 주면 비전 인코더(34.1M) 대신 **frozen RLDX-1 cog token "
+                    "mean-pool feature** 를 쓴다: 표준화 → Linear(4096→512) → LayerNorm. "
+                    "학습 파라미터 38.5M → 6.5M. rl/extract_cogfeat.py 로 만든다")
 p.add_argument("--images", default="gpu", choices=("gpu", "mmap"),
                help="gpu: images.mm 을 통째로 VRAM 에 올린다 (fuji 30.7GB). NFS 랜덤읽기가 "
                     "스텝 시간의 96%% 라 이게 가장 큰 개선. 여유가 없으면 mmap 으로 떨어진다")
@@ -148,7 +154,8 @@ GEFF = cfg.discount ** R
 base = a.checkpoints / exp["base_policy"]
 work = a.checkpoints / f"{a.exp}-critic"             # images.mm / actnorm.npy 는 공유
 # 산출물만 태그로 분리한다 — 스칼라 판과 distributional 판을 같이 비교하려면 필수
-TAG = a.tag or (f"iql-{'dist' + str(a.bins) if a.bins else 'scalar'}"
+TAG = a.tag or (f"iql-{'cog' if a.features else 'px'}"
+                f"-{'dist' + str(a.bins) if a.bins else 'scalar'}"
                 f"-t{str(a.expectile).replace('.', '')}"
                 f"-g{f'{cfg.discount:g}'.replace('.', '')}"
                 f"-q{cfg.num_qs}{a.v_min}-s{a.seed}")
@@ -166,8 +173,18 @@ build_images(sessions, flat, work / "images.mm", mod)
 imgs, meta = open_images(work / "images.mm")
 # 이미지를 VRAM 에 상주시킨다. 실측: NFS 랜덤 읽기가 배치당 0.7~1.9s (96 MB/s) 인데 스텝의
 # GPU 계산은 81ms 뿐이라 가동률이 4% 였다. 순차 업로드는 364~469 MB/s 로 30.7GB 가 1.4분.
+FEAT = None
+if a.features:
+    fp = np.load(work / a.features, mmap_mode="r")
+    assert fp.shape[0] == len(flat), f"feature 프레임 수 {fp.shape[0]} != {len(flat)}"
+    FEAT = torch.from_numpy(np.ascontiguousarray(np.asarray(fp))).to(dev)      # (T, 4096) 910MB
+    MU, SD = FEAT.mean(0, keepdim=True), FEAT.std(0, keepdim=True).clamp_min(1e-3)
+    FEAT = (FEAT - MU) / SD                                # 표준화해서 저장 (차원별 std 비율 1e6)
+    print(f"[feature] {a.features} {tuple(fp.shape)} → VRAM {FEAT.numel()*4/1e9:.2f}GB, "
+          f"표준화 완료 (인코더 미사용)")
+
 GI = None
-if a.images == "gpu":
+if a.images == "gpu" and not a.features:                   # feature 를 쓰면 이미지는 비디오용만
     need = int(np.prod(meta["shape"]))
     freeb = torch.cuda.mem_get_info()[0]
     if freeb < need * 1.15:
@@ -242,6 +259,10 @@ else:
 # 액션/상태도 GPU 상주 (각각 83MB / 7.5MB). 남는 CPU 작업은 nstep 뿐이다.
 NORM = torch.from_numpy(np.ascontiguousarray(np.asarray(norm[:, :LAT + R]))).to(dev)
 SNORM = torch.from_numpy(snorm).to(dev)
+
+def enc_in(i):
+    """critic 입력 latent. feature 판은 [proj(feat) | raw state], 픽셀 판은 obs 그대로."""
+    return FEAT[torch.as_tensor(i, device=dev)] if a.features else obs(i)
 
 def obs(i):
     """(B, H, W, 3*n_cams) uint8. **카메라 concat 을 GPU 에서** 한다 — CPU concat 은 340ms 였다."""
@@ -332,10 +353,28 @@ def write_videos(step, qc, vc):
 
 
 # --- 2. 학습 (IQL) -----------------------------------------------------------
-enc = BatchEncoder(3 * mod.n_cams, cfg.latent_dim_image, cfg.encoder_stage_sizes,
-                   cfg.encoder_num_filters).to(dev)
-critic = CriticEnsemble(cfg.latent_dim_image, snorm.shape[1], (LAT + R) * mod.action_dim,
-                        cfg.num_qs, cfg.latent_dim_state, cfg.include_state, cfg.hidden_dims,
+if a.features:
+    # frozen feature 판: 인코더 대신 projection 만 학습한다. tanh 는 쓰지 않는다 —
+    # 함께 학습되는 픽셀 인코더의 드리프트를 막으려던 장치라 frozen 에서는 근거가 없다.
+    # state/액션은 이미 q01/q99 정규화 + clip 이라 raw 로 넣고, 이미지 분기만 정규화한다
+    # (cog feature 는 차원별 std 비율이 1e6, 최대값 129 라 정규화가 필수).
+    class Proj(nn.Module):
+        def __init__(self, din, dout):
+            super().__init__()
+            self.lin = xavier_(nn.Linear(din, dout))
+            self.ln = nn.LayerNorm(dout)
+        def forward(self, x, stop_gradient=False):
+            z = self.ln(self.lin(x))
+            return z.detach() if stop_gradient else z
+    enc = Proj(FEAT.shape[1], cfg.latent_dim_image).to(dev)
+    LATENT = cfg.latent_dim_image + snorm.shape[1]          # state 를 raw 로 붙인다
+    INCL_STATE = False                                     # CriticEnsemble 안의 state 분기 미사용
+else:
+    enc = BatchEncoder(3 * mod.n_cams, cfg.latent_dim_image, cfg.encoder_stage_sizes,
+                       cfg.encoder_num_filters).to(dev)
+    LATENT, INCL_STATE = cfg.latent_dim_image, cfg.include_state
+critic = CriticEnsemble(LATENT, snorm.shape[1], (LAT + R) * mod.action_dim,
+                        cfg.num_qs, cfg.latent_dim_state, INCL_STATE, cfg.hidden_dims,
                         cfg.critic_layer_norm).to(dev)
 # --- distributional critic (HL-Gauss) 옵션 ---------------------------------
 # 스칼라 회귀를 분류로 바꾼다: support [lo,hi] 를 bins 개로 자르고 bin logits 를 내게 한 뒤,
@@ -370,8 +409,8 @@ target = copy.deepcopy(critic).requires_grad_(False)
 # (iql.py:173, grad_params=self.state.target_params). V 회귀 타깃이 그만큼 안정된다.
 tenc = copy.deepcopy(enc).requires_grad_(False)
 # V = **액션 입력 폭이 0인 critic** (앙상블 1). 구조/초기화를 Q 와 똑같이 두려고 재사용한다.
-value = CriticEnsemble(cfg.latent_dim_image, snorm.shape[1], 0, 1, cfg.latent_dim_state,
-                       cfg.include_state, cfg.hidden_dims, cfg.critic_layer_norm).to(dev)
+value = CriticEnsemble(LATENT, snorm.shape[1], 0, 1, cfg.latent_dim_state,
+                       INCL_STATE, cfg.hidden_dims, cfg.critic_layer_norm).to(dev)
 # PA-RL 의 kernel_scale_final=1e-2 (+ orthogonal scale 1e-2) 에 대응 — 마지막 층을 작게 두어
 # 출력이 0 근처에서 시작하게 한다. 없으면 V 가 4.07 에서 시작해 Q 타깃(r + γ^R·V)이 support
 # 밖으로 나가 한동안 1.0 으로 클램프된다 (스모크 실측).
@@ -388,16 +427,24 @@ for step in range(1, a.steps + 1):
     i = train[rng.integers(0, len(train), cfg.batch_size)]
     n = nstep(flat, i, R, cfg.discount)
     j = n["next_idx"]
-    lat = enc(obs(i), stop_gradient=cfg.freeze_critic_encoder)
+    lat = enc(enc_in(i), stop_gradient=cfg.freeze_critic_encoder)
+    if a.features:
+        lat = torch.cat([lat, st(i)], -1)          # state 는 raw 로 붙인다
     with torch.no_grad():
         # Q 타깃: V(s') — 정책 액션이 필요 없다 (여기가 SARSA 와의 차이)
-        nv = value(enc(obs(j), stop_gradient=True), st(j), none_act)[0]
+        lat_n = enc(enc_in(j), stop_gradient=True)
+        if a.features:
+            lat_n = torch.cat([lat_n, st(j)], -1)
+        nv = value(lat_n, st(j), none_act)[0]
         tq = (torch.from_numpy(n["reward"]).to(dev)
               + (cfg.discount ** R) * torch.from_numpy(n["mask"]).to(dev) * nv)
         # V 타깃: target critic 의 Q(s, a_data). 인코더도 **target 사본**(tenc) 을 쓴다 —
         # PA-RL 의 forward_target_critic 이 params 전체를 target_params 로 바꿔 부른다.
         mem = None if a.v_min == "all" else critic.subsample(cfg.num_min_qs, gen)
-        qt = q_of(target(tenc(obs(i), stop_gradient=True), st(i), act(i),
+        lat_t = tenc(enc_in(i), stop_gradient=True)
+        if a.features:
+            lat_t = torch.cat([lat_t, st(i)], -1)
+        qt = q_of(target(lat_t, st(i), act(i),
                          members=mem)).min(dim=0).values
     valid = torch.from_numpy(n["valid"]).to(dev)
     ql = critic(lat, st(i), act(i))                   # bins 면 logits, 아니면 스칼라
@@ -428,7 +475,9 @@ for step in range(1, a.steps + 1):
                 """Q 와 V 를 같은 인코딩에서 한 번에 뽑는다 (비디오가 둘 다 쓴다)."""
                 qq, vv = [], []
                 for k in np.array_split(idx, max(1, len(idx) // bs)):
-                    h = enc(obs(k), stop_gradient=True)
+                    h = enc(enc_in(k), stop_gradient=True)
+                    if a.features:
+                        h = torch.cat([h, st(k)], -1)
                     qq.append(q_of(critic(h, st(k), act(k))).min(0).values.float().cpu().numpy())
                     vv.append(value(h, st(k), torch.zeros(len(k), 0, device=dev))[0]
                               .float().cpu().numpy())

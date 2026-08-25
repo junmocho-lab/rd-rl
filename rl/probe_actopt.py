@@ -27,8 +27,11 @@ usage:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
+import cv2
+import imageio
 import matplotlib
 import numpy as np
 import torch
@@ -56,10 +59,17 @@ p.add_argument("--critic", required=True,
 p.add_argument("--model-path", default="", help="processor 를 읽을 체크포인트 (기본: exp yaml)")
 p.add_argument("--groups", default="", help="편집할 action 그룹 (기본: exp yaml 의 explore_groups)")
 p.add_argument("--num-steps", type=int, default=10)
-p.add_argument("--step-size", type=float, default=3e-4, help="PA-RL 기본값. 이동거리를 보고 조절")
+p.add_argument("--step-size", type=float, default=3e-4, help="PA-RL 기본값 3e-4")
+p.add_argument("--auto-step", type=float, default=0.0,
+               help="차원당 목표 이동거리 D. 주면 표본에서 ‖g‖ 를 재서 "
+                    "step_size = D/(num_steps·median‖g‖) 로 잡는다. PA-RL 의 3e-4 는 우리 "
+                    "Q·액션 스케일에서 이동이 1e-9 라 사실상 아무 일도 안 한다")
 p.add_argument("--holdout", default="0.2")
 p.add_argument("--stride", type=int, default=4, help="에피소드에서 몇 프레임마다 볼지")
 p.add_argument("--anno", type=Path, help="probe_pairs 의 anno.csv — 실패 시점을 그림에 표시")
+p.add_argument("--video-eps", type=int, default=6,
+               help="비디오로 만들 에피소드 수 (성공/실패 절반씩). 0 이면 안 만든다")
+p.add_argument("--video-stride", type=int, default=2, help="비디오 프레임 간격")
 p.add_argument("--device", default="cuda")
 a = p.parse_args()
 dev = a.device
@@ -103,7 +113,13 @@ if BINS:
     q_of = lambda x: (x.softmax(-1) * centers).sum(-1)
 else:
     q_of = lambda x: x
+value = CriticEnsemble(cfg.latent_dim_image, snorm.shape[1], 0, 1, cfg.latent_dim_state,
+                       cfg.include_state, cfg.hidden_dims, cfg.critic_layer_norm).to(dev).eval()
 enc.load_state_dict(sd["enc"]); critic.load_state_dict(sd["critic"])
+if "value" in sd:
+    value.load_state_dict(sd["value"])
+else:
+    value = None
 print(f"[critic] {ck}\n          step {sd.get('step')}  γ={sd.get('discount')}  "
       f"τ={sd.get('expectile')}  bins={BINS}  num_qs={sd.get('num_qs')}")
 
@@ -132,7 +148,8 @@ def obs_of(idx):
         np.concatenate([x[:, c] for c in range(x.shape[1])], -1))).to(dev)
 
 def ascend(idx, bs=48):
-    """로그된 액션에서 ∇_a Q 상승. 반환: q0_min, q1_min, dq_mean, d_rms, g_rms"""
+    """로그된 액션에서 ∇_a Q 상승.
+    반환 열: 0 q_log(min) 1 q_opt(min) 2 dq_mean 3 d_rms 4 g_rms 5 V(s) 6 d_l2"""
     out = []
     for c in range(0, len(idx), bs):
         k = idx[c:c + bs]
@@ -154,13 +171,36 @@ def ascend(idx, bs=48):
             q1 = q_of(critic(lat, st, act.detach()))
             d = (act.detach() - a0)[:, spec.index]
             gg = (g_last * MASK)[:, spec.index]
+            v = (value(lat, st, torch.zeros(len(k), 0, device=dev))[0].float().cpu().numpy()
+                 if value is not None else np.zeros(len(k), np.float32))
             out.append(np.stack([
                 q0.min(0).values.float().cpu().numpy(),
                 q1.min(0).values.float().cpu().numpy(),
                 (q1.mean(0) - q0.mean(0)).float().cpu().numpy(),
                 (d.norm(dim=-1) / NIDX ** 0.5).float().cpu().numpy(),
-                (gg.norm(dim=-1) / NIDX ** 0.5).float().cpu().numpy()], 1))
+                (gg.norm(dim=-1) / NIDX ** 0.5).float().cpu().numpy(),
+                v,
+                d.norm(dim=-1).float().cpu().numpy()], 1))
     return np.concatenate(out)
+
+# --- step_size 캘리브레이션 -------------------------------------------------
+if a.auto_step:
+    probe_idx = np.concatenate([fr[::max(1, len(fr) // 24)] for _, fr, _ in eps])[:256]
+    gs = []
+    for c in range(0, len(probe_idx), 48):
+        k = probe_idx[c:c + 48]
+        with torch.no_grad():
+            lat = enc(obs_of(k), stop_gradient=True)
+            st = torch.from_numpy(snorm[k]).to(dev)
+        act0 = torch.from_numpy(np.ascontiguousarray(
+            np.asarray(norm[k])[:, :LAT + R].reshape(len(k), -1))).to(dev).requires_grad_(True)
+        qm = q_of(critic(lat, st, act0)).mean(0).sum()
+        g, = torch.autograd.grad(qm, act0)
+        gs.append(((g * MASK)[:, spec.index].norm(dim=-1) / NIDX ** 0.5).cpu().numpy())
+    gmed = float(np.median(np.concatenate(gs)))
+    a.step_size = a.auto_step / (a.num_steps * max(gmed, 1e-12))
+    print(f"[캘리브레이션] ‖g‖/차원 중앙값 {gmed:.6f} → 목표 이동 {a.auto_step} 이면 "
+          f"step_size {a.step_size:.4g} (PA-RL 3e-4 의 {a.step_size/3e-4:.0f}배)")
 
 anno = {}
 if a.anno and a.anno.is_file():
@@ -219,3 +259,62 @@ fig.tight_layout()
 out = ev / f"actopt_s{a.step_size:g}_n{a.num_steps}.png"
 fig.savefig(out, dpi=110); plt.close(fig)
 print(f"\n[그림] {out}")
+
+
+# --- 에피소드별 비디오: 카메라 + (V, Q_log, Q_opt) + 액션 이동거리 ------------
+FPS = json.loads((sessions[0] / "meta/info.json").read_text())["fps"]
+
+def make_video(path, fr, m, title, ph=150, hd=22):
+    """matplotlib 로 축을 한 번 렌더하고, 프레임마다 커서만 덧그린다 (offline_critic_0 와 같은 방식).
+    코덱은 libx264 — cv2 번들 ffmpeg 에는 H.264 인코더가 없다."""
+    x0 = np.asarray(imgs[fr[0]])
+    Hc, W = x0.shape[1], x0.shape[2] * x0.shape[0]
+    xs = np.arange(len(fr))
+    panels = []
+    for ylabel, series, ylim in (
+            ("value", [("V(s)", m[:, 5], "0.5"), ("Q(a_log)", m[:, 0], "tab:blue"),
+                       ("Q(a_opt)", m[:, 1], "tab:orange")], (-0.05, 1.05)),
+            (f"|a_opt-a_log| L2 ({NIDX}d)", [("dist", m[:, 6], "tab:purple")], None)):
+        fig = plt.figure(figsize=(W / 100, ph / 100), dpi=100)
+        ax = fig.add_axes([0.075, 0.20, 0.915, 0.76])
+        for lab, y, c in series:
+            ax.plot(xs, y, color=c, lw=1.2, label=lab)
+        ax.set_xlim(0, max(1, len(fr) - 1))
+        if ylim:
+            ax.set_ylim(*ylim); ax.axhline(0, color="0.8", lw=0.6); ax.axhline(1, color="0.8", lw=0.6)
+        ax.set_ylabel(ylabel, fontsize=7); ax.tick_params(labelsize=7); ax.grid(alpha=0.25)
+        ax.legend(fontsize=6, loc="upper left", ncol=len(series), framealpha=0.6)
+        fig.canvas.draw()
+        base = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+        # 커서용 x 픽셀 좌표
+        px = ax.transData.transform(np.c_[xs, np.zeros_like(xs)])[:, 0].astype(np.int32)
+        plt.close(fig)
+        panels.append((base, px))
+
+    vw = imageio.get_writer(str(path), fps=max(1, int(FPS / a.video_stride)), codec="libx264",
+                            quality=8, macro_block_size=1, pixelformat="yuv420p")
+    for t in range(len(fr)):
+        cams = np.concatenate(list(np.asarray(imgs[fr[t]])), axis=1)
+        head = np.full((hd, W, 3), 255, np.uint8)
+        cv2.putText(head, f"{title}  t={t*a.video_stride}  V={m[t,5]:+.3f}  "
+                          f"Q_log={m[t,0]:+.3f}  Q_opt={m[t,1]:+.3f}  d={m[t,6]:.3f}",
+                    (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1)
+        rows = [head, cams]
+        for base, px in panels:
+            pan = base.copy()
+            cv2.line(pan, (int(px[t]), 0), (int(px[t]), ph - 1), (220, 0, 0), 1)
+            rows.append(pan)
+        vw.append_data(np.concatenate(rows, axis=0))
+    vw.close()
+
+if a.video_eps:
+    sel = ([x for x in eps if x[2]][:max(1, a.video_eps // 2)]
+           + [x for x in eps if not x[2]][:max(1, a.video_eps // 2)])
+    print(f"\n[비디오] {len(sel)} 에피소드, stride {a.video_stride}")
+    for e, fr, ok in sel:
+        ii = fr[::a.video_stride]
+        m = ascend(ii)
+        tag = f"ep{e:04d}_{'succ' if ok else 'fail'}"
+        out = ev / f"actopt_{tag}.mp4"
+        make_video(out, ii, m, tag)
+        print(f"  {out.name}  {len(ii)} 프레임  {out.stat().st_size/1e6:.1f} MB")
