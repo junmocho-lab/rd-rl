@@ -47,6 +47,12 @@ spec:
           env:
             - name: MODEL_OUTPUT_DIR
               value: /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/dexjoco-fold-glasses-bc-ptimg
+            - name: HF_TOKEN
+              value: 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
+            - name: HUGGINGFACE_HUB_TOKEN
+              value: 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
+            - name: HF_HOME
+              value: /data/junmo_cho/hf_cache
             - name: WANDB_API_KEY
               value: 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
           command: ["/bin/bash", "-c"]

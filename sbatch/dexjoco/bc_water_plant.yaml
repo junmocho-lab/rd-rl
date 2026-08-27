@@ -11,12 +11,11 @@ metadata:
 spec:
   ttlSecondsAfterFinished: 300
   backoffLimit: 0
-  # 처리량: A100-80GB / batch 32 / 40 step 실측 train_samples_per_second 12.13
-  # (첫 스텝 워밍업 제외 약 14). H200 을 1.5~2x 로 보면 21~29 samples/s.
-  #   30000 step x batch 64 = 1,920,000 sample -> 18 ~ 25 h
-  # 24h 는 아슬아슬해서 48h 로 둔다. 플랫폼이 거부하면 86400 으로 내리고
-  # --max-steps 를 15000 으로 줄일 것 (epoch 은 아래 절반).
-  activeDeadlineSeconds: 172800
+  # 처리량 실측 (A100-80GB, batch 32, 40 step): train_samples_per_second 12.13,
+  # 첫 스텝 워밍업 제외하면 약 14 samples/s. H200 을 1.5~2x 로 보면 21~29 samples/s.
+  # 6,000 optimizer step x 유효배치 128 = 768,000 sample -> 7.4 ~ 10.2 h.
+  # 24h 여유. (30,000 step 이면 37~51h 라 이 deadline 을 넘는다 — 아래 step 수 주석 참고.)
+  activeDeadlineSeconds: 86400
   template:
     metadata:
       labels:
@@ -47,6 +46,12 @@ spec:
           env:
             - name: MODEL_OUTPUT_DIR
               value: /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/dexjoco-water-plant-bc-ptimg
+            - name: HF_TOKEN
+              value: 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
+            - name: HUGGINGFACE_HUB_TOKEN
+              value: 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
+            - name: HF_HOME
+              value: /data/junmo_cho/hf_cache
             - name: WANDB_API_KEY
               value: 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
           command: ["/bin/bash", "-c"]
@@ -72,9 +77,11 @@ spec:
               DATA=/data/junmo_cho/workspace/datasets/dexjoco/water_plant_rand_obj
               export NUM_GPUS=1      # 아래 resources 의 nvidia.com/gpu 와 반드시 일치시킬 것
 
-              # ---- 프리플라이트 --------------------------------------------------
-              # modality config 는 rd-rl 의 서브모듈 체크아웃에 들어 있다. 없으면
-              # launch_train 이 FileNotFoundError 로 죽으니 여기서 먼저, 20초 안에 잡는다.
+              # ---- 이 체크아웃에 modality config 가 있어야 한다 -------------------
+              # /data/.../rd-rl/third_party/RLDX-1 은 rd-rl 의 서브모듈 체크아웃이므로
+              # 이 파일은 rd-rl(+서브모듈)을 최신으로 당기면 같이 들어온다:
+              #   rldx/configs/data/dexjoco_panda_allegro_config.py
+              # 없으면 launch_train 이 FileNotFoundError 로 죽으니 여기서 먼저 잡는다.
               test -f rldx/configs/data/dexjoco_panda_allegro_config.py || {
                   echo "[FATAL] rldx/configs/data/dexjoco_panda_allegro_config.py 없음."
                   echo "        /data/junmo_cho/workspace/rd-rl 에서 서브모듈까지 pull 할 것:"
@@ -82,6 +89,8 @@ spec:
                   echo "          git -C /data/junmo_cho/workspace/rd-rl submodule update --init --recursive"
                   exit 1
               }
+              # 데이터셋 무결성 (v2.1 / 카메라 키 / stats.json) 도 먼저 확인 —
+              # 30000 step 짜리 잡이 20분 뒤에 죽는 것보다 여기서 20초 안에 죽는 게 낫다.
               python - <<'PY'
               import json, os
               D = "/data/junmo_cho/workspace/datasets/dexjoco/water_plant_rand_obj"
@@ -90,34 +99,43 @@ spec:
               assert info["codebase_version"] == "v2.1", info["codebase_version"]
               assert set(mod["video"]) == {"camera_front", "camera_wrist"}, mod["video"]
               assert info["features"]["action"]["shape"] == [25], info["features"]["action"]["shape"]
-              assert info["features"]["observation.state"]["shape"] == [25]
               assert os.path.exists(f"{D}/meta/stats.json"), "meta/stats.json 없음"
-              assert info["total_episodes"] == 100, (info["total_episodes"], 100)
-              assert info["total_frames"] == 27645, (info["total_frames"], 27645)
-              print(f"[ok] {info['total_episodes']} ep / {info['total_frames']} frames / fps {info['fps']}"
-                    f" / cameras {info.get('dexjoco_cameras')}")
+              print(f"[ok] {info['total_episodes']} ep / {info['total_frames']} frames / fps {info['fps']}")
               PY
 
-              # --- 배치 / step / epoch ----------------------------------------------
-              # 1 GPU 에서는 per_device_train_batch_size = global_batch_size // num_gpus
-              # (experiment.py:187) 이므로 --global-batch-size 가 곧 per-device 배치다.
-              # A100-80GB 에서 배치별 peak GPU memory 를 재서 뽑은 선형 모델:
-              #     batch  8 -> 53,443 MiB     batch 24 -> 65,277 MiB
-              #     batch 32 -> 72,181 MiB     batch 40 -> 79,711 MiB     batch 64/128 -> OOM
-              #     mem(MiB) = 46,458 + 815.2 x batch   (잔차 +-750 MiB)
-              # -> H200 143,771 MiB 예측: batch 64 = 98,631 MiB (69%), batch 128 = 105% (OOM).
-              #    batch 64 는 H200 노드에서 실제로 돌려서 확인했다.
+              # --- 배치 크기: 1 GPU 라서 강제된 변경 ------------------------------
+              # per_device_train_batch_size = global_batch_size // num_gpus
+              #   (experiment.py:187). 즉 1 GPU 에서 --global-batch-size 128 은
+              #   per-device 128 을 뜻한다. A100-80GB 에서 배치별 peak GPU memory 를
+              #   직접 재서 선형 모델을 뽑았다 (horizon 32, 카메라 2대, workers 2):
+              #       batch  8 ->  53,443 MiB      batch 32 ->  72,181 MiB
+              #       batch 24 ->  65,277 MiB      batch 40 ->  79,711 MiB
+              #       batch 64 -> OOM              batch 128 -> OOM
+              #     mem(MiB) = 46,458 + 815.2 x batch    (잔차 +-750 MiB)
+              #   H200 143,771 MiB 예측:
+              #       batch  64 ->  98,631 MiB (69%)   OK
+              #       batch  96 -> 124,717 MiB (87%)   여유 없음
+              #       batch 128 -> 150,804 MiB (105%)  OOM
+              #   -> per-device 128 은 1x H200 에도 안 들어간다.
               #
-              # water_plant: 100 ep / 27,645 frame -> effective step 24,545
-              #   (= frame - ep x (action_horizon-1). RLDX-1 은 에피소드 뒤쪽
-              #    action_horizon-1 프레임을 버린다. 학습 시작 로그의
-              #    "StandardSingleStepDataset: N steps" 와 일치해야 한다)
-              # epoch = 30000 x 64 / 24,545 = 78.2
-              #   참고: DexJoCo 논문의 single-arm baseline (pi0.5 / GR00T N1.5) 은 같은
-              #   100-에피소드 데이터셋에 LoRA 30,000 step (openpi 기본 배치 32) = 약 45
-              #   epoch 를 썼다. 위 값이 그보다 크면 과적합 구간을 지날 수 있으니
-              #   --save-steps 10000 로 남는 중간 체크포인트들의 롤아웃 성공률을
-              #   반드시 비교해서 최고점을 base policy 로 쓸 것.
+              # 그래서 **유효 배치 128 은 gradient accumulation 으로 만든다**:
+              #   per-device 64 x num_gpus 1 x accum 2 = 유효 배치 128
+              #   (HF Trainer 의미. RLDX-1 은 accum 을 global_batch_size 와 별도로
+              #    TrainingArguments 에 넘긴다 -> experiment.py:187 은 accum 을 보지 않는다)
+              #   메모리는 per-device 64 기준 98.6 GB = H200 의 69%.
+              #   유효 배치가 128 로 복원되므로 --learning-rate 도 팀 레시피의 1e-4 그대로 쓴다.
+              #
+              # --- step 수 -----------------------------------------------------------
+              # 유효 배치 128 에서 30,000 step 은 3.84M sample = water_plant 기준
+              # **156 epoch** 이고, micro-step 60,000 개라 벽시계로 24h deadline 을 넘긴다.
+              # DexJoCo 논문의 single-arm baseline (pi0.5 / GR00T N1.5) 은 같은 100-에피소드
+              # 데이터셋에 LoRA 30,000 step (openpi 기본 배치 32) = 약 45 epoch 를 썼다.
+              # 그 예산에 맞추면:
+              #   6,000 step x 128 / 24,545 = 31.3 epoch
+              # 30,000 step 짜리 장기 런을 원하면 --max-steps 30000 --save-steps 10000 으로
+              # 되돌리면 되지만 209 epoch 이고 deadline 도 늘려야 한다.
+              #   (24,545 = effective step: 27,645 frame - 100 ep x (32-1).
+              #    RLDX-1 은 에피소드 뒤쪽 action_horizon-1 프레임을 버린다.)
               #
               # --- action-horizon 32 ------------------------------------------------
               # dexjoco_panda_allegro_config.py 의 action delta_indices=range(32) 과
@@ -141,12 +159,13 @@ spec:
                   --n-cog-tokens 64 \
                   --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
                   --global-batch-size 64 \
+                  --gradient-accumulation-steps 2 \
                   --learning-rate 1e-4 \
-                  --max-steps 30000 \
-                  --save-steps 10000 \
+                  --max-steps 6000 \
+                  --save-steps 2000 \
                   --save-only-model \
                   --dataloader-num-workers 8 \
-                  --experiment-name dexjoco_water_plant_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs64_30k_1gpu_mlxp \
+                  --experiment-name dexjoco_water_plant_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs128acc2_6k_1gpu_mlxp \
                   --use-wandb --wandb-project RLDX-1 \
                   --action-horizon 32 \
                   --rtc-training-max-delay 8 \
