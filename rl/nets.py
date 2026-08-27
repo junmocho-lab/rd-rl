@@ -218,6 +218,79 @@ class CriticEnsemble(nn.Module):
         return perm[:num_min_qs].tolist()
 
 
+# --------------------------------------------------------------------------- #
+# Q-VGM 식 critic — 층마다 액션 재주입 + 청크 위치별(stepwise) 값
+#
+# 두 설계 모두 Q-VGM (arXiv 2606.08015) 4.1 절에서 왔고, 논문 ablation 이 각각의 값을
+# 재 놓았다 (LIBERO 평균, 전체 92.5%):
+#   · 층마다 액션 재주입 없음 → 88.2%.  latent 가 액션보다 훨씬 고차원이라 (우리는 4096 대
+#     280) critic 이 액션을 무시하기 쉽다. ∇_A Q 를 쓰는 방법은 전부 이 민감도에 의존한다
+#   · 단일 Q 헤드 → 90.1%.  헤드 2개의 min (clipped double Q)
+#   · stepwise 아님 → 위 표에 없지만 본문이 "긴 지평 + 희소 보상에서 청크 전체에 값 하나는
+#     너무 약한 지도 신호" 라고 명시한다. 우리는 219프레임에 보상이 끝 1프레임뿐이다
+# --------------------------------------------------------------------------- #
+class StepwiseQ(nn.Module):
+    """(latent, action) → 청크 위치별 Q^(i). (B, n_steps)
+
+    보통 MLP 와 다른 점은 **hidden 층마다 액션을 다시 concat** 한다는 것뿐이다.
+    """
+
+    def __init__(self, in_dim: int, action_dim: int, n_steps: int,
+                 hidden_dims: tuple[int, ...] = (512, 512, 512), use_layer_norm: bool = True,
+                 inject: bool = True):
+        super().__init__()
+        self.inject = inject
+        self.blocks = nn.ModuleList()
+        d = in_dim + action_dim
+        for h in hidden_dims:
+            layer = [xavier_(nn.Linear(d, h))]
+            if use_layer_norm:
+                layer.append(nn.LayerNorm(h))
+            layer.append(nn.GELU())
+            self.blocks.append(nn.Sequential(*layer))
+            d = h + (action_dim if inject else 0)      # 다음 층 입력에 액션을 다시 붙인다
+        self.head = xavier_(nn.Linear(d - (action_dim if inject else 0), n_steps))
+        self.n_steps = n_steps
+
+    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        h = torch.cat([x, action], -1)
+        for i, blk in enumerate(self.blocks):
+            h = blk(h)
+            if self.inject and i < len(self.blocks) - 1:
+                h = torch.cat([h, action], -1)
+        return self.head(h)
+
+
+class StepwiseEnsemble(nn.Module):
+    """StepwiseQ 를 num_qs 개. (num_qs, B, n_steps). Q-VGM 은 2개의 min 을 쓴다."""
+
+    def __init__(self, in_dim: int, action_dim: int, n_steps: int, num_qs: int = 2,
+                 hidden_dims: tuple[int, ...] = (512, 512, 512), use_layer_norm: bool = True,
+                 inject: bool = True):
+        super().__init__()
+        self.qs = nn.ModuleList([
+            StepwiseQ(in_dim, action_dim, n_steps, hidden_dims, use_layer_norm, inject)
+            for _ in range(num_qs)])
+        self.num_qs, self.n_steps = num_qs, n_steps
+
+    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return torch.stack([q(x, action) for q in self.qs], 0)
+
+
+class StepwiseV(nn.Module):
+    """액션 없는 stepwise value. (B, n_steps). IQL expectile 회귀 대상."""
+
+    def __init__(self, in_dim: int, n_steps: int, hidden_dims: tuple[int, ...] = (512, 512, 512),
+                 use_layer_norm: bool = True):
+        super().__init__()
+        self.body = MLP(in_dim, hidden_dims, activate_final=True, use_layer_norm=use_layer_norm)
+        self.head = xavier_(nn.Linear(self.body.out_dim, n_steps))
+        self.n_steps = n_steps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.body(x))
+
+
 class Temperature(nn.Module):
     """networks/temperature.py — exp(log_temp)."""
 

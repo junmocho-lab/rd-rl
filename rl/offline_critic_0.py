@@ -42,7 +42,8 @@ from rl.data import (build_flat, build_images, find_sessions, nstep, open_images
 from rl.expo import ExpoConfig
 from rl.nets import BatchEncoder, CriticEnsemble
 from rl.offline_critic import normalize_all
-from rl.vla_rldx import RLDXVLA, load_state_action_processor, normalize_states
+from rl.vla_rldx import (load_state_action_processor, normalize_actions,
+                         normalize_states)
 
 REPO = Path(__file__).resolve().parent.parent
 RLDX = REPO / "third_party/RLDX-1"
@@ -104,10 +105,11 @@ FPS = json.loads((sessions[0] / "meta/info.json").read_text())["fps"]   # openar
 proc = load_state_action_processor(base, RLDX, exp["rldx_data_config"])
 snorm = normalize_states(proc, mod.embodiment_tag, mod, flat.state)
 if not (work / "actnorm.npy").is_file():             # 액션 청크는 비싸다 → VLA + 캐시
-    vla = RLDXVLA(base, mod, RLDX, exp["rldx_data_config"], device=dev)
-    normalize_all(vla, flat, H, cache=work / "actnorm.npy")
-    del vla
-    torch.cuda.empty_cache()
+    # processor 만으로 굽는다 — apply_action 에 신경망이 관여하지 않으므로 13.8GB 체크포인트가
+    # 필요 없다. 예전에는 RLDXVLA 를 올렸는데 그게 오프라인 학습이 모델 가중치를 요구한
+    # 유일한 이유였다.
+    normalize_all(lambda ch, st: normalize_actions(proc, mod.embodiment_tag, mod, ch, st),
+                  flat, H, cache=work / "actnorm.npy")
 norm = normalize_all(None, flat, H, cache=work / "actnorm.npy")
 # held-out 분리 — AUC 를 학습 프레임에서 재면 암기력을 재는 것이 된다
 # 0<x<1 만 비율로 본다 — 세션 이름이 타임스탬프(170641)처럼 숫자뿐일 수 있다

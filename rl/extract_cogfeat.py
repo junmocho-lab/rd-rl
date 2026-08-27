@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import yaml
 
-from rl.data import build_flat, find_sessions, open_images, resolve_modality
+from rl.data import build_flat, build_images, find_sessions, open_images, resolve_modality
 
 REPO = Path(__file__).resolve().parent.parent
 RLDX = REPO / "third_party/RLDX-1"
@@ -54,6 +54,8 @@ meta_path = out_path.with_suffix(".json")
 mod, src = resolve_modality(a.data, None, RLDX, exp["rldx_data_config"], base)
 sessions = find_sessions(a.data)
 flat = build_flat(sessions, mod)
+work.mkdir(parents=True, exist_ok=True)
+build_images(sessions, flat, work / "images.mm", mod)     # 없으면 만들고, 있으면 이어받기만
 imgs, meta = open_images(work / "images.mm")
 T = len(flat)
 assert meta["shape"][0] == T, "images.mm 이 이 --data 로 만들어진 것이 아니다"

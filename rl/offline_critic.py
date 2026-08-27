@@ -57,12 +57,15 @@ def normalize_all(vla, flat, action_horizon: int, cache: Path | None = None,
             print(f"  [정규화] 캐시 사용 {cache.name}")
             return np.asarray(out)
         print(f"  [정규화] 캐시 shape 불일치 {out.shape} — 다시 계산")
+    # vla 는 RLDXVLA 든 (chunk, state) -> norm 콜러블이든 된다. 이 계산에 신경망은 관여하지
+    # 않으므로 (processor 의 apply_action 뿐) 가중치 없이 부르는 쪽이 정상 경로다.
+    fn = vla.normalize_actions if hasattr(vla, "normalize_actions") else vla
     T = len(flat)
     out = np.empty((T, action_horizon, flat.action.shape[1]), np.float32)
     t0 = time.time()
     for i in range(0, T, chunk):
         idx = np.arange(i, min(i + chunk, T))
-        out[idx] = vla.normalize_actions(action_chunk(flat, idx, action_horizon), flat.state[idx])
+        out[idx] = fn(action_chunk(flat, idx, action_horizon), flat.state[idx])
     print(f"  [정규화] {T} 프레임 {time.time()-t0:.1f}s")
     if cache:
         np.save(cache, out)

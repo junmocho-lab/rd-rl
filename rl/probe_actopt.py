@@ -35,7 +35,6 @@ import imageio
 import matplotlib
 import numpy as np
 import torch
-import torch.nn as nn
 import yaml
 
 matplotlib.use("Agg")
@@ -43,8 +42,10 @@ import matplotlib.pyplot as plt                      # noqa: E402
 
 from rl.data import build_flat, find_sessions, open_images, resolve_modality
 from rl.expo import ExpoConfig
-from rl.nets import BatchEncoder, CriticEnsemble, explore_spec, xavier_
-from rl.vla_rldx import load_state_action_processor, normalize_states
+from rl.critic_io import load_critic
+from rl.nets import explore_spec
+from rl.vla_rldx import (denormalize_actions, load_state_action_processor,
+                         normalize_states)
 
 REPO = Path(__file__).resolve().parent.parent
 RLDX = REPO / "third_party/RLDX-1"
@@ -58,6 +59,14 @@ p.add_argument("--critic", required=True,
                     "(예: iql-dist128-t07-g0999-q10all-s0/critic_latest.pt)")
 p.add_argument("--model-path", default="", help="processor 를 읽을 체크포인트 (기본: exp yaml)")
 p.add_argument("--groups", default="", help="편집할 action 그룹 (기본: exp yaml 의 explore_groups)")
+p.add_argument("--features", default="",
+               help="frozen VLM feature 로 학습한 critic 이면 그 npy 이름 (예: cogfeat.npy). "
+                    "ckpt 에 기록돼 있으면 생략해도 된다")
+p.add_argument("--ascend", default="mean", choices=("mean", "min"),
+               help="상승·표시에 쓸 앙상블 축약. PA-RL 은 config 기본값이 "
+                    "optimize_critic_ensemble_min=False 라 실전 경로가 mean 이고 후보 선택은 "
+                    "하드코딩 mean 이다. min 은 보수적(REDQ 식) 대안 — 상승과 플롯이 같은 값을 "
+                    "쓰도록 이 선택이 둘 다에 적용된다")
 p.add_argument("--num-steps", type=int, default=10)
 p.add_argument("--step-size", type=float, default=3e-4, help="PA-RL 기본값 3e-4")
 p.add_argument("--auto-step", type=float, default=0.0,
@@ -87,8 +96,8 @@ sessions = find_sessions(a.data)
 flat = build_flat(sessions, mod)
 imgs, meta = open_images(work / "images.mm")
 norm = np.load(work / "actnorm.npy", mmap_mode="r")
-snorm = normalize_states(load_state_action_processor(base, RLDX, exp["rldx_data_config"]),
-                         mod.embodiment_tag, mod, flat.state)
+proc = load_state_action_processor(base, RLDX, exp["rldx_data_config"])
+snorm = normalize_states(proc, mod.embodiment_tag, mod, flat.state)
 FULL, A_DIM = (LAT + R) * mod.action_dim, mod.action_dim
 
 # --- critic ------------------------------------------------------------------
@@ -97,37 +106,18 @@ if not ck.is_file():
     ck = work / a.critic
 if not ck.is_file():
     raise SystemExit(f"체크포인트가 없다: {a.critic}  (work={work})")
-sd = torch.load(ck, map_location=dev)
-BINS = sd.get("bins") or 0
-enc = BatchEncoder(3 * mod.n_cams, cfg.latent_dim_image, cfg.encoder_stage_sizes,
-                   cfg.encoder_num_filters).to(dev).eval()
-critic = CriticEnsemble(cfg.latent_dim_image, snorm.shape[1], FULL, sd.get("num_qs", cfg.num_qs),
-                        cfg.latent_dim_state, cfg.include_state, cfg.hidden_dims,
-                        cfg.critic_layer_norm).to(dev).eval()
-if BINS:
-    for m in critic.qs:
-        m.head = xavier_(nn.Linear(m.body.out_dim, BINS)).to(dev)
-    lo_q, hi_q = (float(x) for x in (sd.get("q_range") or "0,1").split(","))
-    edges = torch.linspace(lo_q, hi_q, BINS + 1, device=dev)
-    centers = (edges[:-1] + edges[1:]) / 2
-    q_of = lambda x: (x.softmax(-1) * centers).sum(-1)
-else:
-    q_of = lambda x: x
-value = CriticEnsemble(cfg.latent_dim_image, snorm.shape[1], 0, 1, cfg.latent_dim_state,
-                       cfg.include_state, cfg.hidden_dims, cfg.critic_layer_norm).to(dev).eval()
-enc.load_state_dict(sd["enc"]); critic.load_state_dict(sd["critic"])
-if "value" in sd:
-    value.load_state_dict(sd["value"])
-else:
-    value = None
-print(f"[critic] {ck}\n          step {sd.get('step')}  γ={sd.get('discount')}  "
-      f"τ={sd.get('expectile')}  bins={BINS}  num_qs={sd.get('num_qs')}")
+C = load_critic(ck, work, cfg, mod.n_cams, FULL, snorm.shape[1],
+                features=a.features, imgs=imgs, dev=dev)
 
 # --- 편집 마스크: explore_groups 의 실행 구간만 -------------------------------
 spec = explore_spec(mod.offsets("action"), groups, A_DIM, R, LAT)
 MASK = torch.zeros(FULL, device=dev)
 MASK[spec.index] = 1.0
 NIDX = len(spec.index)
+JCOL = torch.as_tensor(sorted({int(i) % A_DIM for i in spec.index}), device=dev)   # explore 관절
+# 상승 목적함수와 화면에 찍는 값을 **같은** 축약으로 묶는다. 예전에는 mean 으로 올리고 min 을
+# 그려서, 보이는 곡선이 실제로 올리고 있는 양이 아니었다.
+RED = (lambda q: q.min(0).values) if a.ascend == "min" else (lambda q: q.mean(0))
 print(f"[편집 범위] {groups} → 액션 {FULL}차원 중 {NIDX}개 "
       f"({spec.active_dim}관절 x {R}스텝, prefix {LAT}스텝 제외)")
 print(f"[상승] num_steps {a.num_steps}, step_size {a.step_size}, 앙상블 mean 으로 상승 (PA-RL)")
@@ -142,45 +132,107 @@ eps = [(e, np.flatnonzero(flat.episode == e)) for e in np.unique(flat.episode[ho
 eps = [(e, fr, bool(flat.is_success[fr[-1]])) for e, fr in eps]
 print(f"[평가셋] 에피소드 {len(eps)} (성공 {sum(o for _,_,o in eps)})")
 
-def obs_of(idx):
-    x = np.asarray(imgs[idx])
-    return torch.from_numpy(np.ascontiguousarray(
-        np.concatenate([x[:, c] for c in range(x.shape[1])], -1))).to(dev)
+# --- 기준 스케일 --------------------------------------------------------------
+# 정규화 공간의 L2 자체로는 "큰 변화" 인지 알 수 없다 (q01/q99 로 관절 스케일이 뭉개져 있다).
+# 데이터가 스스로 주는 자연 단위를 쓴다: 같은 (관절, 청크스텝) 에서 t → t+1 의 변화는
+# 정확히 그 관절이 **1프레임 동안 실제로 움직인 양**이다. 편집량을 이것으로 나누면
+# "이 편집은 평소 N 프레임치 움직임이다" 가 되어 바로 해석된다.
+_pi = np.concatenate([fr[:-1:max(1, len(fr) // 40)] for _, fr, _ in eps])[:2048]
+_d1 = (np.asarray(norm[_pi + 1])[:, :LAT + R].reshape(len(_pi), -1)
+       - np.asarray(norm[_pi])[:, :LAT + R].reshape(len(_pi), -1))[:, spec.index]
+REF1 = float(np.median(np.linalg.norm(_d1, axis=-1)) / NIDX ** 0.5)
+print(f"[기준] 1프레임 자연 변화 (중앙) = {REF1:.5f}/차원 — 편집량을 이걸로 나눠 프레임 환산")
+
+
+# --- OOD 눈금: 앙상블 불일치의 양 끝점을 실측한다 ---------------------------
+# ens.std 자체는 단위가 없어 "얼마면 심한가" 를 말할 수 없다. 두 극단을 재서 0~1 로 환산한다.
+#   바닥 STD_DATA : 로그된 액션 (확실히 분포 안)
+#   중간 STD_SHUF : 다른 프레임의 로그된 액션을 explore 차원에만 붙여넣기 — 액션 자체는
+#                   실제 로봇 액션인데 맥락이 틀린 경우. "그럴듯하지만 여기 것이 아님" 의 눈금
+#   천장 STD_RAND : explore 차원을 U(-1,1) 난수로 (완전 OOD)
+def _ens_std(k, mk=None):
+    with torch.no_grad():
+        st_ = torch.from_numpy(snorm[k]).to(dev)
+        lat_ = C.latent_of(k, st_)
+        a_ = torch.from_numpy(np.ascontiguousarray(
+            np.asarray(norm[k])[:, :LAT + R].reshape(len(k), -1))).to(dev)
+        if mk is not None:
+            a_ = a_.clone()
+            a_[:, spec.index] = mk
+        return C.q(lat_, st_, a_).std(0).float().cpu().numpy()
+
+
+_ck = np.concatenate([fr[::max(1, len(fr) // 16)] for _, fr, _ in eps])[:768]
+_rng = np.random.default_rng(0)
+_sh = _rng.permutation(_ck)                                   # 다른 프레임의 액션
+_shv = torch.from_numpy(np.ascontiguousarray(
+    np.asarray(norm[_sh])[:, :LAT + R].reshape(len(_sh), -1))).to(dev)[:, spec.index]
+_g = torch.Generator(device=dev).manual_seed(0)
+_rd = (torch.rand(len(_ck), NIDX, device=dev, generator=_g) * 2 - 1)
+STD_DATA = float(np.median(_ens_std(_ck)))
+STD_SHUF = float(np.median(_ens_std(_ck, _shv)))
+STD_RAND = float(np.median(_ens_std(_ck, _rd)))
+SPAN = max(STD_RAND - STD_DATA, 1e-9)
+OOD_SHUF = (STD_SHUF - STD_DATA) / SPAN
+print(f"[OOD 눈금] 표본 {len(_ck)} 프레임의 앙상블 std 중앙값")
+print(f"  로그 액션 (분포 안)        {STD_DATA:.5f}   -> OOD 0.00")
+print(f"  다른 프레임 액션 (맥락 틀림) {STD_SHUF:.5f}   -> OOD {(STD_SHUF-STD_DATA)/SPAN:.2f}")
+print(f"  난수 액션 (완전 OOD)       {STD_RAND:.5f}   -> OOD 1.00")
+
+
+def _jerk(x):
+    """(B, LAT+R, A) 청크의 실행 구간에서 explore 관절의 2차 차분 RMS.
+    critic 을 무제한 상승시키면 청크가 고주파로 튀는데(제어 불가) 그걸 잡는 지표다."""
+    z = x[:, LAT:LAT + R][:, :, JCOL]
+    return (z[:, 2:] - 2 * z[:, 1:-1] + z[:, :-2]).pow(2).mean((1, 2)).sqrt()
+
 
 def ascend(idx, bs=48):
     """로그된 액션에서 ∇_a Q 상승.
-    반환 열: 0 q_log(min) 1 q_opt(min) 2 dq_mean 3 d_rms 4 g_rms 5 V(s) 6 d_l2"""
+
+    반환 열: 0 q_log(min) 1 q_opt(min) 2 dq_mean 3 d_rms 4 g_rms 5 V(s) 6 d_l2
+             7 d/REF1 (프레임 환산)  8 앙상블 std(a_log)  9 앙상블 std(a_opt)
+             10 jerk(a_log)  11 jerk(a_opt)  12 OOD 점수 (0=분포 안, 1=난수 수준)"""
     out = []
     for c in range(0, len(idx), bs):
         k = idx[c:c + bs]
         with torch.no_grad():
-            lat = enc(obs_of(k), stop_gradient=True)
             st = torch.from_numpy(snorm[k]).to(dev)
+            lat = C.latent_of(k, st)
             a0 = torch.from_numpy(np.ascontiguousarray(
                 np.asarray(norm[k])[:, :LAT + R].reshape(len(k), -1))).to(dev)
-            q0 = q_of(critic(lat, st, a0))
+            q0 = C.q(lat, st, a0)
         act = a0.clone()
         g_last = None
         for _ in range(a.num_steps):
             act = act.detach().requires_grad_(True)
-            qm = q_of(critic(lat, st, act)).mean(0).sum()      # PA-RL: 앙상블 mean
+            qm = RED(C.q(lat, st, act)).sum()         # PA-RL 실전 경로는 mean (--ascend)
             g, = torch.autograd.grad(qm, act)
             g_last = g
             act = (act + a.step_size * g * MASK).clamp(-1.0, 1.0)
         with torch.no_grad():
-            q1 = q_of(critic(lat, st, act.detach()))
-            d = (act.detach() - a0)[:, spec.index]
+            a1 = act.detach()
+            q1 = C.q(lat, st, a1)
+            d = (a1 - a0)[:, spec.index]
             gg = (g_last * MASK)[:, spec.index]
-            v = (value(lat, st, torch.zeros(len(k), 0, device=dev))[0].float().cpu().numpy()
-                 if value is not None else np.zeros(len(k), np.float32))
+            v = C.v(lat, st).float().cpu().numpy()
+            drms = (d.norm(dim=-1) / NIDX ** 0.5).float()
+            nb = len(k)
             out.append(np.stack([
-                q0.min(0).values.float().cpu().numpy(),
-                q1.min(0).values.float().cpu().numpy(),
-                (q1.mean(0) - q0.mean(0)).float().cpu().numpy(),
-                (d.norm(dim=-1) / NIDX ** 0.5).float().cpu().numpy(),
+                RED(q0).float().cpu().numpy(),
+                RED(q1).float().cpu().numpy(),
+                (RED(q1) - RED(q0)).float().cpu().numpy(),
+                drms.cpu().numpy(),
                 (gg.norm(dim=-1) / NIDX ** 0.5).float().cpu().numpy(),
                 v,
-                d.norm(dim=-1).float().cpu().numpy()], 1))
+                d.norm(dim=-1).float().cpu().numpy(),
+                (drms / REF1).cpu().numpy(),                     # 프레임 환산
+                q0.std(0).float().cpu().numpy(),                 # 앙상블 불일치 (외삽 신호)
+                q1.std(0).float().cpu().numpy(),
+                _jerk(a0.view(nb, LAT + R, A_DIM)).float().cpu().numpy(),
+                _jerk(a1.view(nb, LAT + R, A_DIM)).float().cpu().numpy(),
+                # 편집이 만든 불일치 증가분을 "분포 안 -> 난수" 전체 폭으로 나눈 0~1 점수
+                ((q1.std(0) - q0.std(0)).float().cpu().numpy() / SPAN)], 1))
     return np.concatenate(out)
 
 # --- step_size 캘리브레이션 -------------------------------------------------
@@ -190,11 +242,11 @@ if a.auto_step:
     for c in range(0, len(probe_idx), 48):
         k = probe_idx[c:c + 48]
         with torch.no_grad():
-            lat = enc(obs_of(k), stop_gradient=True)
             st = torch.from_numpy(snorm[k]).to(dev)
+            lat = C.latent_of(k, st)
         act0 = torch.from_numpy(np.ascontiguousarray(
             np.asarray(norm[k])[:, :LAT + R].reshape(len(k), -1))).to(dev).requires_grad_(True)
-        qm = q_of(critic(lat, st, act0)).mean(0).sum()
+        qm = RED(C.q(lat, st, act0)).sum()
         g, = torch.autograd.grad(qm, act0)
         gs.append(((g * MASK)[:, spec.index].norm(dim=-1) / NIDX ** 0.5).cpu().numpy())
     gmed = float(np.median(np.concatenate(gs)))
@@ -241,19 +293,72 @@ for lo, hi in ((0,100),(100,200),(200,400),(400,800),(800,2000)):
     print(f"{f'{lo}-{hi}':>12} {sv[:,3].mean():10.5f} {fv[:,3].mean():10.5f} "
           f"{sv[:,2].mean():+10.5f} {fv[:,2].mean():+10.5f}")
 
+# --- 편집이 "말이 되는 액션" 인지 판정 ---------------------------------------
+# L2 하나로는 알 수 없다. 세 축을 같이 본다.
+print(f"\n{'':16s} {'OOD점수':>8} {'프레임환산':>10} {'ΔQ':>9} {'ΔQ/std':>8} {'jerk비':>7}")
+for tag, M in (("성공 에피소드", S), ("실패 에피소드", F)):
+    print(f"{tag:16s} {M[:,12].mean():8.3f} {M[:,7].mean():10.2f} {M[:,2].mean():+9.5f} "
+          f"{(M[:,2]/np.maximum(M[:,9],1e-9)).mean():8.2f} "
+          f"{(M[:,11]/np.maximum(M[:,10],1e-9)).mean():7.2f}")
+ALL = np.concatenate([S, F])
+ood = ALL[:, 12]
+print(f"\n[판정] OOD 점수            중앙 {np.median(ood):.3f}  p95 {np.percentile(ood,95):.3f}  "
+      f"최대 {ood.max():.3f}")
+print(f"        (0 = 로그 액션 수준, {OOD_SHUF:.2f} = 다른 프레임 액션 붙여넣기 수준, 1 = 난수 수준)")
+print(f"        붙여넣기 수준을 넘은 프레임 {100*(ood > OOD_SHUF).mean():.1f}%")
+print(f"        ΔQ / ens.std(a_opt)  중앙 {np.median(ALL[:,2]/np.maximum(ALL[:,9],1e-9)):.2f}   "
+      f"(1 미만이면 개선이 앙상블 노이즈 안)")
+print(f"        프레임 환산 편집량   중앙 {np.median(ALL[:,7]):.2f}  "
+      f"p95 {np.percentile(ALL[:,7],95):.2f} 프레임치")
+print(f"        청크 jerk 비율      중앙 {np.median(ALL[:,11]/np.maximum(ALL[:,10],1e-9)):.2f}  "
+      f"p95 {np.percentile(ALL[:,11]/np.maximum(ALL[:,10],1e-9),95):.2f}   (1 이면 매끄러움 유지)")
+
+# 관절별 편집량을 라디안으로. 정규화 공간 수치는 관절 스케일이 뭉개져 있어 해석 불가.
+pj = np.concatenate([fr[::max(1, len(fr) // 12)] for _, fr, _ in eps])[:512]
+with torch.no_grad():
+    stj = torch.from_numpy(snorm[pj]).to(dev)
+    latj = C.latent_of(pj, stj)
+    a0j = torch.from_numpy(np.ascontiguousarray(
+        np.asarray(norm[pj])[:, :LAT + R].reshape(len(pj), -1))).to(dev)
+aj = a0j.clone()
+for _ in range(a.num_steps):
+    aj = aj.detach().requires_grad_(True)
+    g, = torch.autograd.grad(RED(C.q(latj, stj, aj)).sum(), aj)
+    aj = (aj + a.step_size * g * MASK).clamp(-1.0, 1.0)
+raw0 = denormalize_actions(proc, mod.embodiment_tag, mod,
+                           a0j.view(len(pj), LAT + R, A_DIM).cpu().numpy(), flat.state[pj])
+raw1 = denormalize_actions(proc, mod.embodiment_tag, mod,
+                           aj.detach().view(len(pj), LAT + R, A_DIM).cpu().numpy(), flat.state[pj])
+dr = np.abs(raw1 - raw0)[:, LAT:LAT + R]                 # (B, R, A) 라디안
+nxt = np.minimum(pj + 1, flat.ep_end[pj])                # 에피소드 경계를 넘지 않는다
+nat = np.abs(flat.action[nxt] - flat.action[pj])         # 1프레임 자연 변화 (라디안)
+print(f"\n{'관절':22s} {'편집 p95':>10} {'편집 최대':>10} {'1프레임 자연변화 중앙':>22} {'배수':>7}")
+for name, s0, e0 in mod.offsets("action"):
+    if name not in groups:
+        continue
+    for j in range(s0, e0):
+        n_ = float(np.median(nat[:, j]))
+        print(f"  {name}[{j-s0}]{'':<10} {np.percentile(dr[:,:,j],95):10.5f} "
+              f"{dr[:,:,j].max():10.5f} {n_:22.5f} "
+              f"{np.percentile(dr[:,:,j],95)/max(n_,1e-9):7.1f}")
+print("  (단위 라디안. 배수 = 편집 p95 / 1프레임 자연변화 — 1 이하면 사실상 노이즈 수준)")
+
 ev = ck.parent / "plots"                             # 새 레이아웃: <tag>/plots/
 ev.mkdir(parents=True, exist_ok=True)
 fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
 for e, x, m, ok, L in curves:
     c = "tab:green" if ok else "tab:red"
     ax[0].plot(x, m[:, 0], color=c, lw=1, alpha=0.5)
-    ax[1].plot(x, m[:, 3], color=c, lw=1, alpha=0.5)
+    ax[1].plot(x, m[:, 12], color=c, lw=1, alpha=0.5)     # OOD 점수
     if e in anno:
         ax[1].axvline(anno[e], color=c, ls=":", lw=0.8, alpha=0.7)
-ax[0].set_ylabel("Q (min of ensemble)"); ax[0].grid(alpha=0.25)
-ax[0].set_title(f"{sd.get('tag') or ck.parent.name}  step {sd.get('step')}   green=success red=failure"
+ax[0].set_ylabel(f"Q ({a.ascend} of ensemble)"); ax[0].grid(alpha=0.25)
+ax[0].set_title(f"{C.meta.get('tag') or ck.parent.name}  step {C.meta.get('step')}   green=success red=failure"
                 f"   (dotted = labeled failure moment)")
-ax[1].set_ylabel(f"|a_opt - a_log| per dim  ({'+'.join(groups)}, {NIDX} dims)")
+ax[1].axhline(OOD_SHUF, color="tab:red", lw=0.8, ls="--")
+ax[1].axhline(1, color="0.4", lw=0.8, ls=":")
+ax[1].set_ylabel(f"OOD score (0=logged, {OOD_SHUF:.2f}=shuffled, 1=random)\n"
+                 f"({'+'.join(groups)}, {NIDX} dims)")
 ax[1].set_xlabel("frame in episode"); ax[1].grid(alpha=0.25)
 fig.tight_layout()
 out = ev / f"actopt_s{a.step_size:g}_n{a.num_steps}.png"
@@ -272,16 +377,26 @@ def make_video(path, fr, m, title, ph=150, hd=22):
     xs = np.arange(len(fr))
     panels = []
     for ylabel, series, ylim in (
-            ("value", [("V(s)", m[:, 5], "0.5"), ("Q(a_log)", m[:, 0], "tab:blue"),
-                       ("Q(a_opt)", m[:, 1], "tab:orange")], (-0.05, 1.05)),
-            (f"|a_opt-a_log| L2 ({NIDX}d)", [("dist", m[:, 6], "tab:purple")], None)):
+            ("value", [("V(s)", m[:, 5], "0.5"), (f"Q(a_log) {a.ascend}", m[:, 0], "tab:blue"),
+                       (f"Q(a_opt) {a.ascend}", m[:, 1], "tab:orange")], (-0.05, 1.05)),
+            # 앙상블 불일치를 0~1 OOD 점수로 환산한 것만 그린다. 기준선이 절대 의미를 준다:
+            #   0 = 로그된 액션과 같은 수준 (분포 안)
+            #   SHUF = 다른 프레임의 실제 액션을 붙여넣은 수준 (그럴듯하지만 여기 것이 아님)
+            #   1 = 난수 액션 수준 (완전 외삽)
+            ("OOD score (ens. disagreement)",
+             [("a_opt", m[:, 12], "tab:brown")], (-0.05, 1.05))):
         fig = plt.figure(figsize=(W / 100, ph / 100), dpi=100)
         ax = fig.add_axes([0.075, 0.20, 0.915, 0.76])
         for lab, y, c in series:
             ax.plot(xs, y, color=c, lw=1.2, label=lab)
         ax.set_xlim(0, max(1, len(fr) - 1))
-        if ylim:
-            ax.set_ylim(*ylim); ax.axhline(0, color="0.8", lw=0.6); ax.axhline(1, color="0.8", lw=0.6)
+        ax.set_ylim(*ylim)
+        ax.axhline(0, color="0.8", lw=0.6)
+        ax.axhline(1, color="0.8", lw=0.6)
+        if "OOD" in ylabel:                                    # 붙여넣기 수준 눈금
+            ax.axhline(OOD_SHUF, color="tab:red", lw=0.8, ls="--")
+            ax.text(0.995, OOD_SHUF, " shuffled-action level", color="tab:red", fontsize=6,
+                    ha="right", va="bottom", transform=ax.get_yaxis_transform())
         ax.set_ylabel(ylabel, fontsize=7); ax.tick_params(labelsize=7); ax.grid(alpha=0.25)
         ax.legend(fontsize=6, loc="upper left", ncol=len(series), framealpha=0.6)
         fig.canvas.draw()

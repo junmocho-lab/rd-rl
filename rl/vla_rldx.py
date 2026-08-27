@@ -71,6 +71,41 @@ def normalize_states(proc, tag: str, mod: Modality, raw_state: np.ndarray) -> np
     return np.concatenate([out[n] for n, _, _ in off], axis=-1).astype(np.float32)
 
 
+def normalize_actions(proc, tag: str, mod: Modality, raw_chunk: np.ndarray,
+                     raw_state: np.ndarray) -> np.ndarray:
+    """(B,H,A) 절대 액션 + (B,A) 상태 → 모델 공간. 가중치 없이 processor 만 쓴다.
+
+    RLDXVLA.normalize_actions 와 같은 계산이다 (같은 apply_action 호출). 그쪽은 1.25B 를
+    올려야 접근할 수 있는데 이 계산에는 신경망이 전혀 관여하지 않는다 — actnorm.npy 캐시를
+    굽는 것 때문에 오프라인 학습이 13.8GB 체크포인트를 요구하던 이유가 그것뿐이었다.
+
+    상대 액션의 기준은 state[key][-1] 이므로 상태를 (B,1,A) 로 준다 = 그 프레임의 상태.
+    """
+    off = mod.offsets("action")
+    soff = mod.offsets("state")
+    x = np.asarray(raw_chunk, np.float32)
+    st = np.asarray(raw_state, np.float32)[:, None, :]
+    out = proc.apply_action({n: x[..., s:e] for n, s, e in off}, tag,
+                            state={n: st[..., s:e] for n, s, e in soff})
+    return np.concatenate([out[n] for n, _, _ in off], axis=-1).astype(np.float32)
+
+
+def denormalize_actions(proc, tag: str, mod: Modality, norm_chunk: np.ndarray,
+                       raw_state: np.ndarray) -> np.ndarray:
+    """normalize_actions 의 역. (B,H,A) 모델 공간 → 원본 라디안. 가중치 불필요.
+
+    편집량을 사람이 읽는 단위로 되돌릴 때 쓴다 — 정규화 공간의 L2 는 관절별 스케일이
+    q01/q99 로 뭉개져 있어서 "이게 큰 변화인가" 를 판단할 수 없다.
+    """
+    off = mod.offsets("action")
+    soff = mod.offsets("state")
+    x = np.asarray(norm_chunk, np.float32)
+    st = np.asarray(raw_state, np.float32)[:, None, :]
+    out = proc.unapply_action({n: x[..., s:e] for n, s, e in off}, tag,
+                              state={n: st[..., s:e] for n, s, e in soff})
+    return np.concatenate([out[n] for n, _, _ in off], axis=-1).astype(np.float32)
+
+
 class RLDXVLA(VLA):
     def __init__(self, model_path: Path | str, mod: Modality, rldx_root: Path | str,
                  rldx_config: str, device: str = "cuda", rtc_inference_mode: str = "none",
@@ -314,7 +349,21 @@ class ExpoServer:
         for m in (self.learner.encoder, self.learner.critic, self.learner.target_critic,
                   self.learner.residual):
             m.eval()
-        self.loaded = self._load(artifacts)
+        # cog feature critic 이면 학습 때와 같은 latent 를 만들 수 있게 따로 세운다.
+        # (EXPOLearner 의 ResNet 인코더 + CriticEnsemble 은 shape 이 다르다 —
+        #  실측 856(512+64+280) vs 820(512+28+280). load_state_dict 가 실패한다)
+        self.cog = None
+        if artifacts is not None and Path(artifacts).is_file():
+            probe = torch.load(artifacts, map_location="cpu")
+            if probe.get("features"):
+                from rl.critic_io import load_serving_critic
+                m = self.vla.model
+                n_cog = int(getattr(m, "_n_cog_tokens",
+                                    getattr(m.backbone, "n_cog_tokens", 64)))
+                self.cog = load_serving_critic(Path(artifacts), self.cfg, mod.state_dim,
+                                               spec.full_dim, n_cog, dev=device)
+                self.spec = spec
+        self.loaded = self._load(artifacts) if self.cog is None else ["cog-critic"]
 
         self.policy, self.runtime = self.vla.policy, self.vla.runtime
         if self.runtime.use_memory:
@@ -337,7 +386,12 @@ class ExpoServer:
         print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
         if self.loaded:
             print(f"  [산출물] {artifacts} 에서 {self.loaded} 로드")
-        miss = [k for k in ("enc", "critic", "target", "residual") if k not in self.loaded]
+        if self.cog is not None:
+            print(f"  [critic] cog feature 경로 — 백본이 이미 계산한 backbone_features 에서\n"
+                  f"           cognition token {self.cog.n_cog}개를 mean-pool 한다 "
+                  f"(백본 재실행 없음, ResNet 인코더 미사용)")
+        miss = [] if self.cog is not None else [
+            k for k in ("enc", "critic", "target", "residual") if k not in self.loaded]
         if miss:
             print(f"  [주의] {miss} 는 **랜덤 초기화** 상태다. EXPO-FT 의 warmup 과 같은 조건이고\n"
                   f"         (랜덤 critic·랜덤 residual 로 수집) 그래서 edit 이 액션을 흔든다 —\n"
@@ -418,6 +472,32 @@ class ExpoServer:
                                               _cat_state(obs, self.mod))).to(dev)
         return x, st
 
+    def _cog_select(self, pred, request, chunks):
+        """cog feature 로 후보를 고른다. select_from_chunks 와 같은 규약.
+
+        분포형 critic 이라 원본 select_from_chunks 를 못 쓴다 (그쪽은 raw 출력에 min 을
+        걸어 (B,bins) 가 되어 view 가 깨진다) — q_of 를 적용해야 한다.
+        """
+        C, s = self.cog, self.latency
+        A = self.vla.action_dim
+        B, n = chunks.shape[0], chunks.shape[1]
+        acts = chunks[:, :, :s + self.replan].reshape(B, n, -1)
+
+        # 백본이 액션 생성하면서 이미 계산했다 (rldx.py:729-733 의 반환값).
+        # inference_mode 텐서라 clone 으로 꺼낸다.
+        f = pred["backbone_features"][:1].clone()
+        state = torch.from_numpy(normalize_states(
+            self.vla.proc, self.vla.tag, self.mod, _cat_state(request.obs, self.mod))).to(f.device)
+        lat = C.latent(C.cog_of(f), state)
+        with torch.no_grad():
+            q = C.q(lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0),
+                    acts.reshape(B * n, -1), target=True).min(dim=0).values.view(B, n)
+        best = q.argmax(dim=1)
+        chosen = acts[torch.arange(B, device=acts.device), best]
+        return chosen, best, {"chosen_q": float(q.gather(1, best[:, None]).mean()),
+                              "candidate_q_std": float(q.std(dim=1).mean()),
+                              "select_ratio_with_residual": 0.0}
+
     def _run_inference(self, request, collated, B, reset_memory):
         if B != 1:
             raise ValueError(f"정책 서버는 관측 1개씩 받는다 (B={B}). 배치 추론은 학습 경로다.")
@@ -432,9 +512,12 @@ class ExpoServer:
             if H < self.latency + self.replan:
                 raise ValueError(f"청크 길이 {H} < latency({self.latency})+replan({self.replan})")
             chunks = a[..., :A].reshape(1, n, H, A)
-            img, state = self._critic_obs(request.obs)
-            lat = self.learner.encode(img, stop_gradient=True)
-            chosen, best, info = self.learner.select_from_chunks(chunks, lat, state)
+            if self.cog is not None:
+                chosen, best, info = self._cog_select(pred, request, chunks)
+            else:
+                img, state = self._critic_obs(request.obs)
+                lat = self.learner.encode(img, stop_gradient=True)
+                chosen, best, info = self.learner.select_from_chunks(chunks, lat, state)
 
             j = int(best[0])
             src = j if j < n else j - n            # edit 후보는 base 후보 (j-n) 에서 나왔다
@@ -462,6 +545,132 @@ class ExpoServer:
 
         print(f"\n  듣는다 tcp://{host}:{port}   (rrc zmq_client 가 붙으면 된다)", flush=True)
         PolicyServer(policy=self.policy, host=host, port=port).run()
+
+
+def _verify_cog(argv: list[str]) -> int:
+    """서빙 배선이 **학습 때의 latent/Q 를 재현하는지** 데이터셋으로 대조한다 (로봇 불필요).
+
+    왜 이게 결정적인가: 학습은 cogfeat.npy 를 인덱스로 읽고, 서빙은 백본 출력에서 그 자리에서
+    mean-pool 한다. 두 경로가 같은 프레임에 같은 값을 내면 배선이 맞은 것이고, 다르면
+    (전처리·토큰 위치·표준화·Proj 중) 어디가 어긋났는지 단계별로 드러난다.
+
+    네 단계를 순서대로 대조한다:
+      1) cog feature   서빙 경로 mean-pool  vs  cogfeat.npy[idx]
+      2) latent        표준화 + Proj 통과 후
+      3) Q             로그된 액션에 대한 Q (분포형이면 bin 기댓값)
+      4) 후보 선택     같은 후보 집합에서 argmax 인덱스가 같은지
+    """
+    import argparse
+
+    import yaml
+
+    repo = Path(__file__).resolve().parent.parent
+    p = argparse.ArgumentParser("rl.vla_rldx verify-cog")
+    p.add_argument("--exp", required=True)
+    p.add_argument("--data", type=Path, required=True)
+    p.add_argument("--checkpoints", type=Path, required=True)
+    p.add_argument("--critic", required=True, help="work 기준 상대경로도 된다")
+    p.add_argument("--model-path", default="")
+    p.add_argument("--frames", type=int, default=64)
+    p.add_argument("--device", default="cuda")
+    a = p.parse_args(argv)
+
+    from rl.critic_io import load_serving_critic
+    from rl.data import build_flat, find_sessions, open_images, resolve_modality
+    from rl.expo import ExpoConfig
+    from rl.nets import explore_spec
+    from rl.offline_critic import normalize_all
+
+    rldx = repo / "third_party/RLDX-1"
+    exp = yaml.safe_load((repo / "configs/exp" / f"{a.exp}.yaml").read_text())
+    cfg = ExpoConfig.from_dict(exp.get("expo"))
+    R, LAT, H = exp["replan_steps"], exp["inference_latency"], exp["action_horizon"]
+    work = a.checkpoints / f"{a.exp}-critic"
+    base = a.checkpoints / (a.model_path or exp["base_policy"])
+    mod, _ = resolve_modality(a.data, None, rldx, exp["rldx_data_config"], base)
+    sessions = find_sessions(a.data)
+    flat = build_flat(sessions, mod)
+    imgs, _ = open_images(work / "images.mm")
+    norm = normalize_all(None, flat, H, cache=work / "actnorm.npy")
+    proc = load_state_action_processor(base, rldx, exp["rldx_data_config"])
+    snorm = normalize_states(proc, mod.embodiment_tag, mod, flat.state)
+    task = json.loads((sessions[0] / "meta/tasks.jsonl").read_text().splitlines()[0])["task"]
+    spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
+                        mod.action_dim, R, LAT)
+    ck = Path(a.critic) if Path(a.critic).is_file() else work / a.critic
+
+    vla = RLDXVLA(base, mod, rldx, exp["rldx_data_config"], device=a.device)
+    n_cog = int(getattr(vla.model, "_n_cog_tokens",
+                        getattr(vla.model.backbone, "n_cog_tokens", 64)))
+    C = load_serving_critic(ck, cfg, mod.state_dim, spec.full_dim, n_cog, dev=a.device)
+
+    # 정답지: 학습이 읽는 그 파일
+    fp = np.load(work / C.meta["features"], mmap_mode="r")
+    idx = np.linspace(0, len(flat) - R - 1, a.frames).astype(np.int64)
+    dev = a.device
+
+    print(f"\n[검증] 프레임 {len(idx)}개  n_cog {n_cog}  features {C.meta['features']}")
+    ok = True
+
+    # --- 1) cog feature ---
+    grabbed = []
+    for c in range(0, len(idx), 8):
+        k = idx[c:c + 8]
+        x = np.asarray(imgs[k])
+        obs = {"video": {nm: x[:, ci][:, None] for ci, (nm, _) in enumerate(mod.video)},
+               "state": {nm: flat.state[k][:, None, s0:e0]
+                         for nm, s0, e0 in mod.offsets("state")},
+               "language": {mod.task_key: [[task]] * len(k)}}
+        with torch.no_grad():
+            out = vla.runtime._forward(vla._collate(obs))
+        grabbed.append(C.cog_of(out["backbone_features"].clone()).cpu().numpy())
+    served = np.concatenate(grabbed)
+    truth = np.asarray(fp[idx])
+    d = np.abs(served - truth)
+    rel = d.max() / max(np.abs(truth).max(), 1e-9)
+    print(f"  1) cog feature   최대 절대차 {d.max():.3e}  상대 {rel:.3e}  "
+          f"{'OK' if rel < 1e-3 else '** 불일치'}")
+    ok &= rel < 1e-3
+
+    # --- 2) latent, 3) Q ---
+    st = torch.from_numpy(snorm[idx]).to(dev)
+    lat_s = C.latent(torch.from_numpy(served).to(dev), st)
+    lat_t = C.latent(torch.from_numpy(truth).to(dev), st)
+    dl = (lat_s - lat_t).abs().max().item()
+    print(f"  2) latent        최대 절대차 {dl:.3e}  {'OK' if dl < 1e-2 else '** 불일치'}")
+    ok &= dl < 1e-2
+
+    act = torch.from_numpy(np.ascontiguousarray(
+        np.asarray(norm[idx])[:, :LAT + R].reshape(len(idx), -1))).to(dev)
+    with torch.no_grad():
+        q_s = C.q(lat_s, st, act).min(0).values
+        q_t = C.q(lat_t, st, act).min(0).values
+    dq = (q_s - q_t).abs()
+    print(f"  3) Q(로그 액션)  최대 절대차 {dq.max():.3e}  평균 {dq.mean():.3e}  "
+          f"Q 범위 [{q_t.min():.3f},{q_t.max():.3f}]  "
+          f"{'OK' if dq.max() < 1e-2 else '** 불일치'}")
+    ok &= dq.max().item() < 1e-2
+
+    # --- 4) 후보 선택이 같은 인덱스를 고르나 ---
+    g = torch.Generator(device=dev).manual_seed(0)
+    N = 8
+    cand = act[:, None, :].repeat(1, N, 1)
+    cand[:, 1:] += (torch.rand(len(idx), N - 1, spec.full_dim, device=dev, generator=g) * 2 - 1) \
+        * 0.05 * torch.as_tensor(
+            [1.0 if i in set(spec.index.tolist()) else 0.0 for i in range(spec.full_dim)],
+            device=dev)
+    with torch.no_grad():
+        qq_s = C.q(lat_s.repeat_interleave(N, 0), st.repeat_interleave(N, 0),
+                   cand.reshape(-1, spec.full_dim)).min(0).values.view(len(idx), N)
+        qq_t = C.q(lat_t.repeat_interleave(N, 0), st.repeat_interleave(N, 0),
+                   cand.reshape(-1, spec.full_dim)).min(0).values.view(len(idx), N)
+    same = (qq_s.argmax(1) == qq_t.argmax(1)).float().mean().item()
+    print(f"  4) 후보 argmax   일치율 {same:.1%}  (후보 {N}개, 편집 범위에 ±0.05 교란)  "
+          f"{'OK' if same > 0.98 else '** 불일치'}")
+    ok &= same > 0.98
+
+    print(f"\n[결과] {'배선이 학습 경로를 재현한다' if ok else '** 어긋난 단계가 있다 (위 참고)'}")
+    return 0 if ok else 1
 
 
 def _serve(argv: list[str]) -> int:
@@ -605,4 +814,6 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         sys.exit(_serve(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "verify-cog":
+        sys.exit(_verify_cog(sys.argv[2:]))
     sys.exit(_verify())

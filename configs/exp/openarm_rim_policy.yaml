@@ -1,3 +1,13 @@
+# openarm_rim 을 그대로 쓰면서 **테스트 시점 탐색만 끈** 서빙용 사본.
+#
+# rl.train_policy 로 뽑은 정책(action expert LoRA)을 단독으로 평가할 때 쓴다.
+# 원본 openarm_rim.yaml 은 EXPO 롤아웃용이라 base 후보 8개 + edit 후보 8개를 만들어
+# critic argmax 로 고른다. distillation 결과만 재려면 그 선택 단계가 개입해선 안 된다:
+#   N=1, n_edit_samples=0 → 후보가 하나뿐이라 argmax 가 항등이 되고, 서버는 순수
+#   base policy 추론이 된다 (critic 가중치가 랜덤이어도 결과에 영향이 없다).
+# 그 밖의 값(action_horizon / replan_steps / inference_latency / explore_groups /
+# rldx_data_config / modality)은 openarm_rim.yaml 과 **같아야 한다** — 어긋나면
+# RTC 지연과 관절 순서가 학습 때와 달라진다.
 # openarm 리그로 "빨간 블록을 림에 넣기" 태스크. 기존 롤아웃 419 에피소드가 있어
 # Phase D(critic 오프라인 학습) 를 이 실험으로 먼저 돌린다.
 #
@@ -39,8 +49,8 @@ explore_groups:
 # 여기 적어두는 이유: 태스크마다 다르게 쓸 수 있게 하고, 원본에서 벗어나면 그 사실이
 # 파일에 보이고 라운드 manifest 에 기록되도록.
 expo:
-  N: 8                    # 관측당 base 후보 수
-  n_edit_samples: 8       # edit 후보 수. 원본 롤아웃 경로는 N 과 같다고 가정한다
+  N: 1                    # 후보 1개 = critic argmax 가 항등. distill 된 정책만 평가한다
+  n_edit_samples: 0       # residual(edit) 정책을 쓰지 않는다 — 편집은 LoRA 에 구워져 있다
   edit_scale: 0.2         # 편집 크기. 정규화된 액션 스케일(std 0.5)의 40%
   num_qs: 10              # Q 앙상블 크기
   num_min_qs: 2           # REDQ 부분집합 min

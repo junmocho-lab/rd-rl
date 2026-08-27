@@ -25,8 +25,8 @@ Q 가 음수 고정점(측정 -0.013)에 갇혔는데, IQL 타깃에는 그 min 
         config.json                            인자/설정 스냅샷
         critic_<step>.pt                       enc/critic/target/value (+ bins/q_range)
         critic_latest.pt                       → 가장 최근 것을 가리키는 심링크
-        plots/<step>_qv.png                    홀드아웃 에피소드의 Q·V 궤적
-        videos/<step>_ep<번호>_<succ|fail>.mp4  카메라 + Q·V 커서 오버레이
+        plots/<step>_qv.png                    홀드아웃 에피소드의 Q·V·A(=Q-V) 궤적
+        videos/<step>_ep<번호>_<succ|fail>.mp4  카메라 + Q·V·A 커서 오버레이
 
 태그 기본값은 설정에서 자동 생성된다 (예: iql-scalar-t07-s0, iql-dist64-t07-s0) — 스칼라 판과
 distributional 판을 나란히 비교할 때 서로 덮어쓰지 않는다.
@@ -79,7 +79,8 @@ import torch.nn as nn
 
 from rl.nets import BatchEncoder, CriticEnsemble, xavier_
 from rl.offline_critic import normalize_all
-from rl.vla_rldx import RLDXVLA, load_state_action_processor, normalize_states
+from rl.vla_rldx import (load_state_action_processor, normalize_actions,
+                         normalize_states)
 
 REPO = Path(__file__).resolve().parent.parent
 RLDX = REPO / "third_party/RLDX-1"
@@ -93,6 +94,9 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--eval-every", type=int, default=2500,
                help="이 주기마다 홀드아웃 평가 + Q·V 플롯 + 체크포인트를 한꺼번에 저장한다")
 p.add_argument("--holdout", default="0.2", help="세션 이름 문자열 또는 에피소드 비율(0<x<1)")
+p.add_argument("--train-eps", default="all", choices=("all", "success", "fail"),
+               help="학습에 쓸 에피소드. success 면 성공한 에피소드만 (보상 1 만 존재). "
+                    "홀드아웃(평가)은 항상 그대로 둔다 — 안 그러면 AUC 를 낼 수 없다")
 p.add_argument("--expectile", type=float, default=0.7, help="τ. 0.5 면 SARSA 에 가까워진다")
 p.add_argument("--bins", type=int, default=0,
                help="0 이면 스칼라 MSE. >0 이면 distributional critic (HL-Gauss, PA-RL 기본 128)")
@@ -125,16 +129,17 @@ p.add_argument("--wandb-entity", default="", help="비우면 계정 기본 entit
 p.add_argument("--wandb-run", default="", help="run 이름. 비우면 태그와 같게 둔다")
 p.add_argument("--log-every", type=int, default=100, help="loss 를 wandb 에 올리는 주기")
 # --- 평가 비디오 -------------------------------------------------------------
-p.add_argument("--video-every", type=int, default=2500,
-               help="N 스텝마다 비디오. 0 = 평가할 때마다 (--eval-every 주기). 음수 = 안 만든다. "
-                    "비디오는 평가 블록 안에서 굽히므로 --eval-every 의 배수여야 실제로 걸린다")
 p.add_argument("--keep-last", type=int, default=1,
                help="남길 체크포인트 개수. 0 이면 전부 보관. 하나가 294MB 라 40k/2500 = 16개 = 4.7GB")
-p.add_argument("--video-stride", type=int, default=4,
-               help="비디오에 넣을 프레임 간격. fuji 는 에피소드가 ~1200 프레임이라 4면 300컷")
-p.add_argument("--video-fps", type=int, default=30)
+p.add_argument("--video-stride", type=int, default=0,
+               help="비디오에 넣을 프레임 간격. 0 이면 에피소드 중앙 길이를 보고 ~300컷이 되게 자동으로 "
+                    "정한다 (fuji 1200f -> 4, openarm 219f -> 1 = 전 프레임). 직접 주면 그 값을 쓴다")
+p.add_argument("--video-fps", type=int, default=0,
+               help="0 이면 데이터셋 meta/info.json 의 fps 를 --video-stride 로 나눠 실시간 재생 속도를 "
+                    "맞춘다 (openarm 20Hz/stride4 -> 5fps, fuji 30Hz/stride4 -> 8fps). 직접 주면 그 값을 쓴다")
 p.add_argument("--video-eps", type=int, default=0,
-               help="비디오를 만들 홀드아웃 에피소드 수. 0 이면 전부")
+               help="평가할 때 비디오를 만들 홀드아웃 에피소드 수 (--eval-every 주기와 같다). "
+                    "0 이면 전부, 음수면 비디오를 안 만든다")
 a = p.parse_args()
 
 torch.manual_seed(a.seed)
@@ -158,7 +163,12 @@ TAG = a.tag or (f"iql-{'cog' if a.features else 'px'}"
                 f"-{'dist' + str(a.bins) if a.bins else 'scalar'}"
                 f"-t{str(a.expectile).replace('.', '')}"
                 f"-g{f'{cfg.discount:g}'.replace('.', '')}"
-                f"-q{cfg.num_qs}{a.v_min}-s{a.seed}")
+                f"-q{cfg.num_qs}{a.v_min}-s{a.seed}"
+                # holdout 이 기본값이 아니면 태그에 넣는다. 안 넣으면 세션별 교차검증
+                # 두 런이 같은 디렉토리를 덮어쓴다 (기본값 런의 이름은 그대로 둔다).
+                + ("" if a.holdout == p.get_default("holdout")
+                   else "-h" + a.holdout.replace(".", ""))
+                + ("" if a.train_eps == "all" else f"-{a.train_eps}only"))
 run = work / TAG                                     # 실험 하나 = 디렉토리 하나
 plots, vids = run / "plots", run / "videos"
 for d in (run, plots, vids):
@@ -169,6 +179,15 @@ for d in (run, plots, vids):
 mod, src = resolve_modality(a.data, None, RLDX, exp["rldx_data_config"], base)
 sessions = find_sessions(a.data)
 flat = build_flat(sessions, mod)
+DS_FPS = float(json.loads((sessions[0] / "meta/info.json").read_text())["fps"])
+# 컷 수를 ~300 으로 맞춘다. 한 컷이 ~10KB 라 300컷이면 3MB — 에피소드가 짧으면 stride 1 (전 프레임).
+VSTRIDE = a.video_stride or max(1, int(round(float(np.median(flat.ep_length)) / 300)))
+# stride 로 프레임을 건너뛰므로 fps 도 같이 나눠야 실시간이 된다. 안 나누면 stride 배 빨라진다.
+VFPS = a.video_fps or max(1, int(round(DS_FPS / VSTRIDE)))
+print(f"[비디오] 데이터셋 {DS_FPS:g}Hz, 에피소드 중앙 {int(np.median(flat.ep_length))}프레임 "
+      f"-> stride {VSTRIDE}, {VFPS}fps, 에피소드당 ~{int(np.median(flat.ep_length) / VSTRIDE)}컷"
+      + (", 안 만듦" if a.video_eps < 0 else
+         f", {a.eval_every} 스텝마다 {'전부' if a.video_eps == 0 else str(a.video_eps) + '편'}"))
 build_images(sessions, flat, work / "images.mm", mod)
 imgs, meta = open_images(work / "images.mm")
 # 이미지를 VRAM 에 상주시킨다. 실측: NFS 랜덤 읽기가 배치당 0.7~1.9s (96 MB/s) 인데 스텝의
@@ -199,10 +218,11 @@ if a.images == "gpu" and not a.features:                   # feature 를 쓰면 
 proc = load_state_action_processor(base, RLDX, exp["rldx_data_config"])
 snorm = normalize_states(proc, mod.embodiment_tag, mod, flat.state)
 if not (work / "actnorm.npy").is_file():
-    vla = RLDXVLA(base, mod, RLDX, exp["rldx_data_config"], device=dev)
-    normalize_all(vla, flat, H, cache=work / "actnorm.npy")
-    del vla
-    torch.cuda.empty_cache()
+    # processor 만으로 굽는다 — apply_action 에 신경망이 관여하지 않으므로 13.8GB 체크포인트가
+    # 필요 없다. 예전에는 RLDXVLA 를 올렸는데 그게 오프라인 학습이 모델 가중치를 요구한
+    # 유일한 이유였다.
+    normalize_all(lambda ch, st: normalize_actions(proc, mod.embodiment_tag, mod, ch, st),
+                  flat, H, cache=work / "actnorm.npy")
 norm = normalize_all(None, flat, H, cache=work / "actnorm.npy")
 
 frac = float(a.holdout) if a.holdout.replace(".", "", 1).isdigit() else 0.0
@@ -215,6 +235,12 @@ else:
     hold = np.isin(flat.session, sel)
     how = f"세션 이름에 '{a.holdout}' 포함 = {[flat.sessions[i] for i in sel]}"
 train = np.flatnonzero(~hold[:len(flat) - R])
+n_all = len(train)
+if a.train_eps != "all":
+    want = a.train_eps == "success"
+    train = train[flat.is_success[train] == want]
+    if len(train) == 0:
+        raise SystemExit(f"--train-eps {a.train_eps} 로 학습 프레임이 0개다")
 eps = [(e, np.flatnonzero(flat.episode == e)) for e in np.unique(flat.episode[hold])]
 eps = [(e, fr, bool(flat.is_success[fr[-1]])) for e, fr in eps]
 n_ok = sum(o for _, _, o in eps)
@@ -222,6 +248,10 @@ print(f"[exp] {a.exp} replan={R} latency={LAT} horizon={H} expectile={a.expectil
 print(f"[할인] 프레임당 {cfg.discount} → 결정당 {GEFF:.5f}  지평 {1/(1-GEFF):.0f} 결정 "
       f"= {1/(1-GEFF)*R:.0f} 프레임  (min 편향 증폭 {1/(1-GEFF):.0f}배)")
 print(f"[critic] 앙상블 {cfg.num_qs}, V 타깃 min = {a.v_min}")
+if a.train_eps != "all":
+    n_tr_ep = len(np.unique(flat.episode[train]))
+    print(f"[학습 에피소드] --train-eps {a.train_eps} → 프레임 {len(train)}/{n_all} "
+          f"({len(train)/n_all:.1%}), 에피소드 {n_tr_ep}개")
 print(f"[산출물] {run}/  (critic_<step>.pt · critic_latest.pt · plots/ · videos/)")
 print(f"[데이터] 세션 {len(sessions)} / 프레임 {len(flat)} / 학습 {len(train)} / "
       f"state {flat.state.shape[1]}→{snorm.shape[1]}차원")
@@ -290,18 +320,34 @@ def _raw_cams(idx) -> np.ndarray:
     return np.asarray(imgs[idx])
 
 
-def _plot_base(qv, vv, e, ok, step):
-    """정적 Q·V 플롯을 RGB 배열로 굽고 프레임→픽셀 사상을 함께 돌려준다."""
-    n = len(qv)
-    fig, axs = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
-    axs[0].plot(np.arange(n), qv, lw=1.4, color="tab:blue")
-    axs[1].plot(np.arange(n), vv, lw=1.4, color="tab:orange")
-    for ax, name in zip(axs, ("Q (min of ensemble)", "V")):
+# 평가에서 그리는 곡선. (이름, (q_min,q_mean,v)->곡선, 1 선을 그릴지)
+#   Q(min)  = IQL 타깃이 쓰는 보수적 값. AUC 도 이걸로 낸다
+#   Q(mean) = PA-RL 액션 최적화가 올리는 값 (probe_actopt 의 --ascend mean)
+#   A = Q-V = expectile 회귀가 남긴 advantage. 이게 0 근처에 붙어 있으면 critic 이 액션을
+#             구분하지 못한다는 뜻이라 액션 최적화의 여지 자체가 없다
+CURVES = (
+    ("Q (min of ens.)", lambda qn, qm, v: qn, True),
+    ("Q (mean of ens.)", lambda qn, qm, v: qm, True),
+    ("V", lambda qn, qm, v: v, True),
+    ("A = Q(min) - V", lambda qn, qm, v: qn - v, False),
+    ("A = Q(mean) - V", lambda qn, qm, v: qm - v, False),
+)
+_CCOL = ("tab:blue", "tab:cyan", "tab:orange", "tab:purple", "tab:pink")
+
+
+def _plot_base(qn, qm, vv, e, ok, step):
+    """정적 플롯을 RGB 배열로 굽고 프레임→픽셀 사상을 곡선별로 돌려준다."""
+    n = len(qn)
+    ys = [f(qn, qm, vv) for _, f, _ in CURVES]
+    fig, axs = plt.subplots(len(CURVES), 1, figsize=(10, 1.7 * len(CURVES)), sharex=True)
+    for ax, y, col, (name, _, zero1) in zip(axs, ys, _CCOL, CURVES):
+        ax.plot(np.arange(n), y, lw=1.4, color=col)
         ax.axhline(0, color="gray", lw=0.5)
-        ax.axhline(1, color="gray", lw=0.5)
-        ax.set_ylabel(name)
+        if zero1:
+            ax.axhline(1, color="gray", lw=0.5)
+        ax.set_ylabel(name, fontsize=9)
         ax.grid(alpha=0.25)
-    axs[1].set_xlabel("frame in episode")
+    axs[-1].set_xlabel("frame in episode")
     axs[0].set_title(f"ep {e}  {'SUCCESS' if ok else 'FAIL'}  step {step}  tau={a.expectile}")
     fig.tight_layout()
     fig.canvas.draw()
@@ -309,33 +355,33 @@ def _plot_base(qv, vv, e, ok, step):
     hp = base.shape[0]
     x = np.arange(n)
     xs = axs[0].transData.transform(np.column_stack([x, np.zeros(n)]))[:, 0]
-    qy = hp - axs[0].transData.transform(np.column_stack([x, qv]))[:, 1]
-    vy = hp - axs[1].transData.transform(np.column_stack([x, vv]))[:, 1]
+    cy = [hp - ax.transData.transform(np.column_stack([x, y]))[:, 1]
+          for ax, y in zip(axs, ys)]
     top = hp - axs[0].get_window_extent().y1
-    bot = hp - axs[1].get_window_extent().y0
+    bot = hp - axs[-1].get_window_extent().y0
     plt.close(fig)
-    return base, xs, qy, vy, float(top), float(bot)
+    return base, xs, cy, float(top), float(bot)
 
 
-def write_videos(step, qc, vc):
+def write_videos(step, qc, qmc, vc):
     sel = eps if a.video_eps <= 0 else eps[:a.video_eps]
     t0 = time.time()
     for e, fr, ok in sel:
         n = len(fr)
-        ks = np.arange(0, n, max(1, a.video_stride))
-        base, xs, qy, vy, top, bot = _plot_base(qc[e], vc[e], e, ok, step)
+        ks = np.arange(0, n, VSTRIDE)
+        base, xs, cy, top, bot = _plot_base(qc[e], qmc[e], vc[e], e, ok, step)
         probe = _raw_cams(fr[ks[:1]])                       # (1, n_cams, H, W, 3)
         _, ncam, ih, iw, _ = probe.shape
         sw = iw * ncam                                      # 카메라 스트립 폭
         sc = sw / base.shape[1]
         base_r = cv2.resize(base, (sw, int(round(base.shape[0] * sc))))
-        xs_r, qy_r, vy_r = xs * sc, qy * sc, vy * sc
+        xs_r, cy_r = xs * sc, [y * sc for y in cy]
         top_r, bot_r = int(top * sc), int(bot * sc)
         cw, ch = sw, ih + base_r.shape[0]
         tw, th = _m16(cw), _m16(ch)
         need = (tw, th) != (cw, ch)
         out = vids / f"{step:06d}_ep{e:04d}_{'succ' if ok else 'fail'}.mp4"
-        with iio.get_writer(out, fps=a.video_fps, codec="libx264", quality=7,
+        with iio.get_writer(out, fps=VFPS, codec="libx264", quality=7,
                             macro_block_size=None) as w:
             for b0 in range(0, len(ks), 64):                # 이미지는 64프레임씩 읽는다
                 blk = ks[b0:b0 + 64]
@@ -345,8 +391,8 @@ def write_videos(step, qc, vc):
                     pf = base_r.copy()
                     px = int(round(xs_r[k]))
                     cv2.line(pf, (px, top_r), (px, bot_r), (40, 40, 40), 2)
-                    cv2.circle(pf, (px, int(round(qy_r[k]))), 5, (214, 39, 40), -1)
-                    cv2.circle(pf, (px, int(round(vy_r[k]))), 5, (214, 39, 40), -1)
+                    for y in cy_r:
+                        cv2.circle(pf, (px, int(round(y[k]))), 5, (214, 39, 40), -1)
                     comp = np.vstack([strip, pf])
                     w.append_data(cv2.resize(comp, (tw, th)) if need else comp)
     print(f"  [video] {len(sel)}개 → {vids}/  ({time.time()-t0:.0f}s)")
@@ -473,33 +519,38 @@ for step in range(1, a.steps + 1):
         with torch.no_grad():
             def qv_at(idx, bs=256):
                 """Q 와 V 를 같은 인코딩에서 한 번에 뽑는다 (비디오가 둘 다 쓴다)."""
-                qq, vv = [], []
+                qn, qm, vv = [], [], []
                 for k in np.array_split(idx, max(1, len(idx) // bs)):
                     h = enc(enc_in(k), stop_gradient=True)
                     if a.features:
                         h = torch.cat([h, st(k)], -1)
-                    qq.append(q_of(critic(h, st(k), act(k))).min(0).values.float().cpu().numpy())
+                    q = q_of(critic(h, st(k), act(k)))          # (num_qs, B)
+                    qn.append(q.min(0).values.float().cpu().numpy())   # IQL 타깃이 쓰는 값
+                    qm.append(q.mean(0).float().cpu().numpy())         # 액션 최적화가 쓰는 값
                     vv.append(value(h, st(k), torch.zeros(len(k), 0, device=dev))[0]
                               .float().cpu().numpy())
-                return np.concatenate(qq), np.concatenate(vv)
+                return (np.concatenate(qn), np.concatenate(qm), np.concatenate(vv))
             curves = {e: qv_at(fr) for e, fr, _ in eps}
-        qc = {e: c[0] for e, c in curves.items()}
-        vc = {e: c[1] for e, c in curves.items()}
+        qc = {e: c[0] for e, c in curves.items()}            # Q(min) — AUC 는 이걸 쓴다
+        qmc = {e: c[1] for e, c in curves.items()}           # Q(mean)
+        vc = {e: c[2] for e, c in curves.items()}
         fin = np.array([qc[e][-1] for e, _, _ in eps])
         okm = np.array([o for _, _, o in eps])
         sq, fq = fin[okm], fin[~okm]
         auc = float((sq[:, None] > fq[None, :]).mean())
         print(f"  [eval] step {step:5d}  AUC {auc:.3f}  Q(성공끝) {sq.mean():+.3f}  "
               f"Q(실패끝) {fq.mean():+.3f}  Q범위 [{fin.min():+.3f},{fin.max():+.3f}]")
-        fig, axs = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+        fig, axs = plt.subplots(len(CURVES), 1, figsize=(9, 2 + 2.0 * len(CURVES)), sharex=True)
         for e, fr, o in eps:
             col = "tab:green" if o else "tab:red"
-            axs[0].plot(np.arange(len(fr)), qc[e], lw=1, alpha=0.5, color=col)
-            axs[1].plot(np.arange(len(fr)), vc[e], lw=1, alpha=0.5, color=col)
-        for ax, name in zip(axs, ("Q (min of ensemble)", "V")):
-            ax.axhline(0, color="gray", lw=0.5); ax.axhline(1, color="gray", lw=0.5)
+            for ax, (_, f, _) in zip(axs, CURVES):
+                ax.plot(np.arange(len(fr)), f(qc[e], qmc[e], vc[e]), lw=1, alpha=0.5, color=col)
+        for ax, (name, _, zero1) in zip(axs, CURVES):
+            ax.axhline(0, color="gray", lw=0.5)
+            if zero1:
+                ax.axhline(1, color="gray", lw=0.5)
             ax.set_ylabel(name); ax.grid(alpha=0.25)
-        axs[1].set_xlabel("frame in episode")
+        axs[-1].set_xlabel("frame in episode")
         axs[0].set_title(f"IQL tau={a.expectile}{f' dist{a.bins}' if a.bins else ''}  "
                          f"step {step}  AUC {auc:.3f}  green=success")
         fig.tight_layout(); fig.savefig(plots / f"{step:06d}_qv.png", dpi=110); plt.close(fig)
@@ -512,7 +563,11 @@ for step in range(1, a.steps + 1):
                     "discount": cfg.discount, "num_qs": cfg.num_qs, "v_min": a.v_min,
                     "latency": LAT, "replan": R, "action_dim": mod.action_dim,
                     "state_dim": snorm.shape[1], "bins": a.bins, "tag": TAG,
-                    "q_range": a.q_range if a.bins else None}, tmp)
+                    "q_range": a.q_range if a.bins else None,
+                    # 다운스트림(probe_actopt / relabel_parl)이 같은 latent 를 재현하려면
+                    # feature 이름과 표준화 통계가 필요하다. 없으면 Q 가 학습 때와 달라진다.
+                    "features": a.features, "feat_mu": None if FEAT is None else MU.cpu(),
+                    "feat_sd": None if FEAT is None else SD.cpu()}, tmp)
         os.replace(tmp, ck)
         # 최신 포인터. 고정 이름을 원하는 다운스트림(probe_pairs 등)이 쓸 수 있게 둔다.
         lnk, ltmp = run / "critic_latest.pt", run / "critic_latest.pt.tmp"
@@ -527,11 +582,10 @@ for step in range(1, a.steps + 1):
             if old_ck:
                 print(f"  [정리] 오래된 체크포인트 {len(old_ck)}개 삭제 (--keep-last {a.keep_last})")
 
-        # 이 블록 자체가 --eval-every 주기로만 돈다. video_every=0 이면 매 평가마다,
-        # N>0 이면 N 의 배수인 평가에서 굽는다 (N 이 eval_every 의 배수가 아니면 안 걸린다).
-        if a.video_every >= 0 and (step % (a.video_every or a.eval_every) == 0
-                                   or step == a.steps):
-            write_videos(step, qc, vc)
+        # 비디오는 평가와 같은 주기다 (이 블록 자체가 --eval-every 로만 돈다).
+        # 별도 주기를 두면 --eval-every 의 배수가 아닐 때 조용히 안 걸린다.
+        if a.video_eps >= 0:
+            write_videos(step, qc, qmc, vc)
 
 if wb is not None:
     wb.finish()

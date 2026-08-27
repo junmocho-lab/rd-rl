@@ -2,6 +2,12 @@
 
 지표와 튜닝은 [METRICS.md](METRICS.md) — 학습 중에는 wandb `rd-rl-expo` 프로젝트를 본다.
 
+오프라인 RL 쪽 문서:
+- [POLICY-EXTRACTION.md](POLICY-EXTRACTION.md) — PA-RL / QAM / Q-VGM 세 가지 policy
+  extraction 비교 + **구현·명령어·하이퍼파라미터** (오프라인에서 정책을 뽑는 현재 경로)
+- [PA-RL.md](PA-RL.md) — PA-RL 알고리즘 정리 / [PARL-DISTILL.md](PARL-DISTILL.md) — 데이터셋 relabel 방식
+- [ACTION-OPT.md](ACTION-OPT.md) — `∇_a Q` 액션 최적화 진단 / [DIVL.md](DIVL.md) — LWD 의 value learning
+
 # 실행 순서
 
 창을 3개띄운다 (학습서버, 로컬 데이터 전송, 로컬 모델 열기)
