@@ -109,7 +109,8 @@ def denormalize_actions(proc, tag: str, mod: Modality, norm_chunk: np.ndarray,
 class RLDXVLA(VLA):
     def __init__(self, model_path: Path | str, mod: Modality, rldx_root: Path | str,
                  rldx_config: str, device: str = "cuda", rtc_inference_mode: str = "none",
-                 rtc_inference_delay: int | None = None):
+                 rtc_inference_delay: int | None = None,
+                 rtc_inference_exec_horizon: int | None = None):
         from rldx.data.embodiment_tags import EmbodimentTag
         from rldx.policy.rldx_policy import RLDXPolicy
 
@@ -118,9 +119,18 @@ class RLDXVLA(VLA):
         tag = mod.embodiment_tag or rldx_layout(Path(rldx_root), rldx_config)[0]
         self.tag = tag
         self.mod = mod
+        # exec_horizon 을 **반드시 넘겨야 한다.** 안 넘기면 config 의 0 이 그대로 가고
+        # policy_loader.py:289 가 action_horizon - delay 로 채운다 (16-2 = 14).
+        # 그런데 RTC prefix 는 session_registry.py:289 에서
+        #   prefix = 이전청크[exec_horizon : exec_horizon+delay]
+        # 로 잘리므로, 14 면 위치 14,15 를 "방금 실행한 액션" 이라고 pin 한다 — 실제로
+        # 커밋된 것은 rrc 의 execution_horizon(=replan_steps=8) 기준 위치 8,9 다.
+        # 6프레임 미래의 값을 과거로 pin 하니 모델이 이미 더 갔다고 착각해 동작이 어긋난다.
+        # latency 0 에서는 RTC 가 꺼져(delay>0 조건) 이 버그가 잠들어 있었다.
         self.policy = RLDXPolicy(embodiment_tag=EmbodimentTag(tag), model_path=str(model_path),
                                  device=device, rtc_inference_mode=rtc_inference_mode,
-                                 rtc_inference_delay=rtc_inference_delay)
+                                 rtc_inference_delay=rtc_inference_delay,
+                                 rtc_inference_exec_horizon=rtc_inference_exec_horizon)
         self.runtime = self.policy.runtime
         self.model = self.runtime.model
         self.proc = self.policy.processor.state_action_processor
@@ -326,8 +336,9 @@ class ExpoServer:
     def __init__(self, exp: dict, model_path: Path, modality: Path, rldx_root: Path,
                  device: str = "cuda", artifacts: Path | None = None, seed: int = 0,
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
-                 verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.2,
-                 guide_all: bool = False):
+                 verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
+                 guide_all: bool = False, rtc_exec_horizon: int | None = None,
+                 log_every: int = 25):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -341,7 +352,8 @@ class ExpoServer:
         print(f"  [modality] {src}")
 
         self.vla = RLDXVLA(model_path, mod, rldx_root, cfg_rel, device=device,
-                           rtc_inference_mode=rtc_mode, rtc_inference_delay=self.latency)
+                           rtc_inference_mode=rtc_mode, rtc_inference_delay=self.latency,
+                           rtc_inference_exec_horizon=rtc_exec_horizon or self.replan)
         spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
                             mod.action_dim, self.replan, self.latency)
         self.cfg = ExpoConfig.from_dict(exp.get("expo"))
@@ -362,10 +374,20 @@ class ExpoServer:
                 n_cog = int(getattr(m, "_n_cog_tokens",
                                     getattr(m.backbone, "n_cog_tokens", 64)))
                 self.cog = load_serving_critic(Path(artifacts), self.cfg, mod.state_dim,
-                                               spec.full_dim, n_cog, dev=device)
-                self.spec = spec
-                self.cog_mask = torch.zeros(spec.full_dim, device=device)
-                self.cog_mask[spec.index] = 1.0
+                                               mod.action_dim, self.latency, self.replan,
+                                               n_cog, dev=device)
+                # 편집/guidance 마스크는 **실제로 실행되는 스텝**에만 걸어야 한다.
+                # critic 창은 체크포인트가 정하고(예 10스텝) 실행 구간은 rrc 가 정한다
+                # (예 [0,8)). 창 밖이나 실행 밖 스텝을 건드리면 아무 효과 없이 critic 만
+                # 착취한다. 관절은 explore_groups 로 제한한다.
+                jsel = [i for nm, s0, e0 in mod.offsets("action") if nm in
+                        (exp.get("explore_groups") or [nm]) for i in range(s0, e0)]
+                mk = torch.zeros(self.cog.window, mod.action_dim, device=device)
+                mk[self.latency:self.latency + self.replan, jsel] = 1.0
+                self.cog_mask = mk.reshape(-1)
+                print(f"  [편집] 창 {self.cog.window}스텝 중 실행 "
+                      f"[{self.latency},{self.latency + self.replan}) x 관절 {len(jsel)}개 "
+                      f"= {int(self.cog_mask.sum())}/{self.cog.full} 차원")
         self.loaded = self._load(artifacts) if self.cog is None else ["cog-critic"]
 
         self.policy, self.runtime = self.vla.policy, self.vla.runtime
@@ -373,10 +395,16 @@ class ExpoServer:
             raise SystemExit(
                 "memory 모델은 아직 지원하지 않는다 — 후보 N개 확장이 memory scratchpad 의\n"
                 "  배치(B=1)와 어긋난다. base 정책을 memory 없이 뽑거나 확장 경로를 고쳐야 한다.")
+        if verbose:
+            # [SERVER-LOG] RTC prefix injected: source=client|server_cache ... 가
+            # PolicyRuntime.verbose 에 걸려 있다 (policy_runtime.py:335). prefix 를 rrc 가
+            # 보내는지 서버 캐시에서 만드는지가 RTC 진단의 첫 갈림길이라 같이 켠다.
+            self.runtime.verbose = True
         self._orig_run = self.runtime._run_inference
         self.runtime._run_inference = self._run_inference
         self.calls, self.ms, self.q, self.with_edit = 0, [], [], []
         self.guide_steps, self.guide_move, self.guide_all = guide_steps, guide_move, guide_all
+        self.log_every = max(1, log_every)
         self.guide_gain = []
 
         print(f"  [정책] {Path(model_path).name}")
@@ -386,6 +414,10 @@ class ExpoServer:
               f"replan={self.replan} → critic 이 보는 구간 "
               f"[{self.latency},{self.latency + self.replan})")
         print(f"  [탐색] {list(spec.groups)}  활성 {spec.active_dim}/{mod.action_dim} 차원")
+        print(f"  [RTC] mode={rtc_mode} delay={self.latency} "
+              f"exec_horizon={self.runtime.rtc_exec_horizon}  "
+              f"(delay = rrc 의 inference_latency_steps, "
+              f"exec_horizon = rrc 의 execution_horizon 이어야 한다)")
         print(f"  [선택] N={self.cfg.N} + edit={self.cfg.n_edit_samples} "
               f"(edit_scale={self.cfg.edit_scale}) → target critic argmax")
         print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
@@ -491,10 +523,9 @@ class ExpoServer:
         분포형 critic 이라 원본 select_from_chunks 를 못 쓴다 (그쪽은 raw 출력에 min 을
         걸어 (B,bins) 가 되어 view 가 깨진다) — q_of 를 적용해야 한다.
         """
-        C, s = self.cog, self.latency
-        A = self.vla.action_dim
+        C = self.cog
         B, n = chunks.shape[0], chunks.shape[1]
-        acts = chunks[:, :, :s + self.replan].reshape(B, n, -1)
+        acts = chunks[:, :, :C.window].reshape(B, n, -1)   # 창은 체크포인트가 정한다
 
         # 백본이 액션 생성하면서 이미 계산했다 (rldx.py:729-733 의 반환값).
         # inference_mode 텐서라 clone 으로 꺼낸다.
@@ -583,8 +614,12 @@ class ExpoServer:
         with torch.no_grad():
             a = pred["action_pred"].float()                      # (N, H, max_action_dim)
             H, A = a.shape[1], self.vla.action_dim
-            if H < self.latency + self.replan:
-                raise ValueError(f"청크 길이 {H} < latency({self.latency})+replan({self.replan})")
+            need = (self.cog.window if self.cog is not None
+                    else self.latency + self.replan)
+            if H < need:
+                raise ValueError(f"청크 길이 {H} < 필요 {need} "
+                                 f"(실행 오프셋 {self.latency} + replan {self.replan}"
+                                 f"{f', critic 창 {self.cog.window}' if self.cog else ''})")
             chunks = a[..., :A].reshape(1, n, H, A)
             if self.cog is not None:
                 chosen, best, info = self._cog_select(pred, request, chunks)
@@ -596,10 +631,11 @@ class ExpoServer:
             j = int(best[0])
             src = j if j < n else j - n            # edit 후보는 base 후보 (j-n) 에서 나왔다
             out = a[src:src + 1].clone()                          # (1, H, max_action_dim)
-            # chosen 은 청크 [0, latency+replan) 이다. prefix 는 편집되지 않았으므로
-            # (explore_spec 이 마스킹) 실행 구간만 잘라 꽂는다.
-            out[0, self.latency:self.latency + self.replan, :A] = \
-                chosen[0, self.latency * A:].view(self.replan, A)
+            # chosen 은 청크 [0, 창) 을 평탄화한 것이다. **실행되는 구간만** 꽂는다 —
+            # 실행 오프셋은 rrc 의 inference_latency_steps 이고 critic 창과 별개다.
+            e0 = self.latency
+            out[0, e0:e0 + self.replan, :A] = \
+                chosen[0, e0 * A:(e0 + self.replan) * A].view(self.replan, A)
 
         pred = dict(pred)
         pred["action_pred"] = out
@@ -608,15 +644,21 @@ class ExpoServer:
         self.ms.append(dt)
         self.q.append(info["chosen_q"])
         self.with_edit.append(info["select_ratio_with_residual"])
-        if self.verbose or self.calls <= 3 or self.calls % 25 == 0:
+        if self.verbose or self.calls <= 3 or self.calls % self.log_every == 0:
             # guide Δ / 앙상블std 비율이 1 미만이면 그 개선은 앙상블 노이즈 안이다
+            # ens.std 절대값이 핵심이다: 오프라인 검증에서 0.007~0.02 였는데 실기에서
+            # 0.09~0.15 가 나오면 critic 이 학습 분포 밖이라는 뜻이다 (Δ/std 만 보면 놓친다).
             gtxt = ("" if not info.get("guide_ens_std") else
-                    f"  guide Δ={info['guide_gain']:+.4f} "
-                    f"(ens.std {info['guide_ens_std']:.4f}, "
-                    f"Δ/std {info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f})")
-            print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {n}+{min(self.cfg.n_edit_samples, n)} "
-                  f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.3f} "
-                  f"후보간 Q std={info['candidate_q_std']:.3f}{gtxt}", flush=True)
+                    f"  guideΔ={info['guide_gain']:+.4f} "
+                    f"ens.std={info['guide_ens_std']:.4f} "
+                    f"Δ/std={info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f}"
+                    + ("  ** OOD 의심 (오프라인 0.007~0.02)"
+                       if info["guide_ens_std"] > 0.05 else ""))
+            # cog 모드는 edit 후보를 만들지 않는다 (residual policy 미사용) — 표시도 그렇게.
+            ncand = f"{n}" if self.cog is not None else f"{n}+{min(self.cfg.n_edit_samples, n)}"
+            print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand} "
+                  f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.4f} "
+                  f"후보간Qstd={info['candidate_q_std']:.4f}{gtxt}", flush=True)
         return pred, reset_memory
 
     def run(self, host: str, port: int) -> None:
@@ -653,6 +695,7 @@ def _verify_cog(argv: list[str]) -> int:
     p.add_argument("--frames", type=int, default=64)
     p.add_argument("--device", default="cuda")
     a = p.parse_args(argv)
+    dev = a.device
 
     from rl.critic_io import load_serving_critic
     from rl.data import build_flat, find_sessions, open_images, resolve_modality
@@ -681,12 +724,22 @@ def _verify_cog(argv: list[str]) -> int:
     vla = RLDXVLA(base, mod, rldx, exp["rldx_data_config"], device=a.device)
     n_cog = int(getattr(vla.model, "_n_cog_tokens",
                         getattr(vla.model.backbone, "n_cog_tokens", 64)))
-    C = load_serving_critic(ck, cfg, mod.state_dim, spec.full_dim, n_cog, dev=a.device)
+    C = load_serving_critic(ck, cfg, mod.state_dim, mod.action_dim, LAT, R, n_cog,
+                            dev=a.device)
+    # ExpoServer.__init__ 과 **같은 방식**으로 창·마스크를 만든다 (테스트가 서버와 어긋나면
+    # 의미가 없다): 창은 체크포인트, 편집은 실행 구간 [LAT, LAT+R) x explore 관절.
+    jsel = [i for nm, s0, e0 in mod.offsets("action")
+            if nm in (exp.get("explore_groups") or [nm]) for i in range(s0, e0)]
+    mk = torch.zeros(C.window, mod.action_dim, device=dev)
+    mk[LAT:LAT + R, jsel] = 1.0
+    MASK = mk.reshape(-1)
+    MIDX = MASK.nonzero(as_tuple=True)[0]
+    print(f"  [편집] 창 {C.window}스텝 중 실행 [{LAT},{LAT + R}) x 관절 {len(jsel)}개 "
+          f"= {len(MIDX)}/{C.full} 차원")
 
     # 정답지: 학습이 읽는 그 파일
     fp = np.load(work / C.meta["features"], mmap_mode="r")
     idx = np.linspace(0, len(flat) - R - 1, a.frames).astype(np.int64)
-    dev = a.device
 
     print(f"\n[검증] 프레임 {len(idx)}개  n_cog {n_cog}  features {C.meta['features']}")
     ok = True
@@ -720,7 +773,7 @@ def _verify_cog(argv: list[str]) -> int:
     ok &= dl < 1e-2
 
     act = torch.from_numpy(np.ascontiguousarray(
-        np.asarray(norm[idx])[:, :LAT + R].reshape(len(idx), -1))).to(dev)
+        np.asarray(norm[idx])[:, :C.window].reshape(len(idx), -1))).to(dev)
     with torch.no_grad():
         q_s = C.q(lat_s, st, act).min(0).values
         q_t = C.q(lat_t, st, act).min(0).values
@@ -734,15 +787,13 @@ def _verify_cog(argv: list[str]) -> int:
     g = torch.Generator(device=dev).manual_seed(0)
     N = 8
     cand = act[:, None, :].repeat(1, N, 1)
-    cand[:, 1:] += (torch.rand(len(idx), N - 1, spec.full_dim, device=dev, generator=g) * 2 - 1) \
-        * 0.05 * torch.as_tensor(
-            [1.0 if i in set(spec.index.tolist()) else 0.0 for i in range(spec.full_dim)],
-            device=dev)
+    cand[:, 1:] += (torch.rand(len(idx), N - 1, C.full, device=dev, generator=g) * 2 - 1) \
+        * 0.05 * MASK
     with torch.no_grad():
         qq_s = C.q(lat_s.repeat_interleave(N, 0), st.repeat_interleave(N, 0),
-                   cand.reshape(-1, spec.full_dim)).min(0).values.view(len(idx), N)
+                   cand.reshape(-1, C.full)).min(0).values.view(len(idx), N)
         qq_t = C.q(lat_t.repeat_interleave(N, 0), st.repeat_interleave(N, 0),
-                   cand.reshape(-1, spec.full_dim)).min(0).values.view(len(idx), N)
+                   cand.reshape(-1, C.full)).min(0).values.view(len(idx), N)
     same = (qq_s.argmax(1) == qq_t.argmax(1)).float().mean().item()
     print(f"  4) 후보 argmax   일치율 {same:.1%}  (후보 {N}개, 편집 범위에 ±0.05 교란)  "
           f"{'OK' if same > 0.98 else '** 불일치'}")
@@ -781,8 +832,7 @@ def _verify_cog(argv: list[str]) -> int:
         pass
     srv = _Srv()
     srv.cog = C
-    srv.cog_mask = torch.zeros(spec.full_dim, device=dev)
-    srv.cog_mask[spec.index] = 1.0
+    srv.cog_mask = MASK
     srv._cog_guide = ExpoServer._cog_guide.__get__(srv, _Srv)
     print()
     for gs, gm in ((4, 0.05), (4, 0.2), (10, 0.2)):
@@ -795,7 +845,7 @@ def _verify_cog(argv: list[str]) -> int:
             q_before = C.q(lat_t, st, act, target=True).min(0).values
             std_b = C.q(lat_t, st, act, target=True).std(0)
             std_a = C.q(lat_t, st, gact, target=True).std(0)
-        mv = (gact - act)[:, spec.index].norm(dim=-1) / len(spec.index) ** 0.5
+        mv = (gact - act)[:, MIDX].norm(dim=-1) / len(MIDX) ** 0.5
         worse = int((gq < q_before - 1e-6).sum())
         print(f"  6) guidance steps={gs} move={gm}: Q {q_before.mean():+.4f} -> {gq.mean():+.4f} "
               f"(Δ{(gq - q_before).mean():+.4f})  실제이동 {mv.mean():.4f}/차원 "
@@ -844,13 +894,24 @@ def _serve(argv: list[str]) -> int:
                         "(+0.0064) → 국소적으로 Q 가 거의 선형이라 4 면 충분하다. "
                         "Q-VGM 실측(LIBERO): 선택만 86.0 / guidance 88.7 (SFT 79.0). "
                         "cog feature critic 에서만 동작한다")
-    p.add_argument("--guide-move", type=float, default=0.2,
+    p.add_argument("--guide-move", type=float, default=0.05,
                    help="상승의 차원당 총 이동량 (정규화 액션 단위). **실질적인 유일한 노브다.** "
-                        "openarm 의 1프레임 자연 변화가 ~0.022 이라 0.2 는 약 9 프레임치이고, "
-                        "yaml 의 edit_scale 0.2 와 같은 크기다. "
-                        "실측: 0.05 는 ΔQ +0.0064 인데 앙상블 std 0.024 라 **개선이 노이즈에 "
-                        "묻힌다** (ΔQ/std 0.27). 0.2 는 ΔQ +0.0823, ΔQ/std 3.13 으로 유의하다. "
+                        "openarm 의 1프레임 자연 변화가 ~0.022 이라 0.05 는 약 2.3 프레임치, "
+                        "0.2 는 약 9 프레임치(yaml 의 edit_scale 과 같은 크기)다. "
+                        "실측 두 표본에서 ΔQ/std 는 0.05 와 0.2 가 비슷했지만 앙상블 std 증가는 "
+                        "0.05 가 1.2~1.3배, 0.2 가 1.3~4.1배로 표본에 따라 크게 흔들렸다 — "
+                        "즉 0.2 는 외삽 위험이 훨씬 크면서 신뢰도는 비슷하다. "
+                        "**실기에서 0.05 / 0.1 / 0.2 를 쓸어보고 정할 값이다**: "
+                        "로그의 Δ/std 가 1 이상이고 ens.std 증가가 2배 미만인 구간을 쓸 것. "
                         "keep-best 라 Q 가 나빠지면 원본을 유지한다")
+    p.add_argument("--log-every", type=int, default=25,
+                   help="[EXPO] 한 줄을 몇 호출마다 찍을지. 1 이면 매 스텝 (진단용)")
+    p.add_argument("--rtc-exec-horizon", type=int, default=0,
+                   help="RTC 의 execution horizon s. 0 이면 yaml 의 replan_steps 를 쓴다 "
+                        "(= rrc 의 execution_horizon). 이 값을 안 넘기면 RLDX 가 "
+                        "action_horizon - delay 로 채워서 (16-2=14) RTC prefix 를 엉뚱한 "
+                        "위치에서 자른다 (서버 캐시 폴백 경로). 시작 로그의 exec_horizon 이 "
+                        "replan_steps 와 같은지 꼭 확인할 것")
     p.add_argument("--guide-all", action="store_true",
                    help="후보 전부를 상승시킨 뒤 argmax (PA-RL 순서). 기본은 argmax 를 먼저 하고 "
                         "고른 하나만 상승시킨다. critic 이 작은 MLP 라 비용 차이가 거의 없다")
@@ -865,7 +926,8 @@ def _serve(argv: list[str]) -> int:
                      device=a.device, artifacts=a.artifacts, seed=a.seed,
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
-                     guide_all=a.guide_all)
+                     guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
+                     log_every=a.log_every)
     srv.run(a.host, a.port)
     return 0
 

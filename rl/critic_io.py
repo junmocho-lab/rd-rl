@@ -216,9 +216,13 @@ class ServingCritic:
         return self.q_of(m(lat, state, act))
 
 
-def load_serving_critic(ckpt: Path, cfg, state_dim: int, action_full: int,
-                        n_cog: int, dev: str = "cuda") -> ServingCritic:
-    """cogfeat.npy 를 읽지 않고 체크포인트만으로 ServingCritic 을 만든다."""
+def load_serving_critic(ckpt: Path, cfg, state_dim: int, action_dim: int, exec_off: int,
+                        replan: int, n_cog: int, dev: str = "cuda") -> ServingCritic:
+    """cogfeat.npy 를 읽지 않고 체크포인트만으로 ServingCritic 을 만든다.
+
+    action_full 은 인자로 받지 않는다 — **체크포인트가 정한다**. exec_off/replan 은
+    실행 구간이 critic 창 안에 들어가는지 확인하는 데만 쓴다.
+    """
     sd = torch.load(ckpt, map_location=dev)
     feat = sd.get("features") or ""
     if not feat:
@@ -230,6 +234,31 @@ def load_serving_critic(ckpt: Path, cfg, state_dim: int, action_full: int,
             f"{ckpt} 에 feat_mu/feat_sd 가 없다 (구버전 체크포인트).\n"
             f"  표준화 통계 없이는 학습 때의 latent 를 재현할 수 없다 — critic 을 다시 학습하거나\n"
             f"  cogfeat.npy 에서 통계를 계산해 넣어야 한다.")
+    # 체크포인트에 학습 때의 latency/replan/action_dim/state_dim 이 기록돼 있다.
+    # 서버가 yaml 에서 계산한 값과 다르면 **여기서 잡아야 한다** — 안 그러면 torch 의
+    # size mismatch 로만 드러나서 "학습이 깨졌나" 로 오해하게 된다. 실제로 actor 클론의
+    # inference_latency 가 0 (learner 는 2) 이라 820 vs 764 로 어긋난 적이 있다.
+    # critic 의 액션 창은 **체크포인트가 고정한다** — 학습 때 본 청크 스텝 수다.
+    # 실행 오프셋(rrc 의 inference_latency_steps)과는 별개다: 그건 rrc 설정을 베끼는 값이고
+    # 학습 때와 달라도 된다. 둘을 묶어 두면 rrc 를 바꿀 때마다 critic 을 다시 학습해야 한다.
+    ck_l, ck_r, ck_a = sd.get("latency"), sd.get("replan"), sd.get("action_dim")
+    if None in (ck_l, ck_r, ck_a):
+        raise SystemExit(f"{ckpt} 에 latency/replan/action_dim 이 없다 (구버전 체크포인트)")
+    if ck_a != action_dim:
+        raise SystemExit(f"action_dim 불일치: 체크포인트 {ck_a} vs 지금 {action_dim}. "
+                         f"modality 가 학습 때와 다르다.")
+    if sd.get("state_dim") is not None and sd["state_dim"] != state_dim:
+        raise SystemExit(f"state 차원 불일치: 체크포인트 {sd['state_dim']} vs 지금 {state_dim}. "
+                         f"modality 가 학습 때와 다르다.")
+    window = ck_l + ck_r                      # critic 이 보는 청크 스텝 수
+    if window < exec_off + replan:
+        raise SystemExit(
+            f"critic 의 액션 창이 실행 구간을 못 덮는다.\n"
+            f"  critic 창    : {window} 스텝 (체크포인트: latency {ck_l} + replan {ck_r})\n"
+            f"  실행 구간    : [{exec_off}, {exec_off + replan}) — yaml 의 "
+            f"inference_latency={exec_off}, replan_steps={replan}\n"
+            f"  → critic 을 더 긴 창으로 다시 학습하거나 실행 오프셋을 줄일 것")
+    action_full = window * ck_a
     dim_feat = sd["feat_mu"].shape[-1]
     latent_img = sd.get("latent") or cfg.latent_dim_image
     enc = Proj(dim_feat, latent_img).to(dev).eval()
@@ -258,5 +287,9 @@ def load_serving_critic(ckpt: Path, cfg, state_dim: int, action_full: int,
     print(f"  [critic] {ckpt.name}  step {sd.get('step')}  bins {sd.get('bins')}  "
           f"num_qs {sd.get('num_qs')}  latent {in_latent} = {latent_img}+{state_dim}  "
           f"features {feat}  n_cog {n_cog}")
-    return ServingCritic(enc, critic, target, q_of, sd["feat_mu"].to(dev),
-                         sd["feat_sd"].to(dev), n_cog, sd, dev)
+    print(f"  [critic] 액션 창 {window} 스텝 x {ck_a} 관절 = {action_full}차원 "
+          f"(체크포인트 기준)  |  실행 구간 [{exec_off}, {exec_off + replan}) (yaml 기준)")
+    c = ServingCritic(enc, critic, target, q_of, sd["feat_mu"].to(dev),
+                      sd["feat_sd"].to(dev), n_cog, sd, dev)
+    c.window, c.full, c.action_dim = window, action_full, ck_a
+    return c
