@@ -1,0 +1,49 @@
+{
+    "state": {
+        "eef_position": {
+            "start": 0,
+            "end": 3,
+            "original_key": "observation.state"
+        },
+        "eef_rotation": {
+            "start": 3,
+            "end": 9,
+            "original_key": "observation.state"
+        },
+        "hand_joints": {
+            "start": 9,
+            "end": 25,
+            "original_key": "observation.state"
+        }
+    },
+    "action": {
+        "eef_position": {
+            "start": 0,
+            "end": 3,
+            "original_key": "action"
+        },
+        "eef_rotation": {
+            "start": 3,
+            "end": 9,
+            "original_key": "action"
+        },
+        "hand_joints": {
+            "start": 9,
+            "end": 25,
+            "original_key": "action"
+        }
+    },
+    "video": {
+        "camera_front": {
+            "original_key": "observation.images.camera_front"
+        },
+        "camera_wrist": {
+            "original_key": "observation.images.camera_wrist"
+        }
+    },
+    "annotation": {
+        "human.task_description": {
+            "original_key": "task_index"
+        }
+    }
+}
