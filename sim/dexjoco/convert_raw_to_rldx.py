@@ -106,11 +106,28 @@ TASK_PROMPTS = {
     "fold_glasses": "Fold the glasses and place them into the case.",
 }
 
-# DexJoCo camera name (raw videos/<name>.mp4) -> RLDX-1 modality key.
-# Only cameras the *policy-mode* env actually produces are usable: the raw demo
-# dirs also carry ego_left/ego_right, but e.g. panda_water_plant_env only renders
-# wrist + front at rollout time, so training on ego views would be unservable.
-CAMERA_KEYS = {"front": "camera_front", "wrist": "camera_wrist"}
+# RLDX-1 modality keys, assigned positionally to --cameras. Keeping them fixed
+# across tasks means one modality config (dexjoco_panda_allegro_config.py) covers
+# every single-arm task even where the third-person source camera differs.
+# camera_front = the third-person view, camera_wrist = the wrist view.
+DEFAULT_CAMERA_KEYS = ["camera_front", "camera_wrist"]
+
+# Raw camera names (videos/<name>.mp4) per task, copied from dexjoco's own
+# dexjoco-data-converter/configs/rand_obj/selected_data.yaml so a checkpoint
+# trained here sees the same views the benchmark's eval yaml serves.
+# click_mouse is the odd one out: the monitor occludes `front`, so upstream uses
+# the ego_right view as the base camera. Only cameras the *policy-mode* env
+# actually renders are usable — the raw demo dirs carry ego_left/ego_right for
+# every task, but e.g. panda_water_plant_env only produces wrist + front at
+# rollout time, so training water_plant on ego views would be unservable.
+TASK_CAMERAS = {
+    "hammer_nail": ["front", "wrist"],
+    "water_plant": ["front", "wrist"],
+    "pick_bucket": ["front", "wrist"],
+    "pinch_tongs": ["front", "wrist"],
+    "fold_glasses": ["front", "wrist"],
+    "click_mouse": ["ego_right", "wrist"],
+}
 
 CHUNK_SIZE = 1000
 
@@ -125,8 +142,10 @@ class Config:
     """Task name; selects the language instruction."""
     prompt: str | None = None
     """Override the language instruction (default: TASK_PROMPTS[task])."""
-    cameras: list[str] = field(default_factory=lambda: ["front", "wrist"])
-    """Raw camera names to convert, in order."""
+    cameras: list[str] | None = None
+    """Raw camera names to convert, in order (default: TASK_CAMERAS[task]).
+    They map positionally onto DEFAULT_CAMERA_KEYS, so the first entry becomes
+    camera_front regardless of which raw view it comes from."""
     image_size: int = 256
     """Output video resolution (square). 256 -> 256*256 = the processor's default image_max_area,
     and a multiple of image_resize_m=32, so RLDX-1's AspectAreaResizeAndCrop is a no-op."""
@@ -382,6 +401,11 @@ def write_meta(
         "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
         "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
         "features": _features(cfg, camera_keys),
+        # Provenance, not read by RLDX-1: which raw dexjoco camera fed each key.
+        # Matters because click_mouse's camera_front is actually the ego_right view,
+        # so a rollout client must map the env's cameras the same way.
+        "dexjoco_task": cfg.task,
+        "dexjoco_cameras": dict(zip(camera_keys, cfg.cameras or [])),
     }
     (cfg.output / "meta").mkdir(parents=True, exist_ok=True)
     (cfg.output / "meta/info.json").write_text(json.dumps(info, indent=4))
@@ -405,7 +429,14 @@ def main(cfg: Config) -> None:
         if not cfg.overwrite:
             raise SystemExit(f"{cfg.output} is not empty (pass --overwrite to replace)")
         shutil.rmtree(cfg.output)
-    camera_keys = [CAMERA_KEYS[c] for c in cfg.cameras]
+    if cfg.cameras is None:
+        cfg.cameras = list(TASK_CAMERAS[cfg.task])
+    if len(cfg.cameras) != len(DEFAULT_CAMERA_KEYS):
+        raise SystemExit(
+            f"--cameras must have {len(DEFAULT_CAMERA_KEYS)} entries "
+            f"(mapped positionally onto {DEFAULT_CAMERA_KEYS}), got {cfg.cameras}"
+        )
+    camera_keys = list(DEFAULT_CAMERA_KEYS)
     (cfg.output / "meta").mkdir(parents=True, exist_ok=True)
 
     episodes_meta: list[dict[str, Any]] = []
