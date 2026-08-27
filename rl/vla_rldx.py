@@ -338,7 +338,7 @@ class ExpoServer:
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
-                 log_every: int = 25):
+                 log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -405,6 +405,9 @@ class ExpoServer:
         self.calls, self.ms, self.q, self.with_edit = 0, [], [], []
         self.guide_steps, self.guide_move, self.guide_all = guide_steps, guide_move, guide_all
         self.log_every = max(1, log_every)
+        # 실기 관측을 저장해 두면 오프라인에서 학습 데이터와 직접 대조할 수 있다.
+        # critic 이 실기에서 OOD 인 이유(전처리 차이 vs 데이터 커버리지)를 가르는 유일한 길이다.
+        self.dump_obs, self.dump_n, self.dumped = dump_obs, dump_n, []
         self.guide_gain = []
 
         print(f"  [정책] {Path(model_path).name}")
@@ -532,7 +535,10 @@ class ExpoServer:
         f = pred["backbone_features"][:1].clone()
         state = torch.from_numpy(normalize_states(
             self.vla.proc, self.vla.tag, self.mod, _cat_state(request.obs, self.mod))).to(f.device)
-        lat = C.latent(C.cog_of(f), state)
+        cog = C.cog_of(f)
+        lat = C.latent(cog, state)
+        if self.dump_obs is not None and len(self.dumped) < self.dump_n:
+            self._dump(request, cog, state, acts)
         rl_, rs = lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0)
 
         def score(a):                                  # (B,n,full) → (B,n) 앙상블 min
@@ -555,18 +561,48 @@ class ExpoServer:
         best = q.argmax(dim=1)
         chosen = acts[torch.arange(B, device=acts.device), best]
 
-        gain, gstd = 0.0, 0.0
+        # 편집 **전** 앙상블 불일치. 이게 이미 크면 그 상태 자체가 critic 의 학습 분포
+        # 밖이라는 뜻이고, 편집 후에만 커지면 guidance 가 밀어낸 것이다 — 원인이 다르다.
+        with torch.no_grad():
+            base_sel = acts[torch.arange(B, device=acts.device), best_pre]
+            std_pre = float(C.q(lat, state, base_sel, target=True).std(0).mean())
+
+        gain, gstd = 0.0, std_pre
         if self.guide_steps > 0:
             if not self.guide_all:
                 chosen, _ = self._cog_guide(lat, state, chosen)
             with torch.no_grad():
                 qf = C.q(lat, state, chosen, target=True)
                 gain = float(qf.min(0).values.mean()) - q0
-                gstd = float(qf.std(0).mean())          # 앙상블 불일치 = 외삽 신호
+                gstd = float(qf.std(0).mean())
         return chosen, best, {"chosen_q": q0 + gain,
                               "candidate_q_std": float(q_pre.std(dim=1).mean()),
                               "guide_gain": gain, "guide_ens_std": gstd,
+                              "ens_std_pre": std_pre,
                               "select_ratio_with_residual": 0.0}
+
+    def _dump(self, request, cog, state, acts):
+        """실기 관측 한 프레임을 모은다. dump_n 개가 차면 npz 로 쓴다.
+
+        저장하는 것: 원본 uint8 카메라 프레임(프로세서 통과 **전**), 정규화된 state,
+        서버가 계산한 cog feature, base 후보 청크. 오프라인에서
+        `verify-cog --real-obs` 가 이걸 먹어 학습 데이터와 나란히 비교한다.
+        """
+        cams = {nm: np.asarray(request.obs["video"][nm])[:, -1][0]
+                for nm, _ in self.mod.video}          # (H,W,3) uint8 원본
+        self.dumped.append({"cog": cog[0].float().cpu().numpy(),
+                            "state": state[0].float().cpu().numpy(),
+                            "acts": acts[0].float().cpu().numpy(),
+                            **{f"cam_{k}": v for k, v in cams.items()}})
+        if len(self.dumped) >= self.dump_n:
+            out = {k: np.stack([d[k] for d in self.dumped])
+                   for k in self.dumped[0]}
+            self.dump_obs.parent.mkdir(parents=True, exist_ok=True)
+            np.savez_compressed(self.dump_obs, **out)
+            sz = self.dump_obs.stat().st_size / 1e6
+            print(f"[덤프] 실기 관측 {len(self.dumped)} 프레임 → {self.dump_obs} ({sz:.1f}MB)\n"
+                  f"       오프라인 대조: python -m rl.vla_rldx verify-cog ... "
+                  f"--real-obs {self.dump_obs}", flush=True)
 
     def _cog_guide(self, lat, state, act):
         """test-time Q guidance — ∇_A Q 상승 + keep-best. (편집 액션, 최종 Q)
@@ -648,12 +684,14 @@ class ExpoServer:
             # guide Δ / 앙상블std 비율이 1 미만이면 그 개선은 앙상블 노이즈 안이다
             # ens.std 절대값이 핵심이다: 오프라인 검증에서 0.007~0.02 였는데 실기에서
             # 0.09~0.15 가 나오면 critic 이 학습 분포 밖이라는 뜻이다 (Δ/std 만 보면 놓친다).
-            gtxt = ("" if not info.get("guide_ens_std") else
+            sp = info.get("ens_std_pre")
+            gtxt = ("" if sp is None else
                     f"  guideΔ={info['guide_gain']:+.4f} "
-                    f"ens.std={info['guide_ens_std']:.4f} "
+                    f"ens.std {sp:.4f}->{info['guide_ens_std']:.4f} "
                     f"Δ/std={info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f}"
-                    + ("  ** OOD 의심 (오프라인 0.007~0.02)"
-                       if info["guide_ens_std"] > 0.05 else ""))
+                    + ("  ** 상태가 OOD (편집 전부터 크다. 오프라인 0.007~0.02)"
+                       if sp > 0.05 else
+                       "  ** 편집이 OOD 로 밀어냄" if info["guide_ens_std"] > 0.05 else ""))
             # cog 모드는 edit 후보를 만들지 않는다 (residual policy 미사용) — 표시도 그렇게.
             ncand = f"{n}" if self.cog is not None else f"{n}+{min(self.cfg.n_edit_samples, n)}"
             print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand} "
@@ -693,6 +731,9 @@ def _verify_cog(argv: list[str]) -> int:
     p.add_argument("--critic", required=True, help="work 기준 상대경로도 된다")
     p.add_argument("--model-path", default="")
     p.add_argument("--frames", type=int, default=64)
+    p.add_argument("--real-obs", type=Path,
+                   help="serve --dump-obs 로 모은 실기 관측 npz. 주면 학습 데이터와 나란히 "
+                        "비교한다 (cog feature 분포 / Q / 앙상블 std / 후보 판별력)")
     p.add_argument("--device", default="cuda")
     a = p.parse_args(argv)
     dev = a.device
@@ -857,6 +898,43 @@ def _verify_cog(argv: list[str]) -> int:
               f"(서빙은 후보 8개 = {ms*8/len(idx):.1f}ms 예상)")
         ok &= worse == 0
 
+    # --- 7) 실기 관측 대조 (--real-obs) ---
+    if a.real_obs is not None:
+        z = np.load(a.real_obs)
+        rcog = torch.from_numpy(z["cog"]).to(dev)
+        rst = torch.from_numpy(z["state"]).to(dev)
+        racts = torch.from_numpy(z["acts"]).to(dev)          # (F, n_cand, full)
+        print(f"\n[실기 대조] {a.real_obs.name}  프레임 {len(rcog)}  "
+              f"후보 {racts.shape[1]}  cog {rcog.shape[1]}차원")
+        rlat = C.latent(rcog, rst)
+        F_, N_ = racts.shape[0], racts.shape[1]
+        with torch.no_grad():
+            rq = C.q(rlat.repeat_interleave(N_, 0), rst.repeat_interleave(N_, 0),
+                     racts.reshape(F_ * N_, -1), target=True)
+            rq_min = rq.min(0).values.view(F_, N_)
+            rq_std = rq.std(0).view(F_, N_)
+            dq_min = C.q(lat_t, st, act, target=True)
+        # 표준화된 cog feature 의 크기 — 학습 분포에서 얼마나 떨어졌나
+        zr = ((rcog - C.mu) / C.sd)
+        zd = ((torch.from_numpy(truth).to(dev) - C.mu) / C.sd)
+        print(f"{'':26} {'학습 데이터':>14} {'실기':>14}   배수")
+        rows = [("표준화 cog |z| 평균", float(zd.abs().mean()), float(zr.abs().mean())),
+                ("표준화 cog |z| p99", float(zd.abs().quantile(0.99)), float(zr.abs().quantile(0.99))),
+                ("Q (앙상블 min)", float(dq_min.min(0).values.mean()), float(rq_min.mean())),
+                ("앙상블 std", float(dq_min.std(0).mean()) if dq_min.dim() > 1 else 0.0,
+                 float(rq_std.mean())),
+                ("후보간 Q std", 0.0, float(rq_min.std(dim=1).mean()))]
+        with torch.no_grad():
+            ds = C.q(lat_t, st, act, target=True).std(0).mean().item()
+        rows[3] = ("앙상블 std", ds, float(rq_std.mean()))
+        for nm, dv, rv in rows:
+            r = f"{rv/dv:>6.1f}배" if dv > 1e-9 else "     —"
+            print(f"{nm:26} {dv:>14.4f} {rv:>14.4f}   {r}")
+        bad = float(rq_std.mean()) > 3 * ds
+        print(f"\n  판정: {'** critic 이 실기에서 학습 분포 밖이다' if bad else 'OOD 아님'}")
+        print("  |z| 가 같이 커졌으면 **입력(이미지 전처리/장면)** 이 다른 것이고,")
+        print("  |z| 는 비슷한데 앙상블 std 만 커졌으면 **데이터 커버리지** 문제다.")
+
     print(f"\n[결과] {'배선이 학습 경로를 재현한다' if ok else '** 어긋난 단계가 있다 (위 참고)'}")
     if ok:
         print("  검증한 것 : 같은 이미지에서 학습 경로와 비트 단위로 같은 latent/Q/선택")
@@ -904,6 +982,12 @@ def _serve(argv: list[str]) -> int:
                         "**실기에서 0.05 / 0.1 / 0.2 를 쓸어보고 정할 값이다**: "
                         "로그의 Δ/std 가 1 이상이고 ens.std 증가가 2배 미만인 구간을 쓸 것. "
                         "keep-best 라 Q 가 나빠지면 원본을 유지한다")
+    p.add_argument("--dump-obs", type=Path,
+                   help="실기 관측 첫 --dump-n 프레임을 npz 로 저장한다 (원본 카메라 프레임 + "
+                        "state + 서버가 계산한 cog feature + 후보 청크). 오프라인에서 "
+                        "`verify-cog --real-obs <npz>` 로 학습 데이터와 대조해 critic 이 "
+                        "실기에서 OOD 인 이유를 가른다")
+    p.add_argument("--dump-n", type=int, default=64, help="덤프할 프레임 수")
     p.add_argument("--log-every", type=int, default=25,
                    help="[EXPO] 한 줄을 몇 호출마다 찍을지. 1 이면 매 스텝 (진단용)")
     p.add_argument("--rtc-exec-horizon", type=int, default=0,
@@ -927,7 +1011,7 @@ def _serve(argv: list[str]) -> int:
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
-                     log_every=a.log_every)
+                     log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n)
     srv.run(a.host, a.port)
     return 0
 
