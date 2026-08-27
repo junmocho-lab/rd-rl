@@ -338,7 +338,8 @@ class ExpoServer:
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
-                 log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64):
+                 log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64,
+                 ood_ref: float = 0.0):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -408,6 +409,13 @@ class ExpoServer:
         # 실기 관측을 저장해 두면 오프라인에서 학습 데이터와 직접 대조할 수 있다.
         # critic 이 실기에서 OOD 인 이유(전처리 차이 vs 데이터 커버리지)를 가르는 유일한 길이다.
         self.dump_obs, self.dump_n, self.dumped = dump_obs, dump_n, []
+        # OOD 기준선: critic 이 **학습 분포 안**에서 보이는 앙상블 불일치.
+        # 체크포인트에 기록돼 있으면 그것을 쓴다 (offline_iql 이 홀드아웃에서 재서 저장).
+        # 없으면 --ood-ref, 그것도 없으면 실측 범위(0.007~0.02)의 보수적 상한 0.02.
+        self.ood_ref = ood_ref or (
+            float(self.cog.meta.get("ens_std_ref") or 0.0) if self.cog is not None else 0.0
+        ) or 0.02
+        self.hist = []
         self.guide_gain = []
 
         print(f"  [정책] {Path(model_path).name}")
@@ -426,6 +434,14 @@ class ExpoServer:
         print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
         if self.loaded:
             print(f"  [산출물] {artifacts} 에서 {self.loaded} 로드")
+        if self.cog is not None:
+            print(f"  [진단 기준] 학습 분포 안에서의 앙상블 std = {self.ood_ref:.4f}"
+                  + ("  (체크포인트 기록)" if self.cog.meta.get("ens_std_ref") else
+                     "  (기본값 — 실측 0.007~0.02)"))
+            print(f"              실기에서 이 값의 2배 이내면 정상, 5배 넘으면 critic 을 "
+                  f"믿을 수 없다")
+            print(f"              카메라 전처리가 학습과 같은지: 아래 "
+                  f"[AspectAreaResizeAndCrop] 이 (192, 320) → crop (192, 320) 이어야 한다")
         if self.cog is not None and self.guide_steps > 0:
             print(f"  [guidance] test-time ∇_A Q 상승 {self.guide_steps}스텝, "
                   f"차원당 목표 이동 {self.guide_move} "
@@ -678,6 +694,10 @@ class ExpoServer:
         dt = (time.time() - t0) * 1000
         self.calls += 1
         self.ms.append(dt)
+        if self.cog is not None:
+            self.hist.append((info.get("ens_std_pre") or 0.0,
+                              info["candidate_q_std"], info["chosen_q"],
+                              info.get("guide_gain") or 0.0))
         self.q.append(info["chosen_q"])
         self.with_edit.append(info["select_ratio_with_residual"])
         if self.verbose or self.calls <= 3 or self.calls % self.log_every == 0:
@@ -697,6 +717,19 @@ class ExpoServer:
             print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand} "
                   f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.4f} "
                   f"후보간Qstd={info['candidate_q_std']:.4f}{gtxt}", flush=True)
+        # --- 진단 요약: 학습 분포 안이었나 ---------------------------------------
+        if self.cog is not None and self.calls % self.log_every == 0:
+            h = np.asarray(self.hist[-self.log_every:])
+            std, cstd, q, gd = (float(np.median(h[:, i])) for i in range(4))
+            r = self.ood_ref
+            v = ("정상 (학습 분포 안)" if std <= 2 * r else
+                 "경계" if std <= 5 * r else "** OOD (critic 을 믿을 수 없다)")
+            print(f"[진단] 최근 {len(h)}호출 중앙값 | ens.std {std:.4f} (기준 {r:.4f}, "
+                  f"{std/r:.1f}배) | 후보간Qstd {cstd:.4f} | Q {q:+.4f} | guideΔ {gd:+.4f}"
+                  f"  → {v}", flush=True)
+            if std > 2 * r:
+                print(f"        후보간Qstd 가 {cstd:.4f} 로 0 에 가까우면 critic 이 액션을 "
+                      f"구분하지 못한다 = 선택·guidance 둘 다 무의미", flush=True)
         return pred, reset_memory
 
     def run(self, host: str, port: int) -> None:
@@ -731,6 +764,12 @@ def _verify_cog(argv: list[str]) -> int:
     p.add_argument("--critic", required=True, help="work 기준 상대경로도 된다")
     p.add_argument("--model-path", default="")
     p.add_argument("--frames", type=int, default=64)
+    p.add_argument("--simulate-rrc", action="store_true",
+                   help="데이터셋 프레임에 **실기 전처리를 재현**해서 critic 이 얼마나 망가지는지 "
+                        "본다 (로봇 불필요). rrc 는 1280x720 을 341x192 로 줄여 보내고 프로세서가 "
+                        "320 으로 크롭한다. 데이터셋은 전체 FOV 를 320x192 로 찌그러뜨린 것이라 "
+                        "**같은 장면인데 기하가 다르다**. 여기서 앙상블 std 가 실기 수준(0.1대)으로 "
+                        "뛰면 resize 가 원인이라는 증명이 된다")
     p.add_argument("--real-obs", type=Path,
                    help="serve --dump-obs 로 모은 실기 관측 npz. 주면 학습 데이터와 나란히 "
                         "비교한다 (cog feature 분포 / Q / 앙상블 std / 후보 판별력)")
@@ -785,33 +824,61 @@ def _verify_cog(argv: list[str]) -> int:
     print(f"\n[검증] 프레임 {len(idx)}개  n_cog {n_cog}  features {C.meta['features']}")
     ok = True
 
+    def _rrc(x):
+        """데이터셋 프레임 (B,H,W,3) → 실기 전처리를 재현한 프레임.
+
+        데이터셋은 1280x720 전체 FOV 를 320x192 로 **찌그러뜨린** 것이고, 실기는 같은 FOV 를
+        341x192 로 줄인 뒤 320 으로 **센터 크롭**한다. 그래서 되펴고(320→341) 자른다.
+        """
+        import cv2 as _cv
+        h, w = x.shape[1], x.shape[2]
+        w2 = int(round(w * (1280 / 720) / (w / h)))       # 원래 종횡비로 되펴기
+        out = np.stack([_cv.resize(f, (w2, h), interpolation=_cv.INTER_AREA) for f in x])
+        o = (w2 - w) // 2
+        return out[:, :, o:o + w]                         # 센터 크롭
+
+    def _obs(k):
+        x = np.asarray(imgs[k])
+        if a.simulate_rrc:
+            x = np.stack([_rrc(x[:, c]) for c in range(x.shape[1])], axis=1)
+        return {"video": {nm: x[:, ci][:, None] for ci, (nm, _) in enumerate(mod.video)},
+                "state": {nm: flat.state[k][:, None, s0:e0]
+                          for nm, s0, e0 in mod.offsets("state")},
+                "language": {mod.task_key: [[task]] * len(k)}}
+
+    if a.simulate_rrc:
+        _p = _rrc(np.asarray(imgs[idx[:1]])[:, 0])
+        print(f"  [실기 재현] 데이터셋 {tuple(np.asarray(imgs[idx[:1]])[:, 0].shape[1:])} "
+              f"→ 되펴고 크롭 → {tuple(_p.shape[1:])}  (VLA 프로세서 통과 전)")
+
     # --- 1) cog feature ---
     grabbed = []
     for c in range(0, len(idx), 8):
         k = idx[c:c + 8]
-        x = np.asarray(imgs[k])
-        obs = {"video": {nm: x[:, ci][:, None] for ci, (nm, _) in enumerate(mod.video)},
-               "state": {nm: flat.state[k][:, None, s0:e0]
-                         for nm, s0, e0 in mod.offsets("state")},
-               "language": {mod.task_key: [[task]] * len(k)}}
         with torch.no_grad():
-            out = vla.runtime._forward(vla._collate(obs))
+            out = vla.runtime._forward(vla._collate(_obs(k)))
         grabbed.append(C.cog_of(out["backbone_features"].clone()).cpu().numpy())
     served = np.concatenate(grabbed)
     truth = np.asarray(fp[idx])
     d = np.abs(served - truth)
     rel = d.max() / max(np.abs(truth).max(), 1e-9)
-    print(f"  1) cog feature   최대 절대차 {d.max():.3e}  상대 {rel:.3e}  "
-          f"{'OK' if rel < 1e-3 else '** 불일치'}")
-    ok &= rel < 1e-3
+    if a.simulate_rrc:
+        print(f"  1) cog feature   실기 재현 vs 학습 데이터: 최대 절대차 {d.max():.3e}  "
+              f"상대 {rel:.3e}  (차이가 클수록 전처리가 feature 를 바꾼다는 뜻)")
+    else:
+        print(f"  1) cog feature   최대 절대차 {d.max():.3e}  상대 {rel:.3e}  "
+              f"{'OK' if rel < 1e-3 else '** 불일치'}")
+        ok &= rel < 1e-3
 
     # --- 2) latent, 3) Q ---
     st = torch.from_numpy(snorm[idx]).to(dev)
     lat_s = C.latent(torch.from_numpy(served).to(dev), st)
     lat_t = C.latent(torch.from_numpy(truth).to(dev), st)
     dl = (lat_s - lat_t).abs().max().item()
-    print(f"  2) latent        최대 절대차 {dl:.3e}  {'OK' if dl < 1e-2 else '** 불일치'}")
-    ok &= dl < 1e-2
+    print(f"  2) latent        최대 절대차 {dl:.3e}"
+          + ("" if a.simulate_rrc else f"  {'OK' if dl < 1e-2 else '** 불일치'}"))
+    if not a.simulate_rrc:
+        ok &= dl < 1e-2
 
     act = torch.from_numpy(np.ascontiguousarray(
         np.asarray(norm[idx])[:, :C.window].reshape(len(idx), -1))).to(dev)
@@ -819,10 +886,21 @@ def _verify_cog(argv: list[str]) -> int:
         q_s = C.q(lat_s, st, act).min(0).values
         q_t = C.q(lat_t, st, act).min(0).values
     dq = (q_s - q_t).abs()
-    print(f"  3) Q(로그 액션)  최대 절대차 {dq.max():.3e}  평균 {dq.mean():.3e}  "
-          f"Q 범위 [{q_t.min():.3f},{q_t.max():.3f}]  "
-          f"{'OK' if dq.max() < 1e-2 else '** 불일치'}")
-    ok &= dq.max().item() < 1e-2
+    if a.simulate_rrc:
+        with torch.no_grad():
+            sd_s = C.q(lat_s, st, act, target=True).std(0)
+            sd_t = C.q(lat_t, st, act, target=True).std(0)
+        print(f"  3) Q            학습 {q_t.mean():+.4f} → 실기재현 {q_s.mean():+.4f}  "
+              f"(차 {dq.mean():+.4f})")
+        print(f"     앙상블 std   학습 {sd_t.mean():.4f} → 실기재현 {sd_s.mean():.4f}  "
+              f"({sd_s.mean()/sd_t.mean().clamp_min(1e-9):.1f}배)")
+        print(f"     ** 실기 로그의 앙상블 std 는 0.12~0.23 이었다. 여기서 그 수준이 나오면\n"
+              f"        resize/크롭 이 원인이고, 안 나오면 데이터 커버리지 문제다.")
+    else:
+        print(f"  3) Q(로그 액션)  최대 절대차 {dq.max():.3e}  평균 {dq.mean():.3e}  "
+              f"Q 범위 [{q_t.min():.3f},{q_t.max():.3f}]  "
+              f"{'OK' if dq.max() < 1e-2 else '** 불일치'}")
+        ok &= dq.max().item() < 1e-2
 
     # --- 4) 후보 선택이 같은 인덱스를 고르나 ---
     g = torch.Generator(device=dev).manual_seed(0)
@@ -982,6 +1060,10 @@ def _serve(argv: list[str]) -> int:
                         "**실기에서 0.05 / 0.1 / 0.2 를 쓸어보고 정할 값이다**: "
                         "로그의 Δ/std 가 1 이상이고 ens.std 증가가 2배 미만인 구간을 쓸 것. "
                         "keep-best 라 Q 가 나빠지면 원본을 유지한다")
+    p.add_argument("--ood-ref", type=float, default=0.0,
+                   help="학습 분포 안에서의 앙상블 std 기준선. 0 이면 체크포인트의 "
+                        "ens_std_ref, 그것도 없으면 0.02 (실측 0.007~0.02 의 상한). "
+                        "실기 값이 이것의 2배 이내여야 critic 을 믿을 수 있다")
     p.add_argument("--dump-obs", type=Path,
                    help="실기 관측 첫 --dump-n 프레임을 npz 로 저장한다 (원본 카메라 프레임 + "
                         "state + 서버가 계산한 cog feature + 후보 청크). 오프라인에서 "
@@ -1011,7 +1093,8 @@ def _serve(argv: list[str]) -> int:
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
-                     log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n)
+                     log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n,
+                     ood_ref=a.ood_ref)
     srv.run(a.host, a.port)
     return 0
 

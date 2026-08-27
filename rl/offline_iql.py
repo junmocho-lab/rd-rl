@@ -534,6 +534,16 @@ for step in range(1, a.steps + 1):
         qc = {e: c[0] for e, c in curves.items()}            # Q(min) — AUC 는 이걸 쓴다
         qmc = {e: c[1] for e, c in curves.items()}           # Q(mean)
         vc = {e: c[2] for e, c in curves.items()}
+        # 홀드아웃의 로그된 액션에서 앙상블 std 를 잰다 = "분포 안" 기준선
+        with torch.no_grad():
+            _k = np.concatenate([fr[::max(1, len(fr) // 8)] for _, fr, _ in eps])[:512]
+            _kk = torch.as_tensor(_k, device=dev)
+            _h = enc(enc_in(_kk), stop_gradient=True)
+            if a.features:
+                _h = torch.cat([_h, st(_kk)], -1)
+            ens_std_ref = float(q_of(critic(_h, st(_kk), act(_kk))).std(0).mean())
+        print(f"  [OOD 기준] 홀드아웃 로그 액션의 앙상블 std = {ens_std_ref:.4f} "
+              f"(서빙이 실기 값과 비교한다)")
         fin = np.array([qc[e][-1] for e, _, _ in eps])
         okm = np.array([o for _, _, o in eps])
         sq, fq = fin[okm], fin[~okm]
@@ -567,7 +577,10 @@ for step in range(1, a.steps + 1):
                     # 다운스트림(probe_actopt / relabel_parl)이 같은 latent 를 재현하려면
                     # feature 이름과 표준화 통계가 필요하다. 없으면 Q 가 학습 때와 달라진다.
                     "features": a.features, "feat_mu": None if FEAT is None else MU.cpu(),
-                    "feat_sd": None if FEAT is None else SD.cpu()}, tmp)
+                    "feat_sd": None if FEAT is None else SD.cpu(),
+                    # 학습 분포 안에서의 앙상블 불일치. 서빙이 이 값과 실기 값을 비교해
+                    # critic 이 OOD 인지 판정한다 (rl/vla_rldx.py ExpoServer.ood_ref).
+                    "ens_std_ref": ens_std_ref}, tmp)
         os.replace(tmp, ck)
         # 최신 포인터. 고정 이름을 원하는 다운스트림(probe_pairs 등)이 쓸 수 있게 둔다.
         lnk, ltmp = run / "critic_latest.pt", run / "critic_latest.pt.tmp"

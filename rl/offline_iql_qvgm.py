@@ -287,6 +287,12 @@ for step in range(1, a.steps + 1):
                     qs.append(critic(l, act_of(kk)).min(0).values.sum(-1).float().cpu().numpy())
                     vs.append(value(l).sum(-1).float().cpu().numpy())
                 curves[e] = (np.concatenate(qs), np.concatenate(vs))
+        with torch.no_grad():
+            _k = torch.as_tensor(
+                np.concatenate([fr[::max(1, len(fr) // 8)] for _, fr, _ in eps])[:512],
+                device=dev)
+            ens_std_ref = float(critic(lat_of(_k), act_of(_k)).sum(-1).std(0).mean())
+        print(f"  [OOD 기준] 홀드아웃 로그 액션의 앙상블 std = {ens_std_ref:.4f}")
         fin = np.array([curves[e][0][-1] for e, _, _ in eps])
         okm = np.array([o for _, _, o in eps])
         auc = float((fin[okm][:, None] > fin[~okm][None, :]).mean())
@@ -324,7 +330,8 @@ for step in range(1, a.steps + 1):
                     "state_dim": snorm.shape[1], "latent": a.latent, "tag": TAG,
                     "hidden_dims": list(cfg.hidden_dims),
                     "critic_layer_norm": cfg.critic_layer_norm,
-                    "features": a.features, "feat_mu": MU.cpu(), "feat_sd": SD.cpu()}, tmp)
+                    "features": a.features, "feat_mu": MU.cpu(), "feat_sd": SD.cpu(),
+                    "ens_std_ref": ens_std_ref}, tmp)
         os.replace(tmp, ck)
         lnk, ltmp = run / "critic_latest.pt", run / "critic_latest.pt.tmp"
         ltmp.unlink(missing_ok=True)
