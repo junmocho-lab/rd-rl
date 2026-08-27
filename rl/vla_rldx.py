@@ -339,7 +339,7 @@ class ExpoServer:
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
                  log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64,
-                 ood_ref: float = 0.0):
+                 ood_ref: float = 0.0, ood_gate: float = 0.0):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -416,6 +416,14 @@ class ExpoServer:
             float(self.cog.meta.get("ens_std_ref") or 0.0) if self.cog is not None else 0.0
         ) or 0.02
         self.hist = []
+        # OOD 게이트: 편집 전 앙상블 std 가 기준의 이 배수를 넘으면 **guidance 를 건너뛴다**.
+        # 실측 근거(실기 60호출): ens.std <= 0.04 인 호출은 후보간Qstd 중앙 0.0171,
+        # Δ/std 중앙 2.49, 7개 중 4개가 Δ/std>1 이었다. ens.std > 0.04 인 호출은 각각
+        # 0.0016 / 0.04 / 8개 중 1개였다. log(ens.std) 와 log(후보간Qstd) 의 상관 -0.43 —
+        # OOD 일수록 분포형 헤드가 포화해 액션 민감도가 사라진다. 그런 상태에서 편집하면
+        # 방향 정보 없이 액션만 흔드는 것이므로, base BC 로 폴백하는 게 낫다.
+        self.ood_gate = ood_gate
+        self.gated = 0
         self.guide_gain = []
 
         print(f"  [정책] {Path(model_path).name}")
@@ -429,8 +437,21 @@ class ExpoServer:
               f"exec_horizon={self.runtime.rtc_exec_horizon}  "
               f"(delay = rrc 의 inference_latency_steps, "
               f"exec_horizon = rrc 의 execution_horizon 이어야 한다)")
-        print(f"  [선택] N={self.cfg.N} + edit={self.cfg.n_edit_samples} "
-              f"(edit_scale={self.cfg.edit_scale}) → target critic argmax")
+        if self.cog is not None:
+            # cog 모드는 residual(edit) 후보를 만들지 않는다 — 시작 로그도 그렇게.
+            print(f"  [선택] base 후보 N={self.cfg.N} → target critic argmax "
+                  f"(edit 후보 미사용)")
+            print(f"         실측 경고: base 후보 8개의 차원당 표준편차 중앙값이 0.018 "
+                  f"(= 0.8 프레임치) 다.\n"
+                  f"         후보들이 이만큼 비슷하면 critic 이 구분하지 못해 argmax 가 "
+                  f"사실상 랜덤이 된다 —\n"
+                  f"         로그의 후보간Qstd 가 0 에 가까우면 그 상황이다. "
+                  f"그때는 guidance 만 유효하고,\n"
+                  f"         --guide-move 가 0.018 보다 **충분히 커야** 편집이 재샘플링과 "
+                  f"구분된다")
+        else:
+            print(f"  [선택] N={self.cfg.N} + edit={self.cfg.n_edit_samples} "
+                  f"(edit_scale={self.cfg.edit_scale}) → target critic argmax")
         print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
         if self.loaded:
             print(f"  [산출물] {artifacts} 에서 {self.loaded} 로드")
@@ -584,7 +605,10 @@ class ExpoServer:
             std_pre = float(C.q(lat, state, base_sel, target=True).std(0).mean())
 
         gain, gstd = 0.0, std_pre
-        if self.guide_steps > 0:
+        skip = self.ood_gate > 0 and std_pre > self.ood_gate * self.ood_ref
+        if skip:
+            self.gated += 1
+        if self.guide_steps > 0 and not skip:
             if not self.guide_all:
                 chosen, _ = self._cog_guide(lat, state, chosen)
             with torch.no_grad():
@@ -594,7 +618,7 @@ class ExpoServer:
         return chosen, best, {"chosen_q": q0 + gain,
                               "candidate_q_std": float(q_pre.std(dim=1).mean()),
                               "guide_gain": gain, "guide_ens_std": gstd,
-                              "ens_std_pre": std_pre,
+                              "ens_std_pre": std_pre, "gated": skip,
                               "select_ratio_with_residual": 0.0}
 
     def _dump(self, request, cog, state, acts):
@@ -709,7 +733,8 @@ class ExpoServer:
                     f"  guideΔ={info['guide_gain']:+.4f} "
                     f"ens.std {sp:.4f}->{info['guide_ens_std']:.4f} "
                     f"Δ/std={info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f}"
-                    + ("  ** 상태가 OOD (편집 전부터 크다. 오프라인 0.007~0.02)"
+                    + ("  ** 게이트: 편집 건너뜀 (상태 OOD)" if info.get("gated") else
+                       "  ** 상태가 OOD (편집 전부터 크다. 오프라인 0.007~0.02)"
                        if sp > 0.05 else
                        "  ** 편집이 OOD 로 밀어냄" if info["guide_ens_std"] > 0.05 else ""))
             # cog 모드는 edit 후보를 만들지 않는다 (residual policy 미사용) — 표시도 그렇게.
@@ -727,9 +752,13 @@ class ExpoServer:
             print(f"[진단] 최근 {len(h)}호출 중앙값 | ens.std {std:.4f} (기준 {r:.4f}, "
                   f"{std/r:.1f}배) | 후보간Qstd {cstd:.4f} | Q {q:+.4f} | guideΔ {gd:+.4f}"
                   f"  → {v}", flush=True)
-            if std > 2 * r:
-                print(f"        후보간Qstd 가 {cstd:.4f} 로 0 에 가까우면 critic 이 액션을 "
-                      f"구분하지 못한다 = 선택·guidance 둘 다 무의미", flush=True)
+            if self.ood_gate > 0:
+                print(f"        게이트: 지금까지 {self.gated}/{self.calls} 호출에서 편집을 "
+                      f"건너뜀 (ens.std > {self.ood_gate}x{r:.4f})", flush=True)
+            if std > 2 * r and cstd < 0.01:
+                print(f"        후보간Qstd {cstd:.4f} 가 0 에 가깝다 = critic 이 액션을 "
+                      f"구분하지 못한다 (분포형 헤드 포화). 편집해도 방향 정보가 없다",
+                      flush=True)
         return pred, reset_memory
 
     def run(self, host: str, port: int) -> None:
@@ -1064,6 +1093,13 @@ def _serve(argv: list[str]) -> int:
                    help="학습 분포 안에서의 앙상블 std 기준선. 0 이면 체크포인트의 "
                         "ens_std_ref, 그것도 없으면 0.02 (실측 0.007~0.02 의 상한). "
                         "실기 값이 이것의 2배 이내여야 critic 을 믿을 수 있다")
+    p.add_argument("--ood-gate", type=float, default=0.0,
+                   help="편집 전 앙상블 std 가 (--ood-ref x 이 배수) 를 넘으면 guidance 를 "
+                        "**건너뛰고 base BC 를 그대로 쓴다**. 0 이면 게이트 없음. "
+                        "실측(실기 60호출): ens.std<=0.04 구간은 Δ/std 중앙 2.49 로 편집이 "
+                        "유효했고, >0.04 구간은 0.04 로 무의미했다 (후보간Qstd 도 10배 작다 "
+                        "— OOD 에서 분포형 헤드가 포화해 액션 민감도가 사라진다). "
+                        "2 정도가 합리적 출발점이다 — 못 믿을 상태에서는 안 건드리는 게 낫다")
     p.add_argument("--dump-obs", type=Path,
                    help="실기 관측 첫 --dump-n 프레임을 npz 로 저장한다 (원본 카메라 프레임 + "
                         "state + 서버가 계산한 cog feature + 후보 청크). 오프라인에서 "
@@ -1094,7 +1130,7 @@ def _serve(argv: list[str]) -> int:
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
                      log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n,
-                     ood_ref=a.ood_ref)
+                     ood_ref=a.ood_ref, ood_gate=a.ood_gate)
     srv.run(a.host, a.port)
     return 0
 
