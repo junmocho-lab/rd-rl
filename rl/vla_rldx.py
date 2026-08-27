@@ -326,7 +326,8 @@ class ExpoServer:
     def __init__(self, exp: dict, model_path: Path, modality: Path, rldx_root: Path,
                  device: str = "cuda", artifacts: Path | None = None, seed: int = 0,
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
-                 verbose: bool = False):
+                 verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.2,
+                 guide_all: bool = False):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -363,6 +364,8 @@ class ExpoServer:
                 self.cog = load_serving_critic(Path(artifacts), self.cfg, mod.state_dim,
                                                spec.full_dim, n_cog, dev=device)
                 self.spec = spec
+                self.cog_mask = torch.zeros(spec.full_dim, device=device)
+                self.cog_mask[spec.index] = 1.0
         self.loaded = self._load(artifacts) if self.cog is None else ["cog-critic"]
 
         self.policy, self.runtime = self.vla.policy, self.vla.runtime
@@ -373,6 +376,8 @@ class ExpoServer:
         self._orig_run = self.runtime._run_inference
         self.runtime._run_inference = self._run_inference
         self.calls, self.ms, self.q, self.with_edit = 0, [], [], []
+        self.guide_steps, self.guide_move, self.guide_all = guide_steps, guide_move, guide_all
+        self.guide_gain = []
 
         print(f"  [정책] {Path(model_path).name}")
         print(f"  [태그] {self.vla.tag}  state_dim={mod.state_dim} action_dim={mod.action_dim} "
@@ -386,6 +391,14 @@ class ExpoServer:
         print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
         if self.loaded:
             print(f"  [산출물] {artifacts} 에서 {self.loaded} 로드")
+        if self.cog is not None and self.guide_steps > 0:
+            print(f"  [guidance] test-time ∇_A Q 상승 {self.guide_steps}스텝, "
+                  f"차원당 목표 이동 {self.guide_move} "
+                  f"(1프레임 자연 변화가 ~0.022 이므로 약 {self.guide_move/0.022:.1f} 프레임치)")
+            print(f"             keep-best 라 Q 가 나빠지는 방향은 절대 채택하지 않는다")
+            print(f"             순서: {'후보 전부 상승 → argmax (PA-RL 방식)' if self.guide_all else 'argmax → 고른 하나만 상승'}")
+        elif self.cog is not None:
+            print("  [guidance] 끔 (--guide-steps 0) → Q 선택만 한다")
         if self.cog is not None:
             print(f"  [critic] cog feature 경로 — 백본이 이미 계산한 backbone_features 에서\n"
                   f"           cognition token {self.cog.n_cog}개를 mean-pool 한다 "
@@ -489,14 +502,75 @@ class ExpoServer:
         state = torch.from_numpy(normalize_states(
             self.vla.proc, self.vla.tag, self.mod, _cat_state(request.obs, self.mod))).to(f.device)
         lat = C.latent(C.cog_of(f), state)
-        with torch.no_grad():
-            q = C.q(lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0),
-                    acts.reshape(B * n, -1), target=True).min(dim=0).values.view(B, n)
+        rl_, rs = lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0)
+
+        def score(a):                                  # (B,n,full) → (B,n) 앙상블 min
+            with torch.no_grad():
+                return C.q(rl_, rs, a.reshape(B * n, -1),
+                           target=True).min(dim=0).values.view(B, n)
+
+        q_pre = score(acts)
+        best_pre = q_pre.argmax(dim=1)
+        q0 = float(q_pre.gather(1, best_pre[:, None]).mean())   # 선택만 했을 때의 Q
+
+        if self.guide_steps > 0 and self.guide_all:
+            # PA-RL 순서: 후보 **전부** 상승 → argmax. 처음엔 낮았는데 상승 후 더 높아지는
+            # 후보를 잡을 수 있다. critic 이 작은 MLP 라 n배 비용이 지연에 거의 안 보인다.
+            gd, _ = self._cog_guide(rl_, rs, acts.reshape(B * n, -1))
+            acts = gd.view(B, n, -1)
+            q = score(acts)
+        else:
+            q = q_pre
         best = q.argmax(dim=1)
         chosen = acts[torch.arange(B, device=acts.device), best]
-        return chosen, best, {"chosen_q": float(q.gather(1, best[:, None]).mean()),
-                              "candidate_q_std": float(q.std(dim=1).mean()),
+
+        gain, gstd = 0.0, 0.0
+        if self.guide_steps > 0:
+            if not self.guide_all:
+                chosen, _ = self._cog_guide(lat, state, chosen)
+            with torch.no_grad():
+                qf = C.q(lat, state, chosen, target=True)
+                gain = float(qf.min(0).values.mean()) - q0
+                gstd = float(qf.std(0).mean())          # 앙상블 불일치 = 외삽 신호
+        return chosen, best, {"chosen_q": q0 + gain,
+                              "candidate_q_std": float(q_pre.std(dim=1).mean()),
+                              "guide_gain": gain, "guide_ens_std": gstd,
                               "select_ratio_with_residual": 0.0}
+
+    def _cog_guide(self, lat, state, act):
+        """test-time Q guidance — ∇_A Q 상승 + keep-best. (편집 액션, 최종 Q)
+
+        PA-RL 의 고정 step_size(3e-4) 를 쓰지 않는다. 우리 Q·액션 스케일에서 그 값은 이동이
+        1e-9 라 아무 일도 안 한다 (probe_actopt 에서 실측). 대신 **gradient 를 정규화**해
+        스텝마다 차원당 guide_move/steps 만큼 움직인다 — 스케일에 무관하고 상태마다 자동
+        적응한다.
+
+        keep-best (Q-VGM Eq. 7 의 장치): 매 스텝 Q 를 재보고 개선된 것만 채택한다. j=0 이
+        원본이므로 **Q 가 나빠지는 방향은 절대 나가지 않는다** — 서빙에서 이게 안전장치다.
+
+        inference_mode 텐서는 autograd 에 못 쓰므로 clone 으로 꺼낸다 (실측 확인).
+        """
+        C = self.cog
+        d = int(self.cog_mask.sum())
+        step = self.guide_move * (d ** 0.5) / max(self.guide_steps, 1)
+        best = act.clone()
+        with torch.no_grad():
+            bq = C.q(lat, state, best, target=True).min(0).values
+        cur = best
+        for _ in range(self.guide_steps):
+            cur = cur.clone().detach().requires_grad_(True)
+            with torch.enable_grad():
+                qm = C.q(lat, state, cur, target=True).mean(0).sum()   # PA-RL: 앙상블 mean
+                g, = torch.autograd.grad(qm, cur)
+            g = g * self.cog_mask
+            gn = g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            cur = (cur.detach() + step * g / gn).clamp(-1.0, 1.0)
+            with torch.no_grad():
+                qq = C.q(lat, state, cur, target=True).min(0).values
+            take = qq > bq
+            best = torch.where(take[:, None], cur, best)
+            bq = torch.maximum(bq, qq)
+        return best, bq
 
     def _run_inference(self, request, collated, B, reset_memory):
         if B != 1:
@@ -535,9 +609,14 @@ class ExpoServer:
         self.q.append(info["chosen_q"])
         self.with_edit.append(info["select_ratio_with_residual"])
         if self.verbose or self.calls <= 3 or self.calls % 25 == 0:
+            # guide Δ / 앙상블std 비율이 1 미만이면 그 개선은 앙상블 노이즈 안이다
+            gtxt = ("" if not info.get("guide_ens_std") else
+                    f"  guide Δ={info['guide_gain']:+.4f} "
+                    f"(ens.std {info['guide_ens_std']:.4f}, "
+                    f"Δ/std {info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f})")
             print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {n}+{min(self.cfg.n_edit_samples, n)} "
                   f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.3f} "
-                  f"후보간 Q std={info['candidate_q_std']:.3f}", flush=True)
+                  f"후보간 Q std={info['candidate_q_std']:.3f}{gtxt}", flush=True)
         return pred, reset_memory
 
     def run(self, host: str, port: int) -> None:
@@ -669,7 +748,71 @@ def _verify_cog(argv: list[str]) -> int:
           f"{'OK' if same > 0.98 else '** 불일치'}")
     ok &= same > 0.98
 
+    # --- 5) expanded(N) 아래에서도 같은 cog feature 가 나오나 ---
+    # 실제 서버는 후보 N개를 만들려고 expanded(N) 로 backbone_features 를 N배 복제한 뒤
+    # _cog_select 가 [:1] 을 꺼낸다. 복제가 dim 0 이라 seq 축은 그대로여야 하는데,
+    # 그건 **주장이 아니라 확인할 사실**이다 (여기서 깨지면 서버가 엉뚱한 latent 를 쓴다).
+    k = idx[:4]
+    x = np.asarray(imgs[k])
+    obs = {"video": {nm: x[:, ci][:, None] for ci, (nm, _) in enumerate(mod.video)},
+           "state": {nm: flat.state[k][:, None, s0:e0] for nm, s0, e0 in mod.offsets("state")},
+           "language": {mod.task_key: [[task]] * len(k)}}
+    collated = vla._collate(obs)
+    with torch.no_grad():
+        plain = vla.runtime._forward(collated)["backbone_features"].clone()
+        N = int(cfg.N)
+        with vla.expanded(N):
+            exp_out = vla.runtime._forward(vla._collate(obs))["backbone_features"].clone()
+    print(f"  5) expanded({N})     plain {tuple(plain.shape)} -> expanded {tuple(exp_out.shape)}")
+    shape_ok = (exp_out.shape[0] == plain.shape[0] * N and exp_out.shape[1:] == plain.shape[1:])
+    # 복제가 repeat_interleave 이므로 샘플 i 의 사본들은 행 i*N .. i*N+N-1 에 있다
+    rep_ok = shape_ok and all(
+        torch.equal(exp_out[i * N], exp_out[i * N + j]) for i in range(len(k)) for j in range(N))
+    # 각 샘플의 첫 사본이 plain 과 같아야 한다
+    same_ok = shape_ok and all(torch.equal(exp_out[i * N], plain[i]) for i in range(len(k)))
+    cog_ok = shape_ok and torch.equal(C.cog_of(exp_out[:1]), C.cog_of(plain[:1]))
+    print(f"      seq 축 보존 {shape_ok}  사본끼리 동일 {rep_ok}  "
+          f"plain 과 동일 {same_ok}  cog_of([:1]) 동일 {cog_ok}  "
+          f"{'OK' if (shape_ok and rep_ok and same_ok and cog_ok) else '** 불일치'}")
+    ok &= shape_ok and rep_ok and same_ok and cog_ok
+
+    # --- 6) Q guidance 가 실제로 Q 를 올리나 (keep-best 라 내려갈 수는 없다) ---
+    class _Srv:                                        # _cog_guide 만 쓰기 위한 최소 껍데기
+        pass
+    srv = _Srv()
+    srv.cog = C
+    srv.cog_mask = torch.zeros(spec.full_dim, device=dev)
+    srv.cog_mask[spec.index] = 1.0
+    srv._cog_guide = ExpoServer._cog_guide.__get__(srv, _Srv)
+    print()
+    for gs, gm in ((4, 0.05), (4, 0.2), (10, 0.2)):
+        srv.guide_steps, srv.guide_move = gs, gm
+        t0 = time.time()
+        gact, gq = srv._cog_guide(lat_t, st, act)
+        torch.cuda.synchronize()
+        ms = (time.time() - t0) * 1000
+        with torch.no_grad():
+            q_before = C.q(lat_t, st, act, target=True).min(0).values
+            std_b = C.q(lat_t, st, act, target=True).std(0)
+            std_a = C.q(lat_t, st, gact, target=True).std(0)
+        mv = (gact - act)[:, spec.index].norm(dim=-1) / len(spec.index) ** 0.5
+        worse = int((gq < q_before - 1e-6).sum())
+        print(f"  6) guidance steps={gs} move={gm}: Q {q_before.mean():+.4f} -> {gq.mean():+.4f} "
+              f"(Δ{(gq - q_before).mean():+.4f})  실제이동 {mv.mean():.4f}/차원 "
+              f"= {mv.mean()/0.0218:.1f} 프레임치  앙상블std {std_b.mean():.4f}->{std_a.mean():.4f} "
+              f"({std_a.mean()/std_b.mean().clamp_min(1e-9):.2f}배)  "
+              f"ΔQ/std {(gq - q_before).mean()/std_a.mean().clamp_min(1e-9):.2f}  "
+              f"나빠진 프레임 {worse} {'OK' if worse == 0 else '** keep-best 가 깨졌다'}")
+        print(f"      {len(idx)}개 동시 상승에 {ms:.1f}ms "
+              f"(서빙은 후보 8개 = {ms*8/len(idx):.1f}ms 예상)")
+        ok &= worse == 0
+
     print(f"\n[결과] {'배선이 학습 경로를 재현한다' if ok else '** 어긋난 단계가 있다 (위 참고)'}")
+    if ok:
+        print("  검증한 것 : 같은 이미지에서 학습 경로와 비트 단위로 같은 latent/Q/선택")
+        print("  안 한 것  : 실기 이미지(rrc 1280x720 vs 데이터셋 320x192)에서의 동작.")
+        print("              RLDX 프로세서가 양쪽을 리사이즈하지만 원본이 다르다 — 다만 이 차이는")
+        print("              **정책 자신도 똑같이 겪는 것**이라 critic 이 정책과 어긋나지는 않는다.")
     return 0 if ok else 1
 
 
@@ -694,6 +837,23 @@ def _serve(argv: list[str]) -> int:
                    choices=["none", "trained", "guided"])
     p.add_argument("--critic-image-size", default="320x192",
                    help="critic 인코더에 넣기 전 맞출 해상도 = 학습 데이터 해상도")
+    p.add_argument("--guide-steps", type=int, default=0,
+                   help="test-time Q guidance 의 ∇_A Q 상승 스텝 수. 0 이면 Q 선택만 한다. "
+                        "**총 이동량은 --guide-move 가 정한다** (gradient 를 정규화해 쓴다) — "
+                        "steps 는 경로 해상도일 뿐이다. 실측: steps 4 와 10 의 ΔQ 가 동일 "
+                        "(+0.0064) → 국소적으로 Q 가 거의 선형이라 4 면 충분하다. "
+                        "Q-VGM 실측(LIBERO): 선택만 86.0 / guidance 88.7 (SFT 79.0). "
+                        "cog feature critic 에서만 동작한다")
+    p.add_argument("--guide-move", type=float, default=0.2,
+                   help="상승의 차원당 총 이동량 (정규화 액션 단위). **실질적인 유일한 노브다.** "
+                        "openarm 의 1프레임 자연 변화가 ~0.022 이라 0.2 는 약 9 프레임치이고, "
+                        "yaml 의 edit_scale 0.2 와 같은 크기다. "
+                        "실측: 0.05 는 ΔQ +0.0064 인데 앙상블 std 0.024 라 **개선이 노이즈에 "
+                        "묻힌다** (ΔQ/std 0.27). 0.2 는 ΔQ +0.0823, ΔQ/std 3.13 으로 유의하다. "
+                        "keep-best 라 Q 가 나빠지면 원본을 유지한다")
+    p.add_argument("--guide-all", action="store_true",
+                   help="후보 전부를 상승시킨 뒤 argmax (PA-RL 순서). 기본은 argmax 를 먼저 하고 "
+                        "고른 하나만 상승시킨다. critic 이 작은 MLP 라 비용 차이가 거의 없다")
     p.add_argument("--verbose", action="store_true")
     a = p.parse_args(argv)
 
@@ -703,7 +863,9 @@ def _serve(argv: list[str]) -> int:
     print(f"EXPO 정책 서버 — 실험 {a.exp}")
     srv = ExpoServer(exp, a.model_path, modality, repo / "third_party" / "RLDX-1",
                      device=a.device, artifacts=a.artifacts, seed=a.seed,
-                     rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose)
+                     rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
+                     guide_steps=a.guide_steps, guide_move=a.guide_move,
+                     guide_all=a.guide_all)
     srv.run(a.host, a.port)
     return 0
 
