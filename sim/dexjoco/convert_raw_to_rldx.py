@@ -336,6 +336,7 @@ def write_episode(
     done: np.ndarray | None = None,
     truncated: np.ndarray | None = None,
     extra_meta: dict[str, Any] | None = None,
+    extra_columns: dict[str, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Write one episode's parquet (and videos, if `frames` is given); return its meta row.
 
@@ -369,6 +370,14 @@ def write_episode(
             "task_index": np.zeros(length, dtype=np.int64),
         }
     )
+    # Diagnostic columns (e.g. a rollout's raw pre-orthogonalisation policy output).
+    # They are deliberately NOT declared in info.json's `features`, so
+    # generate_stats skips them and LeRobotEpisodeLoader never looks at them —
+    # they ride along for analysis only.
+    for name, values in (extra_columns or {}).items():
+        values = np.asarray(values)
+        assert len(values) == length, (name, len(values), length)
+        frame[name] = list(values) if values.ndim > 1 else values
     chunk = ep_idx // CHUNK_SIZE
     parquet_path = cfg.output / f"data/chunk-{chunk:03d}/episode_{ep_idx:06d}.parquet"
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
