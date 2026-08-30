@@ -184,8 +184,12 @@ fi
 
 if [ "$FROM" -le 8 ]; then
 step "8. LoRA 병합"
-CK=$(ls -d checkpoints/fuji_distill/_preflight/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
-[ -n "$CK" ] || die "LoRA 체크포인트가 안 나왔다"
+# launch_train 은 산출물을 <output-dir>/<experiment-name>/checkpoint-N 으로 한 단계
+# 더 중첩한다. 그래서 output-dir 바로 아래를 보면 안 된다. 스텝 번호로 정렬해 마지막을 고른다.
+CK=$(find "checkpoints/fuji_distill/_preflight" -maxdepth 2 -type d -name 'checkpoint-*' -printf '%f\t%p\n' 2>/dev/null \
+     | sed 's/^checkpoint-//' | sort -n | tail -1 | cut -f2)
+[ -n "$CK" ] || die "LoRA 체크포인트가 안 나왔다 (checkpoints/fuji_distill/_preflight 아래)"
+echo "  체크포인트 $CK  ($(du -sh "$CK" | cut -f1))"
 ( cd third_party/RLDX-1 && .venv/bin/python scripts/merge_lora_checkpoint.py \
     --trainable-ckpt "$ROOT/$CK" --base-ckpt "$BASE" \
     --output "$ROOT/checkpoints/fuji_distill/_preflight_merged" ) || die "merge_lora_checkpoint"

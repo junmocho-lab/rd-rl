@@ -137,6 +137,8 @@ if QVGM:
         return C.q(lat, act)                       # 이미 min(헤드) + sum(위치)
     def q_mean(lat, st, act):
         return C.q_all(lat, act).mean(0).sum(-1)
+    def v_of(lat, st):
+        return C.v(lat)
 else:
     C = load_critic(ck, work, cfg, mod.n_cams, FULL, snorm.shape[1],
                     features=a.features, imgs=imgs, dev=dev)
@@ -144,6 +146,8 @@ else:
         return C.q(lat, st, act).min(0).values
     def q_mean(lat, st, act):
         return C.q(lat, st, act).mean(0)
+    def v_of(lat, st):
+        return C.v(lat, st)
 
 spec = explore_spec(mod.offsets("action"), groups, A_DIM, R, LAT)
 MASK = torch.zeros(FULL, device=dev)
@@ -274,7 +278,7 @@ print(f"[상승] num_steps {a.num_steps}, step_size {a.step_size:.4g}, "
 
 # --- 4. relabel --------------------------------------------------------------
 NEW = flat.action.copy()                              # (T, A) raw 공간, 원본에서 출발
-stat = {"dq": [], "d": [], "won_logged": 0, "n": 0, "g": []}
+stat = {"dq": [], "d": [], "won_logged": 0, "n": 0, "g": [], "adv": [], "ok": []}
 t0 = time.time()
 for c in range(0, len(dec), a.batch):
     idx = dec[c:c + a.batch]
@@ -289,6 +293,15 @@ for c in range(0, len(dec), a.batch):
     with torch.no_grad():
         q_log = q_min(lat, st, logged)
         q_new = q_min(lat, st, chosen)
+    # advantage A = Q(s, a_new) - V(s).
+    # **BC 손실은 타깃이 얼마나 좋은지를 모른다.** 이미 망가진 상태에서 후보 32개 중
+    # 최선을 골라도 그 액션은 여전히 나쁠 수 있는데, 좋은 상태의 좋은 액션과 똑같은
+    # 가중치로 학습된다. A 가 그 차이를 드러낸다 — 실패 에피소드의 A 분포가 성공
+    # 에피소드보다 크게 낮으면 "회복 불가능한 상태" 가 데이터를 희석하고 있다는 뜻이다.
+    with torch.no_grad():
+        adv = q_new - v_of(lat, st)
+    stat["adv"].append(adv.cpu().numpy())
+    stat["ok"].append(flat.is_success[idx].astype(bool))
     stat["dq"].append((q_new - q_log).cpu().numpy())
     stat["d"].append((chosen - logged)[:, spec.index].norm(dim=-1).cpu().numpy() / NIDX ** 0.5)
     stat["g"].append((gn / NIDX ** 0.5).cpu().numpy())
@@ -316,6 +329,14 @@ print(f"  ΔQ (선택 - 로그)  평균 {dq.mean():+.4f}  중앙 {np.median(dq):
 print(f"  이동거리/차원      평균 {dd.mean():.4f}  중앙 {np.median(dd):.4f}  "
       f"p95 {np.percentile(dd,95):.4f}   (액션 공간 ±1)")
 print(f"  ‖g‖/√d            중앙 {np.median(gg):.3e}")
+_adv = np.concatenate(stat["adv"]); _ok = np.concatenate(stat["ok"])
+print(f"  advantage A=Q(s,a_new)-V(s)   전체 평균 {_adv.mean():+.4f}  A>0 비율 {(_adv>0).mean():.1%}")
+if _ok.any() and (~_ok).any():
+    print(f"    성공 에피소드 (n={int(_ok.sum())})  A 평균 {_adv[_ok].mean():+.4f}  "
+          f"중앙 {np.median(_adv[_ok]):+.4f}  A>0 {(_adv[_ok]>0).mean():.1%}")
+    print(f"    실패 에피소드 (n={int((~_ok).sum())})  A 평균 {_adv[~_ok].mean():+.4f}  "
+          f"중앙 {np.median(_adv[~_ok]):+.4f}  A>0 {(_adv[~_ok]>0).mean():.1%}")
+    print(f"    → 실패 쪽 A 가 크게 낮으면 회복 불가능한 상태가 BC 를 희석한다는 뜻이다")
 print(f"  로그된 액션이 이긴 비율 {stat['won_logged']/max(stat['n'],1):.1%}  "
       f"(높으면 critic 이 base policy 를 개선하지 못한다는 뜻)")
 chg = np.abs(NEW - flat.action).max(1)

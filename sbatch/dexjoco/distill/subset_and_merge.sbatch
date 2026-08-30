@@ -57,9 +57,12 @@ elif [ "$MODE" = merge ]; then
     TAG=${TAG:?TAG 를 줘야 한다}
     BASE=$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
     RUN=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}
-    # 마지막 체크포인트를 고른다
-    CK=$(ls -d $RUN/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
-    [ -n "$CK" ] || { echo "체크포인트 없음: $RUN"; exit 3; }
+    # launch_train 은 산출물을 <output-dir>/<experiment-name>/checkpoint-N 으로 한 단계
+    # 더 중첩한다. 그래서 output-dir 바로 아래를 보면 안 된다. 스텝 번호로 정렬해 마지막을 고른다.
+    CK=$(find "$RUN" -maxdepth 2 -type d -name 'checkpoint-*' -printf '%f\t%p\n' 2>/dev/null \
+         | sed 's/^checkpoint-//' | sort -n | tail -1 | cut -f2)
+    [ -n "$CK" ] || { echo "체크포인트 없음: $RUN (하위 <experiment-name>/checkpoint-N 까지 찾았다)"; exit 3; }
+    echo "    고른 체크포인트 $CK  ($(du -sh "$CK" | cut -f1))"
     OUT=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}_merged
     echo "=== $(date -Is)  merge  $CK → $OUT"
     cd "$REPO/third_party/RLDX-1"
