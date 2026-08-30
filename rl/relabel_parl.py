@@ -73,6 +73,11 @@ p.add_argument("--num-samples", type=int, default=32, help="PA-RL num_base_polic
 p.add_argument("--num-keep", type=int, default=10, help="PA-RL num_actions_to_keep")
 p.add_argument("--num-steps", type=int, default=10, help="PA-RL local optimization steps")
 p.add_argument("--step-size", type=float, default=3e-4, help="PA-RL 기본값")
+p.add_argument("--guide-move", type=float, default=0.0,
+               help="서빙(rl.vla_rldx)과 같은 스텝 파라미터화를 쓴다.\n"
+                    "매 스텝 g/‖g‖ 로 정규화해 총 이동거리를 guide_move·√d 로 고정한다.\n"
+                    "89%% 를 낸 설정이 --guide-move 0.05 --num-steps 4 다.\n"
+                    "0 이면 옛 방식(--step-size / --auto-step)")
 p.add_argument("--auto-step", type=float, default=0.0,
                help="차원당 목표 이동거리 D. 주면 ‖g‖ 를 재서 step_size 를 잡는다 "
                     "(PA-RL 의 3e-4 는 우리 Q 스케일에서 사실상 아무 일도 안 한다)")
@@ -86,6 +91,9 @@ p.add_argument("--no-parquet", action="store_true",
                help="npy 만 쓰고 데이터셋 사본은 만들지 않는다 (rl.train_policy 로 학습할 때)")
 p.add_argument("--npy-out", default="parl_actions.npy",
                help="relabel 된 raw 액션 (T, action_dim). work 디렉토리에 저장")
+p.add_argument("--eps", default="all", choices=("all", "success", "fail"),
+               help="이 에피소드들만 relabel 한다. critic 을 성공만으로 학습했으면\n"
+                    "성공 에피소드 상태 밖은 critic 이 외삽하므로 맞춰 주는 게 안전하다")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--device", default="cuda")
 a = p.parse_args()
@@ -118,8 +126,24 @@ if not ck.is_file():
     ck = work / a.critic
 if not ck.is_file():
     raise SystemExit(f"체크포인트가 없다: {a.critic}  (work={work})")
-C = load_critic(ck, work, cfg, mod.n_cams, FULL, snorm.shape[1],
-                features=a.features, imgs=imgs, dev=dev)
+QVGM = torch.load(ck, map_location="cpu").get("kind") == "qvgm"
+if QVGM:
+    from rl.critic_io import load_stepwise_critic
+    C = load_stepwise_critic(ck, work, snorm, dev=dev)
+    # 서빙(rl/vla_rldx.py)과 **정확히 같은 집계**를 쓴다. 89% 를 낸 것이 이 조합이다:
+    #   후보 선택 / keep-best 판정 → 앙상블 min  (:590, :715)
+    #   상승 방향 ∇_A Q           → 앙상블 mean (:709, PA-RL 원본이 mean 인 자리)
+    def q_min(lat, st, act):
+        return C.q(lat, act)                       # 이미 min(헤드) + sum(위치)
+    def q_mean(lat, st, act):
+        return C.q_all(lat, act).mean(0).sum(-1)
+else:
+    C = load_critic(ck, work, cfg, mod.n_cams, FULL, snorm.shape[1],
+                    features=a.features, imgs=imgs, dev=dev)
+    def q_min(lat, st, act):
+        return C.q(lat, st, act).min(0).values
+    def q_mean(lat, st, act):
+        return C.q(lat, st, act).mean(0)
 
 spec = explore_spec(mod.offsets("action"), groups, A_DIM, R, LAT)
 MASK = torch.zeros(FULL, device=dev)
@@ -130,7 +154,13 @@ NIDX = len(spec.index)
 # 에피소드 안에서 replan 간격으로 t 를 놓고, 각 t 가 프레임 t+LAT … t+LAT+R-1 을 쓴다.
 # 에피소드 끝을 넘는 쓰기 대상은 버린다 (원본 액션 유지).
 dec, span = [], []
-for e in np.unique(flat.episode):
+_eps_all = np.unique(flat.episode)
+if a.eps != "all":                     # critic 이 본 분포 밖은 외삽이라 맞춰 준다
+    _want = (a.eps == "success")
+    _eps_all = np.array([e for e in _eps_all
+                         if bool(flat.is_success[np.flatnonzero(flat.episode == e)[0]]) == _want])
+    print(f"[에피소드 필터] --eps {a.eps} → {len(_eps_all)}/{len(np.unique(flat.episode))} 에피소드만 relabel")
+for e in _eps_all:
     fr = np.flatnonzero(flat.episode == e)
     for t in range(fr[0], fr[-1] + 1, R):
         w = np.arange(t + LAT, min(t + LAT + R, fr[-1] + 1))
@@ -180,39 +210,60 @@ def candidates(idx):
     st = torch.from_numpy(snorm[idx]).to(dev)
     lat = C.latent_of(idx, st)
     with torch.no_grad():
-        q = C.q(lat.repeat_interleave(a.num_samples, 0),
-                st.repeat_interleave(a.num_samples, 0),
-                acts.reshape(b * a.num_samples, FULL)).mean(0)     # PA-RL: 앙상블 mean
+        q = q_min(lat.repeat_interleave(a.num_samples, 0),
+                  st.repeat_interleave(a.num_samples, 0),
+                  acts.reshape(b * a.num_samples, FULL))   # 서빙과 같게 앙상블 min
     top = q.view(b, a.num_samples).topk(min(a.num_keep - 1, a.num_samples), dim=1).indices
     keep = torch.gather(acts, 1, top[..., None].expand(-1, -1, FULL))
     return torch.cat([keep, logged[:, None, :]], 1), lat, st, logged
 
 
 def ascend(cand, lat, st):
-    """(B,K,FULL) 후보를 ∇_a Q 로 올린 뒤 Q 와 함께 반환. 마지막 ‖g‖ 도 같이."""
+    """(B,K,FULL) 후보를 ∇_a Q 로 올린다. 서빙(vla_rldx._cog_guide)과 같은 절차다.
+
+    **keep-best 가 핵심이다.** 매 스텝 min-Q 가 실제로 올랐을 때만 채택하고 아니면 이전
+    최선을 유지한다. 없으면 마지막 스텝의 과도한 이동을 그대로 받게 되는데, 그것이
+    --guide-all 이 89% -> 72% 로 무너진 실패 모드다 (critic 이 가장 크게 과대평가한 쪽으로
+    밀린다). Q-VGM ablation 도 keep-best 없으면 92.5 -> 88.6 이라고 적어 놓았다.
+    """
     b, K = cand.shape[:2]
     rl_, rs = lat.repeat_interleave(K, 0), st.repeat_interleave(K, 0)
-    act = cand.reshape(b * K, FULL)
-    g_last = torch.zeros_like(act)
-    for _ in range(a.num_steps):
-        act = act.detach().requires_grad_(True)
-        qm = C.q(rl_, rs, act).mean(0).sum()
-        g, = torch.autograd.grad(qm, act)
-        g_last = g
-        act = (act + a.step_size * g * MASK).clamp(-1.0, 1.0)
+    best = cand.reshape(b * K, FULL)
     with torch.no_grad():
-        q = C.q(rl_, rs, act.detach()).mean(0).view(b, K)
-    return act.detach().view(b, K, FULL), q, (g_last * MASK)[:, spec.index].norm(dim=-1)
+        bq = q_min(rl_, rs, best)
+    cur, g_last = best, torch.zeros_like(best)
+    for _ in range(a.num_steps):
+        cur = cur.clone().detach().requires_grad_(True)
+        with torch.enable_grad():
+            qm = q_mean(rl_, rs, cur).sum()          # 방향만 mean (PA-RL 원본 자리)
+            g, = torch.autograd.grad(qm, cur)
+        g = g * MASK
+        g_last = g
+        if a.guide_move > 0:                          # 서빙과 같은 per-example 정규화
+            gn = g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            cur = (cur.detach() + STEP * g / gn).clamp(-1.0, 1.0)
+        else:
+            cur = (cur.detach() + a.step_size * g).clamp(-1.0, 1.0)
+        with torch.no_grad():
+            qq = q_min(rl_, rs, cur)                  # 채택 판정은 min (보수적)
+        take = qq > bq
+        best = torch.where(take[:, None], cur.detach(), best)
+        bq = torch.maximum(bq, qq)
+    return best.view(b, K, FULL), bq.view(b, K), g_last[:, spec.index].norm(dim=-1)
 
 
 # --- step_size 캘리브레이션 (probe_actopt 와 같은 규칙) ----------------------
-if a.auto_step:
+STEP = a.guide_move * (NIDX ** 0.5) / max(a.num_steps, 1)   # 서빙 vla_rldx.py:701 과 동일
+if a.guide_move > 0:
+    print(f"[상승] 서빙과 같은 파라미터화: guide_move {a.guide_move} x sqrt({NIDX}) "
+          f"/ {a.num_steps}스텝 = 스텝당 {STEP:.4f}, 방향은 g/||g||, keep-best 켜짐")
+elif a.auto_step:
     k = dec[:: max(1, len(dec) // 32)][:32]
     st = torch.from_numpy(snorm[k]).to(dev)
     lat = C.latent_of(k, st)
     act0 = torch.from_numpy(np.ascontiguousarray(
         np.asarray(norm[k])[:, :LAT + R].reshape(len(k), -1))).to(dev).requires_grad_(True)
-    qm = C.q(lat, st, act0).mean(0).sum()
+    qm = q_mean(lat, st, act0).sum()
     g, = torch.autograd.grad(qm, act0)
     gmed = float(((g * MASK)[:, spec.index].norm(dim=-1) / NIDX ** 0.5).median())
     a.step_size = a.auto_step / max(a.num_steps * gmed, 1e-12)
@@ -236,8 +287,8 @@ for c in range(0, len(dec), a.batch):
         pick = torch.distributions.Categorical(logits=q / a.temp).sample()
     chosen = torch.gather(opt, 1, pick[:, None, None].expand(-1, 1, FULL))[:, 0]
     with torch.no_grad():
-        q_log = C.q(lat, st, logged).mean(0)
-        q_new = C.q(lat, st, chosen).mean(0)
+        q_log = q_min(lat, st, logged)
+        q_new = q_min(lat, st, chosen)
     stat["dq"].append((q_new - q_log).cpu().numpy())
     stat["d"].append((chosen - logged)[:, spec.index].norm(dim=-1).cpu().numpy() / NIDX ** 0.5)
     stat["g"].append((gn / NIDX ** 0.5).cpu().numpy())

@@ -339,7 +339,9 @@ class ExpoServer:
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
                  log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64,
-                 ood_ref: float = 0.0, ood_gate: float = 0.0):
+                 ood_ref: float = 0.0, ood_gate: float = 0.0,
+                 guide_groups: list[str] | None = None,
+                 parl_keep: int = 0, parl_temp: float = 0.0):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import explore_spec
@@ -381,8 +383,14 @@ class ExpoServer:
                 # critic 창은 체크포인트가 정하고(예 10스텝) 실행 구간은 rrc 가 정한다
                 # (예 [0,8)). 창 밖이나 실행 밖 스텝을 건드리면 아무 효과 없이 critic 만
                 # 착취한다. 관절은 explore_groups 로 제한한다.
-                jsel = [i for nm, s0, e0 in mod.offsets("action") if nm in
-                        (exp.get("explore_groups") or [nm]) for i in range(s0, e0)]
+                # guidance 가 밀 수 있는 관절. 기본은 yaml 의 explore_groups 지만
+                # --guide-groups 로 덮어쓸 수 있다. **후보 선택(_cog_select)은 이 마스크와
+                # 무관하다** — score() 는 청크 전 차원을 그대로 critic 에 넣는다. 마스크는
+                # _cog_guide 의 gradient 에만 걸리므로, 이 값은 "guidance 의 통로 폭" 이다.
+                _gg = guide_groups if guide_groups is not None else (
+                    exp.get("explore_groups") or [])
+                jsel = [i for nm, s0, e0 in mod.offsets("action")
+                        if (nm in _gg if _gg else True) for i in range(s0, e0)]
                 mk = torch.zeros(self.cog.window, mod.action_dim, device=device)
                 mk[self.latency:self.latency + self.replan, jsel] = 1.0
                 self.cog_mask = mk.reshape(-1)
@@ -405,6 +413,7 @@ class ExpoServer:
         self.runtime._run_inference = self._run_inference
         self.calls, self.ms, self.q, self.with_edit = 0, [], [], []
         self.guide_steps, self.guide_move, self.guide_all = guide_steps, guide_move, guide_all
+        self.parl_keep, self.parl_temp = parl_keep, parl_temp
         self.log_every = max(1, log_every)
         # 실기 관측을 저장해 두면 오프라인에서 학습 데이터와 직접 대조할 수 있다.
         # critic 이 실기에서 OOD 인 이유(전처리 차이 vs 데이터 커버리지)를 가르는 유일한 길이다.
@@ -578,30 +587,60 @@ class ExpoServer:
             self._dump(request, cog, state, acts)
         rl_, rs = lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0)
 
-        def score(a):                                  # (B,n,full) → (B,n) 앙상블 min
+        def score(a, k=None, lat_=None, st_=None):      # (B,k,full) → (B,k) 앙상블 min
+            # k 를 인자로 받는다 — PA-RL 의 top-M 필터 뒤에는 후보 수가 n 이 아니다.
+            k = k or a.shape[1]
             with torch.no_grad():
-                return C.q(rl_, rs, a.reshape(B * n, -1),
-                           target=True).min(dim=0).values.view(B, n)
+                return C.q(lat_ if lat_ is not None else rl_,
+                           st_ if st_ is not None else rs,
+                           a.reshape(B * k, -1), target=True).min(dim=0).values.view(B, k)
 
-        q_pre = score(acts)
+        q_pre = score(acts, n)
         best_pre = q_pre.argmax(dim=1)
+        acts0 = acts                       # 필터 전 후보. 아래 OOD 기준선이 이걸 쓴다
         q0 = float(q_pre.gather(1, best_pre[:, None]).mean())   # 선택만 했을 때의 Q
 
-        if self.guide_steps > 0 and self.guide_all:
-            # PA-RL 순서: 후보 **전부** 상승 → argmax. 처음엔 낮았는데 상승 후 더 높아지는
-            # 후보를 잡을 수 있다. critic 이 작은 MLP 라 n배 비용이 지연에 거의 안 보인다.
+        ent = 0.0
+        if self.parl_keep > 0:
+            # PA-RL (action_optimization.py:368-540): Q 로 상위 M 개만 남기고 그 M 개를
+            # 전부 상승시킨 뒤 다시 채점, 마지막에 Categorical(logits=Q) 로 뽑는다.
+            # top-M 필터가 핵심이다 — 전부 상승시키면 critic 이 가장 크게 과대평가한 후보가
+            # 뽑히기 쉬운데(실측 guide-all 72% vs argmax 후 상승 84%), 미리 걸러 그 노출을 줄인다.
+            M = min(self.parl_keep, n)
+            keep = q_pre.topk(M, dim=1).indices                       # (B, M) 원본 인덱스
+            acts = torch.gather(acts, 1, keep[..., None].expand(-1, -1, acts.shape[-1]))
+            rlM, rsM = lat.repeat_interleave(M, 0), state.repeat_interleave(M, 0)
+            if self.guide_steps > 0:
+                gd, _ = self._cog_guide(rlM, rsM, acts.reshape(B * M, -1))
+                acts = gd.view(B, M, -1)
+            q = score(acts, M, rlM, rsM)
+            if self.parl_temp > 0:
+                pr = torch.softmax(q / self.parl_temp, dim=1)
+                ent = float(-(pr * pr.clamp_min(1e-12).log()).sum(1).mean())
+                sel = torch.multinomial(pr, 1).squeeze(1)
+            else:
+                sel = q.argmax(dim=1)
+            # 호출측은 best 로 **원본 후보** a[best] 를 전체 지평 템플릿으로 쓴다.
+            # top-M 은 순서를 바꾸므로 원본 인덱스로 되돌려야 한다.
+            chosen = acts[torch.arange(B, device=acts.device), sel]
+            best = keep.gather(1, sel[:, None]).squeeze(1)
+        elif self.guide_steps > 0 and self.guide_all:
+            # 후보 **전부** 상승 → argmax. 처음엔 낮았는데 상승 후 더 높아지는 후보를 잡을 수
+            # 있다. critic 이 작은 MLP 라 n배 비용이 지연에 거의 안 보인다.
             gd, _ = self._cog_guide(rl_, rs, acts.reshape(B * n, -1))
             acts = gd.view(B, n, -1)
             q = score(acts)
+            best = q.argmax(dim=1)
         else:
             q = q_pre
-        best = q.argmax(dim=1)
-        chosen = acts[torch.arange(B, device=acts.device), best]
+            best = q.argmax(dim=1)
+        if self.parl_keep <= 0:
+            chosen = acts[torch.arange(B, device=acts.device), best]
 
         # 편집 **전** 앙상블 불일치. 이게 이미 크면 그 상태 자체가 critic 의 학습 분포
         # 밖이라는 뜻이고, 편집 후에만 커지면 guidance 가 밀어낸 것이다 — 원인이 다르다.
         with torch.no_grad():
-            base_sel = acts[torch.arange(B, device=acts.device), best_pre]
+            base_sel = acts0[torch.arange(B, device=acts0.device), best_pre]
             std_pre = float(C.q(lat, state, base_sel, target=True).std(0).mean())
 
         gain, gstd = 0.0, std_pre
@@ -609,13 +648,13 @@ class ExpoServer:
         if skip:
             self.gated += 1
         if self.guide_steps > 0 and not skip:
-            if not self.guide_all:
+            if not self.guide_all and self.parl_keep <= 0:
                 chosen, _ = self._cog_guide(lat, state, chosen)
             with torch.no_grad():
                 qf = C.q(lat, state, chosen, target=True)
                 gain = float(qf.min(0).values.mean()) - q0
                 gstd = float(qf.std(0).mean())
-        return chosen, best, {"chosen_q": q0 + gain,
+        return chosen, best, {"chosen_q": q0 + gain, "parl_entropy": ent,
                               "candidate_q_std": float(q_pre.std(dim=1).mean()),
                               "guide_gain": gain, "guide_ens_std": gstd,
                               "ens_std_pre": std_pre, "gated": skip,
@@ -739,7 +778,9 @@ class ExpoServer:
                        "  ** 편집이 OOD 로 밀어냄" if info["guide_ens_std"] > 0.05 else ""))
             # cog 모드는 edit 후보를 만들지 않는다 (residual policy 미사용) — 표시도 그렇게.
             ncand = f"{n}" if self.cog is not None else f"{n}+{min(self.cfg.n_edit_samples, n)}"
-            print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand} "
+            etxt = (f"  샘플엔트로피={info['parl_entropy']:.3f}(균등={np.log(min(self.parl_keep, n)):.3f})"
+                    if self.parl_keep > 0 and self.parl_temp > 0 else "")
+            print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand}{etxt} "
                   f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.4f} "
                   f"후보간Qstd={info['candidate_q_std']:.4f}{gtxt}", flush=True)
         # --- 진단 요약: 학습 분포 안이었나 ---------------------------------------
@@ -761,11 +802,25 @@ class ExpoServer:
                       flush=True)
         return pred, reset_memory
 
-    def run(self, host: str, port: int) -> None:
+    def run(self, host: str, port: int, sim_wrapper: bool = False) -> None:
         from rldx.policy.server_client import PolicyServer
 
+        policy = self.policy
+        if sim_wrapper:
+            # sim 롤아웃 클라이언트(sim/dexjoco/rollout_dexjoco.py)는 **flat 키**를 보낸다
+            # (video.<cam> / state.<name> / annotation.human.task_description). RLDXPolicy 는
+            # 중첩 dict 를 받으므로 run_rldx_server.py --use-sim-policy-wrapper 와 같은
+            # 변환기를 씌워야 한다. 안 씌우면 check_observation 이 키를 못 찾고 죽는다.
+            #
+            # 래핑 지점이 policy **바깥**이라 __init__ 의 runtime._run_inference 몽키패치는
+            # 그대로 산다 (runtime 은 policy 안에 있고 래퍼는 건드리지 않는다). 즉
+            # 관측 변환만 추가되고 후보 선택/guidance 경로는 동일하다.
+            from rldx.policy.rldx_policy import RLDXSimPolicyWrapper
+            policy = RLDXSimPolicyWrapper(policy, strict=True)
+            print("  [래퍼] RLDXSimPolicyWrapper — flat 관측 키를 중첩 dict 로 바꾼다 "
+                  "(run_rldx_server.py --use-sim-policy-wrapper 와 동일)")
         print(f"\n  듣는다 tcp://{host}:{port}   (rrc zmq_client 가 붙으면 된다)", flush=True)
-        PolicyServer(policy=self.policy, host=host, port=port).run()
+        PolicyServer(policy=policy, host=host, port=port).run()
 
 
 def _verify_cog(argv: list[str]) -> int:
@@ -1075,8 +1130,13 @@ def _serve(argv: list[str]) -> int:
     p.add_argument("--guide-steps", type=int, default=0,
                    help="test-time Q guidance 의 ∇_A Q 상승 스텝 수. 0 이면 Q 선택만 한다. "
                         "**총 이동량은 --guide-move 가 정한다** (gradient 를 정규화해 쓴다) — "
-                        "steps 는 경로 해상도일 뿐이다. 실측: steps 4 와 10 의 ΔQ 가 동일 "
-                        "(+0.0064) → 국소적으로 Q 가 거의 선형이라 4 면 충분하다. "
+                        "steps 는 경로 해상도일 뿐이다.\n"
+                        "실측(sim/dexjoco/probe_steps.py, 90차원 critic, 홀드아웃 512프레임):\n"
+                        "  steps 1 / 2 / 4 / 10 / 20 의 ΔQ 가 소수점 5자리까지 **완전히 동일**하다\n"
+                        "  (move 0.02 → 0.00075,  move 0.05 → 0.00185). 즉 Q 가 이 범위에서\n"
+                        "  사실상 선형이라 그래디언트 방향이 이동 중에 안 변한다. 스텝을 늘려도\n"
+                        "  계산만 낭비다. keep-best 도 100% 프레임에서 최종 반복이 채택되어 무의미하다.\n"
+                        "  **guidance 의 유일한 실질 노브는 --guide-move 다.**\n"
                         "Q-VGM 실측(LIBERO): 선택만 86.0 / guidance 88.7 (SFT 79.0). "
                         "cog feature critic 에서만 동작한다")
     p.add_argument("--guide-move", type=float, default=0.05,
@@ -1117,6 +1177,37 @@ def _serve(argv: list[str]) -> int:
     p.add_argument("--guide-all", action="store_true",
                    help="후보 전부를 상승시킨 뒤 argmax (PA-RL 순서). 기본은 argmax 를 먼저 하고 "
                         "고른 하나만 상승시킨다. critic 이 작은 MLP 라 비용 차이가 거의 없다")
+    p.add_argument("--n-cand", type=int, default=0,
+                   help="관측당 base 후보 수. 0 이면 exp yaml 의 expo.N. 후보를 늘리면 "
+                        "고를 폭이 넓어지지만, dexjoco 실측에서는 후보 32개의 Q 범위가 "
+                        "성공/실패 격차의 0.31% 에 불과했다 — 후보 수보다 critic 의 "
+                        "액션 민감도가 병목이다")
+    p.add_argument("--parl-keep", type=int, default=0,
+                   help="PA-RL 의 num_actions_to_keep. >0 이면 후보 N 개를 Q 로 정렬해 상위 M "
+                        "개만 남기고, **그 M 개를 전부** 상승시킨 뒤 다시 채점한다 "
+                        "(action_optimization.py:368-470). 0 이면 기존 동작 "
+                        "(argmax 하나만 상승, 또는 --guide-all 이면 전부 상승). "
+                        "필터를 두는 이유: 전부 상승시키면 critic 이 가장 크게 과대평가한 "
+                        "후보가 뽑히기 쉽다 — 실측 72% (guide-all) vs 84% (argmax 후 상승)")
+    p.add_argument("--parl-temp", type=float, default=0.0,
+                   help="PA-RL 의 최종 Categorical(logits=Q) 샘플링 온도. 0 이면 argmax.\n"
+                        "**원본은 온도가 없다 — Q 를 그대로 logits 로 쓴다. 우리는 못 그런다:**\n"
+                        "  PA-RL : 분포형 support [-100, 0] (cql.py:458). 보상이 매 스텝 음수라\n"
+                        "          Q 가 cost-to-go 이고 후보 간 차이가 수 단위다 → softmax 가 잘 갈린다\n"
+                        "  우리   : support [0, 1] (종단 보상 1 회). 후보 간 산포가 0.001 수준이라\n"
+                        "          softmax([0.412, 0.413, 0.411]) 은 사실상 균등분포다\n"
+                        "스케일이 100배 이상 다르므로 온도로 나눠야 순위가 반영된다. 0.001 근처부터\n"
+                        "훑을 것. 로그의 '샘플엔트로피' 로 확인한다 (0=결정적, ln M=균등)")
+    p.add_argument("--guide-groups", default="",
+                   help="guidance 가 미는 action 그룹을 yaml 의 explore_groups 대신 지정한다 "
+                        "(쉼표 구분, 'all' 이면 전 그룹). 후보 **선택**은 항상 청크 전 차원을 "
+                        "쓰므로 이 값에 영향받지 않는다 — 오직 ∇_A Q 상승의 통로만 넓힌다. "
+                        "dexjoco 기본값 [eef_position] 은 625차원 중 60개뿐이라, Q 의 액션 "
+                        "민감도가 회전·손가락에 있으면 밀지 못한다")
+    p.add_argument("--sim-wrapper", action="store_true",
+                   help="RLDXSimPolicyWrapper 를 씌운다. sim 롤아웃 클라이언트처럼 flat 키 "
+                        "(video.<cam> / state.<name>) 를 보내는 쪽과 붙을 때 필요하다 — "
+                        "dexjoco 는 **반드시** 켜야 한다. 실기 rrc 는 중첩 dict 를 보내므로 끈다")
     p.add_argument("--verbose", action="store_true")
     a = p.parse_args(argv)
 
@@ -1130,8 +1221,15 @@ def _serve(argv: list[str]) -> int:
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
                      log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n,
-                     ood_ref=a.ood_ref, ood_gate=a.ood_gate)
-    srv.run(a.host, a.port)
+                     ood_ref=a.ood_ref, ood_gate=a.ood_gate,
+                     parl_keep=a.parl_keep, parl_temp=a.parl_temp,
+                     guide_groups=(None if not a.guide_groups else
+                                   ([] if a.guide_groups == "all" else
+                                    [g.strip() for g in a.guide_groups.split(",") if g.strip()])))
+    if a.n_cand > 0 and a.n_cand != srv.cfg.N:
+        print(f"  [후보] expo.N {srv.cfg.N} -> {a.n_cand} (--n-cand)")
+        srv.cfg.N = a.n_cand
+    srv.run(a.host, a.port, sim_wrapper=a.sim_wrapper)
     return 0
 
 

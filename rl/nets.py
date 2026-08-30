@@ -218,6 +218,29 @@ class CriticEnsemble(nn.Module):
         return perm[:num_min_qs].tolist()
 
 
+class FuseProj(nn.Module):
+    """Q-VGM 4.1 의 입력 융합: proj(RL token) 과 proj(proprio) 를 concat 한 뒤 LayerNorm.
+
+    우리가 쓰던 방식과 두 군데 다르다:
+      · state 를 raw 로 붙이지 않고 **투영**한다. raw 면 25차원이 512차원 latent 옆에
+        스케일도 맞지 않은 채 놓여, MLP 첫 층이 사실상 latent 만 본다.
+      · LayerNorm 을 **합친 뒤** 한 번 건다. 따로 걸면 두 갈래의 상대 크기가 고정되지
+        않아, 학습이 진행되며 한쪽이 다른 쪽을 압도할 수 있다.
+
+    액션은 여기 들어오지 않는다 — StepwiseQ 가 hidden 층마다 따로 concat 한다.
+    """
+
+    def __init__(self, dfeat: int, dstate: int, latent: int, state_latent: int):
+        super().__init__()
+        self.feat = xavier_(nn.Linear(dfeat, latent))
+        self.state = xavier_(nn.Linear(dstate, state_latent))
+        self.ln = nn.LayerNorm(latent + state_latent)
+        self.out_dim = latent + state_latent
+
+    def forward(self, f: torch.Tensor, st: torch.Tensor) -> torch.Tensor:
+        return self.ln(torch.cat([self.feat(f), self.state(st)], -1))
+
+
 # --------------------------------------------------------------------------- #
 # Q-VGM 식 critic — 층마다 액션 재주입 + 청크 위치별(stepwise) 값
 #
@@ -237,9 +260,13 @@ class StepwiseQ(nn.Module):
 
     def __init__(self, in_dim: int, action_dim: int, n_steps: int,
                  hidden_dims: tuple[int, ...] = (512, 512, 512), use_layer_norm: bool = True,
-                 inject: bool = True):
+                 inject: bool = True, bins: int = 0):
         super().__init__()
         self.inject = inject
+        # bins > 0 이면 위치마다 스칼라 대신 **bin logits** 를 낸다 (HL-Gauss 분포형).
+        # support 를 [0,1] 로 고정하면 Q^(i) 가 그 밖으로 못 나가 발산이 구조적으로
+        # 불가능해진다 — 스칼라 헤드에서 실패 Q 가 29 까지 폭발한 것이 이것 때문이다.
+        self.bins = bins
         self.blocks = nn.ModuleList()
         d = in_dim + action_dim
         for h in hidden_dims:
@@ -249,7 +276,8 @@ class StepwiseQ(nn.Module):
             layer.append(nn.GELU())
             self.blocks.append(nn.Sequential(*layer))
             d = h + (action_dim if inject else 0)      # 다음 층 입력에 액션을 다시 붙인다
-        self.head = xavier_(nn.Linear(d - (action_dim if inject else 0), n_steps))
+        self.head = xavier_(nn.Linear(d - (action_dim if inject else 0),
+                                      n_steps * bins if bins else n_steps))
         self.n_steps = n_steps
 
     def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
@@ -258,7 +286,8 @@ class StepwiseQ(nn.Module):
             h = blk(h)
             if self.inject and i < len(self.blocks) - 1:
                 h = torch.cat([h, action], -1)
-        return self.head(h)
+        o = self.head(h)
+        return o.view(*o.shape[:-1], self.n_steps, self.bins) if self.bins else o
 
 
 class StepwiseEnsemble(nn.Module):
@@ -266,15 +295,19 @@ class StepwiseEnsemble(nn.Module):
 
     def __init__(self, in_dim: int, action_dim: int, n_steps: int, num_qs: int = 2,
                  hidden_dims: tuple[int, ...] = (512, 512, 512), use_layer_norm: bool = True,
-                 inject: bool = True):
+                 inject: bool = True, bins: int = 0):
         super().__init__()
         self.qs = nn.ModuleList([
-            StepwiseQ(in_dim, action_dim, n_steps, hidden_dims, use_layer_norm, inject)
+            StepwiseQ(in_dim, action_dim, n_steps, hidden_dims, use_layer_norm, inject, bins)
             for _ in range(num_qs)])
+        self.bins = bins
         self.num_qs, self.n_steps = num_qs, n_steps
 
-    def forward(self, x: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return torch.stack([q(x, action) for q in self.qs], 0)
+    def forward(self, x: torch.Tensor, action: torch.Tensor,
+                members: list[int] | None = None) -> torch.Tensor:
+        """members 를 주면 그 부분집합만 계산한다 (REDQ 의 subsample)."""
+        qs = self.qs if members is None else [self.qs[k] for k in members]
+        return torch.stack([q(x, action) for q in qs], 0)
 
 
 class StepwiseV(nn.Module):

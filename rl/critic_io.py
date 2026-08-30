@@ -20,8 +20,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from rl.nets import (BatchEncoder, CriticEnsemble, StepwiseEnsemble, StepwiseV,
-                     xavier_)
+from rl.nets import (BatchEncoder, CriticEnsemble, FuseProj, StepwiseEnsemble,
+                     StepwiseV, xavier_)
 
 
 class Proj(nn.Module):
@@ -133,18 +133,38 @@ def load_critic(ckpt: Path, work: Path, cfg, n_cams: int, action_full: int, stat
 class StepwiseCritic:
     """offline_iql_qvgm.py 산출물. Q^(i) 합을 스칼라 Q 로 준다 (Q-VGM 4.1)."""
 
-    def __init__(self, enc, critic, value, feat, mu, sd, snorm, meta, dev):
+    def __init__(self, enc, critic, value, feat, mu, sd, snorm, meta, dev, act_index=None):
         self.enc, self.critic, self.value = enc, critic, value
         self.FEAT, self.SNORM, self.meta, self.dev = feat, snorm, meta, dev
+        # critic 이 액션의 일부 열만 보도록 학습된 경우(--action-groups), 호출측은 전 차원
+        # 액션을 넘기고 여기서 자른다. 이미 잘린 액션이 들어오면 그대로 쓴다.
+        self.act_index = act_index
 
     def latent_of(self, i, state=None):
         idx = torch.as_tensor(i, device=self.dev)
-        z = self.enc(self.FEAT[idx])
-        return torch.cat([z, self.SNORM[idx] if state is None else state], -1)
+        st = self.SNORM[idx] if state is None else state
+        if int(self.meta.get("state_latent") or 0) > 0:
+            return self.enc(self.FEAT[idx], st)    # 합친 뒤 LayerNorm
+        return torch.cat([self.enc(self.FEAT[idx]), st], -1)
+
+    def q_all(self, lat, act):
+        """(num_qs, B, n_steps). 분포형이면 bin 기대값까지 적용한 뒤 돌려준다.
+
+        앙상블 축을 남긴다 — 호출측이 min(신뢰 하한)과 std(OOD 판정)를 직접 잡는다.
+        """
+        if self.act_index is not None and act.shape[-1] != len(self.act_index):
+            act = act[..., self.act_index]
+        x = self.critic(lat, act)
+        b = int(self.meta.get("bins") or 0)
+        if b:
+            lo, hi = (float(v) for v in self.meta["q_range"].split(","))
+            e = torch.linspace(lo, hi, b + 1, device=x.device)
+            x = (x.softmax(-1) * ((e[:-1] + e[1:]) / 2)).sum(-1)
+        return x
 
     def q_steps(self, lat, act):
         """(num_qs, B, n_steps) → min → (B, n_steps)."""
-        return self.critic(lat, act).min(0).values
+        return self.q_all(lat, act).min(0).values
 
     def q(self, lat, act):
         """스칼라 점수 Q(s,A) = Σ_i Q^(i). ∇_A Q 는 이 합에서 받는다."""
@@ -163,20 +183,29 @@ def load_stepwise_critic(ckpt: Path, work: Path, snorm, dev: str = "cuda") -> St
     FEAT = (FEAT - sd["feat_mu"].to(dev)) / sd["feat_sd"].to(dev)
     hid = tuple(sd["hidden_dims"])
     ln = bool(sd["critic_layer_norm"])
-    enc = Proj(FEAT.shape[1], sd["latent"]).to(dev).eval()
-    IN = sd["latent"] + sd["state_dim"]
-    full = (sd["latency"] + sd["replan"]) * sd["action_dim"]
+    slat = int(sd.get("state_latent") or 0)
+    if slat > 0:                                   # Q-VGM 입력 융합 (학습과 같아야 한다)
+        enc = FuseProj(FEAT.shape[1], sd["state_dim"], sd["latent"], slat).to(dev).eval()
+        IN = enc.out_dim
+    else:
+        enc = Proj(FEAT.shape[1], sd["latent"]).to(dev).eval()
+        IN = sd["latent"] + sd["state_dim"]
+    # 액션 열 인덱스가 있으면 critic 은 그 열만 본다 (--action-groups 로 학습한 경우).
+    aidx = sd.get("action_index")
+    full = len(aidx) if aidx else (sd["latency"] + sd["replan"]) * sd["action_dim"]
     critic = StepwiseEnsemble(IN, full, sd["n_steps"], sd["num_qs"], hid, ln,
-                              sd.get("inject", True)).to(dev).eval()
+                              sd.get("inject", True), int(sd.get("bins") or 0)).to(dev).eval()
     value = StepwiseV(IN, sd["n_steps"], hid, ln).to(dev).eval()
     enc.load_state_dict(sd["enc"])
     critic.load_state_dict(sd["critic"])
     value.load_state_dict(sd["value"])
     SN = torch.from_numpy(snorm).to(dev)
+    AIDX = torch.as_tensor(aidx, device=dev) if aidx else None
     print(f"[critic] {ckpt}\n          step {sd.get('step')}  γ={sd.get('discount')}  "
           f"τ={sd.get('expectile')}  stepwise {sd['n_steps']}  q x{sd['num_qs']}  "
           f"inject={sd.get('inject')}  features={sd['features']}")
-    return StepwiseCritic(enc, critic, value, FEAT, sd["feat_mu"], sd["feat_sd"], SN, sd, dev)
+    return StepwiseCritic(enc, critic, value, FEAT, sd["feat_mu"], sd["feat_sd"], SN, sd, dev,
+                          act_index=AIDX)
 
 
 # --------------------------------------------------------------------------- #
@@ -195,9 +224,19 @@ class ServingCritic:
     cog feature 를 넣으면 같은 Q 가 나온다. rl.vla_rldx verify-cog 가 그것을 대조한다.
     """
 
-    def __init__(self, enc, critic, target, q_of, mu, sd, n_cog, meta, dev):
+    def __init__(self, enc, critic, target, q_of, mu, sd, n_cog, meta, dev,
+                 fuse: bool = False, stepwise: bool = False, act_index=None):
         self.enc, self.critic, self.target, self.q_of = enc, critic, target, q_of
         self.mu, self.sd, self.n_cog, self.meta, self.dev = mu, sd, n_cog, meta, dev
+        # offline_iql_qvgm 산출물이면 배선이 다르다:
+        #   fuse     : latent = LayerNorm(concat[proj(cog), proj(state)])  (FuseProj)
+        #              — state 가 latent 안에 이미 들어간다
+        #   stepwise : critic(lat, act) 가 (num_qs, B, n_steps[, bins]) 를 내므로
+        #              위치 축을 더해 스칼라 Q 로 만든다 (--no-stepwise 면 n_steps=1)
+        self.fuse, self.stepwise = fuse, stepwise
+        # --action-groups 로 학습한 critic 은 액션의 일부 열만 본다. 호출측(ExpoServer)은
+        # 전 차원 액션을 넘기므로 여기서 자른다.
+        self.act_index = act_index
 
     def cog_of(self, backbone_features: torch.Tensor) -> torch.Tensor:
         """(B, seq, d) 백본 출력 → (B, d) cog mean-pool.
@@ -208,11 +247,17 @@ class ServingCritic:
 
     def latent(self, cog: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         z = (cog - self.mu) / self.sd
+        if self.fuse:
+            return self.enc(z, state)                  # 합친 뒤 LayerNorm
         return torch.cat([self.enc(z), state], -1)
 
     def q(self, lat, state, act, target: bool = False):
-        """(num_qs, B) 스칼라 Q. 분포형이면 bin 기댓값."""
+        """(num_qs, B) 스칼라 Q. 분포형이면 bin 기댓값, stepwise 면 위치 축 합."""
         m = self.target if (target and self.target is not None) else self.critic
+        if self.act_index is not None and act.shape[-1] != len(self.act_index):
+            act = act[..., self.act_index]
+        if self.stepwise:
+            return self.q_of(m(lat, act)).sum(-1)      # state 는 lat 안에 있다
         return self.q_of(m(lat, state, act))
 
 
@@ -261,6 +306,62 @@ def load_serving_critic(ckpt: Path, cfg, state_dim: int, action_dim: int, exec_o
     action_full = window * ck_a
     dim_feat = sd["feat_mu"].shape[-1]
     latent_img = sd.get("latent") or cfg.latent_dim_image
+
+    # ── offline_iql_qvgm 산출물 (Q-VGM 배선) ────────────────────────────────────
+    if sd.get("kind") == "qvgm":
+        # --action-groups 로 학습했으면 critic 은 액션의 일부 열만 본다. 서빙은 전 차원
+        # 액션을 그대로 넘기고 ServingCritic.q 가 잘라 쓴다 — 그래야 ExpoServer 의
+        # 후보 확장·guidance 마스크(전 차원 기준)를 건드리지 않는다.
+        aidx = sd.get("action_index")
+        if aidx:
+            action_full = len(aidx)
+        slat = int(sd.get("state_latent") or 0)
+        if slat > 0:
+            enc = FuseProj(dim_feat, state_dim, latent_img, slat).to(dev).eval()
+            in_latent = enc.out_dim
+        else:
+            enc = Proj(dim_feat, latent_img).to(dev).eval()
+            in_latent = latent_img + state_dim
+        enc.load_state_dict(sd["enc"])
+        hid = tuple(sd["hidden_dims"])
+        nst = int(sd.get("n_steps", 1))
+
+        def build_q():
+            return StepwiseEnsemble(in_latent, action_full, nst,
+                                    sd.get("num_qs", 2), hid,
+                                    bool(sd["critic_layer_norm"]),
+                                    sd.get("inject", True),
+                                    int(sd.get("bins") or 0)).to(dev).eval()
+
+        critic, target = build_q(), build_q()
+        critic.load_state_dict(sd["critic"])
+        target.load_state_dict(sd.get("target", sd["critic"]))
+        if sd.get("bins"):
+            lo, hi = (float(x) for x in (sd.get("q_range") or "0,1").split(","))
+            e = torch.linspace(lo, hi, sd["bins"] + 1, device=dev)
+            ctr = (e[:-1] + e[1:]) / 2
+            q_of = lambda x: (x.softmax(-1) * ctr).sum(-1)
+        else:
+            q_of = lambda x: x
+        print(f"  [critic] {ckpt.name}  kind=qvgm  step {sd.get('step')}  "
+              f"bins {sd.get('bins')}  num_qs {sd.get('num_qs')}  n_steps {nst}  "
+              f"inject {sd.get('inject')}  latent {in_latent}"
+              + (f" = LN(concat[{latent_img},{slat}])" if slat else
+                 f" = {latent_img}+{state_dim} raw"))
+        print(f"  [critic] 액션 창 {window} 스텝 x {ck_a} 관절 = {action_full}차원 "
+              f"(체크포인트 기준)  |  실행 구간 [{exec_off}, {exec_off + replan}) (yaml 기준)")
+        c = ServingCritic(enc, critic, target, q_of, sd["feat_mu"].to(dev),
+                          sd["feat_sd"].to(dev), n_cog, sd, dev,
+                          fuse=slat > 0, stepwise=True,
+                          act_index=torch.as_tensor(aidx, device=dev) if aidx else None)
+        # full 은 **호출측이 넘길 액션의 차원**이다 (전 차원). 잘라 쓰는 것은 내부 사정이라
+        # ExpoServer 의 편집 마스크는 전 차원 기준으로 그대로 둔다.
+        c.window, c.full, c.action_dim = window, window * ck_a, ck_a
+        if aidx:
+            print(f"  [critic] 액션 열 제한: {len(aidx)}/{window*ck_a} 차원 "
+                  f"(그룹 {sd.get('action_groups')}) — 서빙은 전 차원을 넘기고 내부에서 자른다")
+        return c
+
     enc = Proj(dim_feat, latent_img).to(dev).eval()
     enc.load_state_dict(sd["enc"])
     in_latent = latent_img + state_dim          # state 를 raw 로 붙인다 (offline_iql 과 동일)

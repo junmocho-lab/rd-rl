@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import random
 import sys
 import time
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ from convert_raw_to_rldx import (  # noqa: E402
     TASK_CAMERAS,
     TASK_PROMPTS,
     Config as ConvertConfig,
+    video_path,
     write_episode,
     write_meta,
 )
@@ -102,6 +105,40 @@ class PolicyClient:
 
     def ping(self) -> Any:
         return self.call("ping")
+
+    def wait_ready(self, budget_s: float = 1800.0, probe_s: float = 20.0) -> None:
+        """서버가 응답할 때까지 기다린다.
+
+        정책 서버는 VLA 백본을 올리느라 2~3분이 걸리는데, 잡 여러 개가 동시에 뜨면
+        같은 체크포인트를 NFS 에서 같이 읽느라 훨씬 오래 걸린다. REQ 소켓은 한 번
+        타임아웃하면 상태가 망가지므로 매 시도마다 새로 연다.
+        """
+        import time
+
+        t0 = time.time()
+        n = 0
+        while True:
+            self.sock.close()
+            self.timeout_ms = int(probe_s * 1000)
+            self._connect()
+            try:
+                r = self.ping()
+                if n:
+                    print(f"[i] 정책 서버 준비됨 ({time.time() - t0:.0f}초, 시도 {n + 1}회)",
+                          flush=True)
+                self.sock.close()
+                self.timeout_ms = 300000
+                self._connect()
+                return r
+            except Exception:
+                n += 1
+                el = time.time() - t0
+                if el > budget_s:
+                    raise RuntimeError(
+                        f"정책 서버가 {budget_s:.0f}초 안에 응답하지 않았다 "
+                        f"({self.host}:{self.port}). 서버 로그를 볼 것")
+                if n % 3 == 1:
+                    print(f"[i] 정책 서버 대기 중… {el:.0f}초 경과", flush=True)
 
     def reset(self) -> None:
         # Clears per-episode policy state (RTC prefix / memory). Older servers may
@@ -206,11 +243,53 @@ class Config:
     seed: int = 0
     """Env construction seed. Later episodes differ because the env randomises from
     the global RNG, which advances across resets."""
+    fixed_scene: int = -1
+    """>=0 이면 **모든 에피소드가 같은 장면**이다 (이 값을 매 reset 직전 시드로 쓴다).
+
+    critic 이 액션을 학습하려면 같은 상태에서 다른 액션의 결과가 데이터에 있어야 하는데,
+    장면이 매번 다르면 상태만으로 결과가 거의 설명되어 (홀드아웃 AUC 0.978) 액션 항이
+    학습될 유인이 없다 — 실측에서 액션을 난수로 갈아치워도 Q 가 격차의 3% 밖에 안 움직였다.
+    장면을 고정하면 s0 가 상수라 Q(s0,A) 가 **A 만의 함수일 수밖에 없다**: 상태 지름길이
+    네트워크에 아예 존재하지 않는다. 결과 변동 전부가 액션에서 온다.
+
+    성공률이 0% 나 100% 인 장면은 정보가 없으므로 50% 근처인 시드를 골라 쓸 것."""
+    seed_per_episode: bool = True
+    """Re-seed the global RNG from (seed, episode index) before every env.reset().
+
+    The env draws its scene (table height, hammer xy/yaw, nail xy) from the **global**
+    numpy RNG and ignores reset(seed=). Without this flag the scene depends on how many
+    resets have happened in this process, so:
+
+      - a --resume restart replays the scenes from the beginning. The 1000-episode
+        collection restarted once at ep500, which is why episodes k and 500+k are the
+        same scene (verified: first-frame pixel diff 0.6-0.8 for twins vs 3-7 for
+        distinct scenes). Half of that dataset is a duplicate.
+      - two policy variants cannot be compared on the same scenes, so a success-rate
+        difference is confounded by which scenes each arm happened to draw.
+
+    Seeding per episode index fixes both: episode i is the same scene in every run,
+    which makes arms exactly paired (McNemar on the same scenes instead of a
+    two-proportion test) and makes resume reproduce what it skipped."""
     randomize: bool = False
     """rand_full visual randomisation. Off = rand_obj, matching the BC training data."""
     randomize_dynamics: bool = False
     image_size: int = 256
-    fps: int = 30
+    fps: int = 50
+    """비디오 fps 이자 데이터셋 info.json 의 fps (timestamp 도 여기서 나온다).
+
+    **50 이 실제 값이다**: env.step 한 번이 control_dt 0.02s (physics 0.002 x 10 substeps)
+    이고, 롤아웃은 step 마다 액션 1개 + 프레임 1개를 남긴다 (완전히 1:1). 그러므로 데이터의
+    실질 제어 레이트는 50Hz 다.
+
+    이전 수집분은 30 으로 선언되어 있다 — 원본 dexjoco 레코더가 self.hz=30 을 쓰는 관례를
+    그대로 따랐기 때문이다. 그 결과 (1) mp4 가 실제보다 1.67배 느리게 재생되고
+    (2) timestamp 가 스텝당 0.0333s 로 적혀 실제 0.02s 와 다르다. 프레임 수와 액션 수는
+    맞으므로 학습·평가에는 영향이 없었지만 (RLDX 도 rl/data.py 도 프레임 인덱스를 쓴다),
+    사람이 초로 읽을 때 어긋난다. 새 수집분부터 바로잡는다.
+
+    주의: BC 학습 데이터(hammer_nail_rand_obj)는 여전히 30 으로 선언돼 있다. 두 세션을
+    한 --data 로 같이 로드하면 info.json 의 fps 가 다르지만, rl/data.py 는 sessions[0] 의
+    fps 를 비디오 stride 계산에만 쓰므로 학습에는 영향이 없다."""
     crf: int = 20
     fast_render: bool = True
     """Render only the two cameras the policy uses. hammer_nail and click_mouse render
@@ -372,13 +451,20 @@ def scan_existing(cfg: Config, cam_keys: list[str], prompt: str) -> tuple[list[d
         length = len(df)
         success = bool(df["next.success"].values[-1])
         row = prior.get(ep) or {}
+        # `next.truncated` is deliberately always 0 on disk (cuts are written as
+        # terminals so rl/data.py's check 8 passes), so it cannot be read back to
+        # tell a cut from a real termination. Infer it from the length instead: the
+        # env only terminates below the cap on success (hammer_nail terminates at
+        # `env_step >= 1000 or success`), so a non-success episode that reached the
+        # cap was cut. This field is bookkeeping only — rl/data.py reads the parquet
+        # columns, not meta.
         metas.append(
             {
                 "episode_index": ep,
                 "tasks": [prompt],
                 "length": length,
                 "success": success,
-                "truncated": bool(df["next.truncated"].values[-1]),
+                "truncated": (not success) and length >= cfg.max_episode_steps,
                 "steps": length,
                 "final_nail_depth": row.get("final_nail_depth"),
             }
@@ -408,7 +494,7 @@ def main(cfg: Config) -> None:
     cfg.output.mkdir(parents=True, exist_ok=True)
 
     client = PolicyClient(cfg.host, cfg.port)
-    client.ping()
+    client.wait_ready()
     if cfg.verify_layout:
         verify_layout(client, cam_keys, cfg.replan + cfg.rtc_delay)
     print(
@@ -431,6 +517,15 @@ def main(cfg: Config) -> None:
     t_start = time.time()
 
     for _ in range(remaining):
+        ep_idx = len(episodes_meta)
+        if cfg.fixed_scene >= 0 or cfg.seed_per_episode:
+            # env.reset() ignores its seed= argument and draws from the global RNG
+            # (panda_hammer_nail_env.py:396). Seed it here so scene == f(episode index),
+            # or a constant when --fixed-scene is given.
+            sd = (cfg.fixed_scene if cfg.fixed_scene >= 0
+                  else (cfg.seed * 1_000_003 + ep_idx)) % (2 ** 31 - 1)
+            random.seed(sd)
+            np.random.seed(sd)
         obs, _ = env.reset()
         client.reset()
 
@@ -561,6 +656,12 @@ def main(cfg: Config) -> None:
 
     n = len(episodes_meta)
     lengths = np.array([m["length"] for m in episodes_meta]) if n else np.array([0])
+    ok = np.array([bool(m.get("success")) for m in episodes_meta]) if n else np.zeros(1, bool)
+    # 성공 에피소드의 길이를 따로 남긴다. 성공만으로 학습한 critic 은 참값이 γ^(T-t) 라
+    # "빨리 끝나는 것" 을 높게 보므로, test-time 선택/guidance 가 실제로 완주를 앞당기는지가
+    # 성공률만큼 중요한 지표다 (실측: BC 251.7 -> selection 225.2 -> guidance 167.4 프레임).
+    # 최소값은 특히 의미가 크다 — BC 가 200회 시도해서 못 낸 속도를 냈는지 보여준다.
+    sl = lengths[ok] if ok.any() else np.array([0])
     summary = {
         "task": cfg.task,
         "episodes": n,
@@ -568,10 +669,21 @@ def main(cfg: Config) -> None:
         "success_rate": n_success / n if n else 0.0,
         "frames": global_index,
         "mean_length": float(lengths.mean()),
+        "min_length": int(lengths.min()),
+        "max_length": int(lengths.max()),
+        "success_mean_length": float(sl.mean()),
+        "success_median_length": float(np.median(sl)),
+        "success_min_length": int(sl.min()),
+        "success_max_length": int(sl.max()),
         "replan": cfg.replan,
+        "rtc_delay": cfg.rtc_delay,
         "max_episode_steps": cfg.max_episode_steps,
         "randomize": cfg.randomize,
         "seed": cfg.seed,
+        "fixed_scene": cfg.fixed_scene,
+        "seed_per_episode": cfg.seed_per_episode,
+        # 어떤 critic / 어떤 서버 설정으로 얻은 결과인지 남긴다. 없으면 순정 BC 다.
+        "serve": os.environ.get("RD_SERVE_INFO", ""),
         "wall_seconds": time.time() - t_start,
     }
     (cfg.output / "rollout_summary.json").write_text(json.dumps(summary, indent=2))

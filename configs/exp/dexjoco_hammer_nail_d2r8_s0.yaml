@@ -1,0 +1,120 @@
+# critic 학습용 exp. 이 이름이 캐시 디렉토리(<checkpoints>/dexjoco_hammer_nail_d2r8_s0-critic/)를
+# 정하므로 실험이 자동으로 분리된다.
+# replan_steps(8) / inference_latency(2) 는 **수집 때 쓴 값과 같아야 한다** —
+# rl/data.py 가 이 창으로 n-step 리턴을 만든다.
+# 고정 장면(seed 0) 200 에피소드용. 데이터: rl-dataset/dexjoco/hammer_nail_d2r8_s0
+#
+# 팔만 보는 단순화 세팅. hammer_nail 에서 test-time 액션 선택이 전혀 먹히지 않아서
+# (BC 84% vs sel32 68% / sel128 72% / guidance 76%), critic 이 액션을 배우기
+# 최대한 쉬운 조건으로 줄인 것이다. 바꾼 것 세 가지:
+#
+#  1) critic 이 보는 액션을 eef_position(3) + eef_rotation(6) = 9차원으로 제한.
+#     손가락 16관절을 빼면 625차원 -> 90차원 (7배 축소). 파지는 이미 안정적이고
+#     승패를 가르는 것은 팔의 궤적·타격 속도다.
+#  2) replan 20 -> 8, latency 5 -> 2. RTC prefix 가 후보 다양성을 누르는 효과를 줄이고
+#     (실측: prefix 있으면 후보 산포 0.019 -> 0.0047) 청크가 결과에 미치는 영향을
+#     더 국소적으로 만든다.
+#  3) 장면 고정 (seed 0) — 상태 지름길을 원천 차단한다.
+#
+# 제약: action_horizon(32) >= latency(2) + replan(8) = 10  OK
+#
+# DexJoCo hammer_nail — sim 에서 offline RL 루프(BC → 롤아웃 → critic → guidance)를
+# 한 번 관통시키는 실험. 설계 문서는 레포 루트의 DEXJOCO-SIM.md.
+#
+# 데이터에서 자동으로 나오는 것은 여기 적지 않는다 (robot_type, 차원, 그룹 경계,
+# 카메라 수·이름, language prompt) — 전부 <세션>/meta/{modality,info,tasks} 에서 온다.
+
+name: dexjoco_hammer_nail_d2r8_s0
+
+# 이 exp 가 쓰는 롤아웃 데이터셋 (레포 상대경로). replan_steps/inference_latency 와
+# 짝이 맞아야 한다 — 수집 때 쓴 창으로 n-step 리턴을 만들기 때문이다.
+dataset: rl-dataset/dexjoco/hammer_nail_d2r8_s0
+robot: panda_allegro          # info.json 의 robot_type 과 교차검증
+
+# --- 모달리티 레이아웃의 정본 -------------------------------------------------
+# BC 학습에 쓴 RLDX 등록 config (third_party/RLDX-1 기준 상대경로).
+# state/action/video 의 concat 순서는 이 파일이 정본이다. dexjoco 는 등록 config 의
+# 순서와 modality.json 의 start 순서를 일부러 일치시켜 두었다
+# (eef_position → eef_rotation → hand_joints).
+rldx_data_config: rldx/configs/data/dexjoco_panda_allegro_config.py
+
+# state/action 그룹 경계 (rd-rl 상대경로). 데이터셋의 meta/modality.json 사본.
+modality: modality/dexjoco_panda_allegro/modality.json
+
+# --- 정책 -------------------------------------------------------------------
+# <checkpoints>/ 아래 상대경로. 30k step (배치 64, lr 1e-4, horizon 32) 산출물.
+# 디렉토리 이름의 "bs16" 은 오타다 — 실제 학습은 batch 64 로 돌았다
+# (experiment_cfg/conf.yaml 의 training.global_batch_size = 64 로 확인).
+base_policy: dexjoco/dexjoco_hammer_nail_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs16_30k_1gpu_mlxp
+
+# --- 액션 청크 --------------------------------------------------------------
+# 롤아웃 클라이언트(sim/dexjoco/rollout_dexjoco.py)의 실제 실행 규약과 반드시 같아야
+# 한다. 클라이언트는 서버가 준 32-step 청크의 [latency, latency+replan) 구간만 실행한다.
+#
+# dexjoco 는 env.step 1회가 sim 20ms (control_dt 0.02 = physics 0.002 x 10) 이므로
+# 제어는 50Hz 다. 데이터셋 fps 는 영상·timestamp 에 맞춰 30 으로 선언돼 있지만 그건
+# 벤치마크 레코더의 관례일 뿐이다 (DEXJOCO-SIM.md §3). 아래 값은 sim 시간 기준으로
+# openarm 실기(20fps, exec 8 / latency 2 = 0.40s / 0.10s)와 일치하도록 골랐다:
+#     replan  20 x 20ms = 0.40 s
+#     latency  5 x 20ms = 0.10 s      (비율 1:4 도 openarm 과 동일)
+# 제약: action_horizon >= inference_latency + replan_steps  (32 >= 25) ✓
+#       action_horizon == 모델 config 의 action_horizon      (32) ✓
+action_horizon: 32
+replan_steps: 8
+inference_latency: 2
+
+# --- 탐색 범위 --------------------------------------------------------------
+# hammer_nail 은 못 삽입량이 타격 직전 수직 속도에 비례한다
+# (delta = 0.008 x min(3, |vz|/0.02), panda_hammer_nail_env.py:642) — 즉 궤적의
+# 위치/속도가 결과를 가르므로 EEF 위치가 1순위다.
+# 회전(rot6d 6차원)은 정규화 공간에서 한 차원을 미는 것이 물리적으로 무엇을 뜻하는지
+# 위치만큼 명확하지 않아 일단 제외한다. 손가락은 파악 안정성 쪽이라 2순위.
+#
+# 실측 (actnorm.npy 288,019 프레임에서 4,000개 표본, 실행 구간 스텝 5~24 의
+# t -> t+1 변화, 정규화 액션 공간, 중앙값/차원):
+#     eef_position  3차원   0.01562   <- 가장 활발. p90 0.0537
+#     eef_rotation  6차원   0.01006      (위치의 0.64배)
+#     hand_joints  16차원   0.00391      (위치의 0.25배)
+# 데이터도 물리적 근거와 같은 답을 준다 — 위치가 1순위다.
+#
+# **이 값은 guide_move 를 읽는 눈금이기도 하다.** rl/vla_rldx.py 의 --guide-move 도움말은
+# openarm 실측 0.022 를 기준으로 프레임 환산을 찍는데, dexjoco 의 값은 0.0156 이므로
+# 서버 로그의 "N 프레임치" 는 실제보다 작게 나온다 (0.2 -> 로그 9.1, 실제 12.8).
+explore_groups:
+  - eef_position
+  - eef_rotation
+
+# --- EXPO-FT 알고리즘 값 ----------------------------------------------------
+# openarm_rim.yaml 과 동일하게 원본 기본값을 유지한다. 여기 적어두는 이유는 태스크마다
+# 다르게 쓸 수 있게 하고, 원본에서 벗어나면 그 사실이 파일에 보이도록 하기 위함.
+expo:
+  N: 8                    # 관측당 base 후보 수
+  n_edit_samples: 8       # edit 후보 수
+  edit_scale: 0.2
+  num_qs: 10              # Q 앙상블 크기
+  num_min_qs: 2           # REDQ 부분집합 min
+  critic_layer_norm: true
+
+  # 프레임당 할인. 보상이 종료 시점 1회뿐(sparse terminal)이라 값 함수는
+  #     V(s_t) = gamma_eff^(남은 결정 수) = (discount^R)^((T-t)/R) = discount^(T-t)
+  # 로 정리되어 **replan_steps 가 상쇄된다.** 따라서 replan 이 openarm(8)보다 커도
+  # discount 를 올릴 이유가 없고, 맞춰야 할 것은 "프레임당 할인 대 에피소드 길이"다.
+  #   0.995 → 유효 지평 200 프레임.  에피소드 평균 289 / 최대 360.
+  #   시작 지점 V = 0.995^289 = 0.24  → Q 동적 범위 [0.24, 1.0]
+  # (0.998 은 0.56~1.0 으로 평평해져 초반/후반 구분이 흐려지고, 0.99 는 0.06 으로
+  #  초반이 사실상 0 이 된다. 분포형 헤드 bins=128 에서는 전자가 특히 불리하다.)
+  # 참고: rl/offline_iql.py:486 은 타깃에 discount ** replan_steps 를 쓴다
+  #       (0.995^20 = 0.905).
+  discount: 0.995
+  tau: 0.005              # target critic polyak
+  actor_lr: 3.0e-4        # residual(edit) actor
+  critic_lr: 3.0e-4       # critic + 비전 인코더
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0

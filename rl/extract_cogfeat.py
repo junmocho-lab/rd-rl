@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -90,6 +91,25 @@ start = 0
 if a.resume and out_path.is_file() and meta_path.is_file():
     start = int(json.loads(meta_path.read_text()).get("done", 0))
     feats = np.lib.format.open_memmap(out_path, mode="r+")
+    if feats.shape[0] != T:
+        # 세션이나 에피소드가 늘면 T 가 커진다. npy 는 헤더에 shape 이 박혀 있어 제자리에서
+        # 늘릴 수 없으므로 새 파일로 옮겨 담는다 — 기존 추출분은 그대로 살린다.
+        # 이 처리가 없으면 작은 파일에 쓰다 IndexError 로 죽고, 몇 시간짜리 추출을
+        # 처음부터 다시 하게 된다 (실제로 겪었다: 288019 짜리에 309490 번째를 쓰려다 죽음).
+        keep = min(start, feats.shape[0], T)
+        tmp = out_path.with_suffix(".npy.grow")
+        new_f = np.lib.format.open_memmap(tmp, mode="w+", dtype=feats.dtype,
+                                          shape=(T, feats.shape[1]))
+        for c0 in range(0, keep, 8192):
+            c1 = min(c0 + 8192, keep)
+            new_f[c0:c1] = feats[c0:c1]
+        new_f.flush()
+        del new_f, feats
+        os.replace(tmp, out_path)
+        feats = np.lib.format.open_memmap(out_path, mode="r+")
+        start = keep
+        print(f"[확장] cogfeat.npy 를 ({T}, {feats.shape[1]}) 로 늘렸다 "
+              f"— 기존 {keep} 프레임 보존")
     print(f"[이어받기] {start}/{T} 프레임")
 else:
     feats = None

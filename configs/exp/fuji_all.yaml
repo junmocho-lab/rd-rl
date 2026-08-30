@@ -1,0 +1,97 @@
+# fuji (rby1m_rh56f1) critic 학습용 exp — 335ep 중 성공 252 (75.2%)
+#
+# 이 이름이 캐시 디렉토리(<checkpoints>/fuji_all-critic/)를 정한다. only_success 와 all 은
+# 세션 구성이 달라(all 에만 inference_s180_fail_cases 가 있다) 프레임 수가 다르므로
+# cogfeat 캐시를 공유할 수 없다 — 그래서 --train-eps 플래그가 아니라 exp 를 나눈다.
+#
+# 데이터 실측:
+#   teleop A+B            143ep  성공 143 (100%)     전문가 시연
+#   hil_anchor x2          39ep  성공  39 (100%)     사람 개입 구간 포함 (is_intervention 컬럼 있음)
+#   inference 롤아웃      153ep  성공  70 (45.8%)    정책 롤아웃
+#     - rollout_101146      32ep  93.8%
+#     - rollout_dark         39ep  76.9%             조명 조건이 다르다
+#     - s180_20260829        51ep  19.6%
+#     - fail_cases           31ep   0.0%             **큐레이션된 실패 모음** — 무작위 표본이 아니다
+#
+#   주의: 전체 성공률 75.2% 는 정책의 실제 성공률이 아니다. teleop(전부 성공)과
+#   큐레이션된 실패가 섞인 값이다. BC 기준선으로 읽으면 안 된다.
+#
+# 데이터에서 자동으로 나오는 것은 여기 적지 않는다 (robot_type, 차원, 그룹 경계,
+# 카메라 수·이름, language prompt) — 전부 <세션>/meta/{modality,info,tasks} 에서 온다.
+
+name: fuji_all
+dataset: rl-dataset/fuji/0831_fuji_all      # 335ep / 218359프레임 / 30fps
+robot: rby1m_rh56f1               # info.json 의 robot_type 과 교차검증
+
+# --- 모달리티 레이아웃의 정본 -------------------------------------------------
+# state/action/video 의 concat 순서는 이 파일이 정본이다. modality.json 의 start/end 는
+# raw 컬럼에서 잘라낼 때만 쓴다. 어긋난 채 쓰면 관절이 조용히 뒤섞인다.
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+modality: modality/rby1m_rh56f1/modality.json
+
+# --- 정책 -------------------------------------------------------------------
+# <checkpoints>/ 아래 상대경로. config.json 실측: action_horizon 40,
+# rtc_training_max_delay 4, n_cog_tokens 64, video_length 1.
+base_policy: fuji/rldx_img_0828-40k-2gpu-128b-A-only
+
+# --- 액션 청크 --------------------------------------------------------------
+# action_horizon 40 은 모델 config 에서 확인했다.
+#
+# ★ replan_steps / inference_latency 는 **아직 확인되지 않은 값이다.**
+#   모델 config 는 rtc_inference_mode: none / delay 0 / exec_horizon 0 으로 꺼져 있고,
+#   데이터셋에도 컨트롤러 메타가 없다. 아래는 옛 fuji.yaml 의 값을 그대로 옮긴 추정치다.
+#   **실제 배포 컨트롤러의 execution_horizon / inference_latency_steps 로 반드시 교체할 것.**
+#   어긋나면 n-step 리턴 창이 실제 실행 길이와 달라져 critic 이 엉뚱한 것을 학습한다.
+#   제약: action_horizon >= inference_latency + replan_steps  (40 >= 11) ✓
+action_horizon: 40
+replan_steps: 8
+inference_latency: 3
+
+# --- critic 이 보는 액션 그룹 -------------------------------------------------
+# **dexjoco 에서 이 축이 성패를 갈랐다. fuji 에서 제일 먼저 ablation 할 것.**
+#   전 관절 625차원 → test-time 선택이 -16pp (해로움)
+#   eef pos+rot 90차원 → +17.5pp (이로움)
+#   (20,5) 세팅의 225차원 → BC 보다 나빠짐
+# 즉 90 근처는 되고 225 는 안 된다. fuji 의 창은 latency+replan = 11 스텝이므로:
+#   right_arm(7)                = 11 x  7 =  77차원   ← A 의 성공 구간
+#   right_arm(7) + torso(6)     = 11 x 13 = 143차원   ← 여기를 기본값으로 둔다
+#   + right_hand(6)             = 11 x 19 = 209차원   ← B 의 실패 구간에 가깝다
+#   전 관절(34)                 = 11 x 34 = 374차원   ← 쓰면 안 된다
+#
+# torso 를 넣는 이유는 태스크가 명시적으로 몸통 회전을 포함하기 때문이다:
+#   "Pick up the plastic tray by its handle, pull it out of the shelf,
+#    turn the torso, and place it into the other shelf."
+# 손은 파지라 dexjoco 의 hand_joints 와 같은 위치(2순위)로 본다.
+explore_groups:
+  - right_arm_joints
+  - torso_joints
+
+# --- 알고리즘 값 -------------------------------------------------------------
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.01
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+
+  # 프레임당 할인. 보상이 종료 시점 1회뿐이라 V(s_t) = discount^(T-t) 이고,
+  # 에피소드 시작 지점의 V 가 Q 의 동적 범위 하한이 된다.
+  #   fuji 평균 652 프레임에서   0.995 -> 0.038 (초반이 사실상 0)
+  #                              0.998 -> 0.271   ← 채택
+  #                              0.999 -> 0.521 (평평해서 초반/후반 구분이 흐려진다)
+  # dexjoco 는 289 프레임에서 0.995 (0.235) 로 튜닝했다. 0.998 이 그 동적 범위를
+  # fuji 의 에피소드 길이에 그대로 옮긴 값이다. 옛 fuji.yaml 의 0.999 는 너무 평평하다.
+  discount: 0.998
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
