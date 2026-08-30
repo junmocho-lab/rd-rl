@@ -9,8 +9,8 @@
                        # (background 는 PreemptMode=REQUEUE 라 런이 섞인다)
 #SBATCH --time=2:00:00   # 실측 19~20분, C 500K 는 ~55분. 요청 시간을 실측에 맞춰야
                        # Slurm backfill 이 빈 슬롯에 끼워 넣는다 (12h 를 걸면 대기가 길어진다)
-#SBATCH --output=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-critic_%j.out
-#SBATCH --error=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-critic_%j.err
+#SBATCH --output=out/dexjoco-critic_%j.out
+#SBATCH --error=out/dexjoco-critic_%j.err
 #
 # 학습은 ~150 step/s 라 200K 가 22분이다. --keep-steps 로 격자 스텝의 체크포인트를
 # 지켜두면 스텝 ablation 이 한 번의 학습으로 전부 나온다 (따로 5번 돌릴 필요 없음).
@@ -23,7 +23,15 @@
 export MODEL_OUTPUT_DIR
 
 set -uo pipefail
-REPO=/rlwrld2/home/junmo_cho/ws/rd-rl
+# ── 머신에 따라 달라지는 것은 전부 환경변수로 덮을 수 있다 ────────────────────
+# REPO 는 sbatch 를 던진 디렉토리(= 레포 루트)에서 온다. 다른 머신에 레포가 다른
+# 경로로 있어도 그대로 돌아간다. 명시하고 싶으면 --export=ALL,REPO=... 로 준다.
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$(pwd)}}
+if [ ! -d "$REPO/configs/exp" ]; then
+    echo "REPO 가 레포 루트가 아니다: $REPO"
+    echo "  레포 루트에서 sbatch 를 던지거나 --export=ALL,REPO=<루트> 를 줄 것"
+    exit 2
+fi
 cd "$REPO"
 
 EXP=${EXP:-dexjoco_hammer_nail_d2r8_s0}
@@ -40,8 +48,8 @@ HOLDOUT=${HOLDOUT:-0.1}
 TAG=${TAG:-${TRAIN_EPS}$([ "$NUM_MIN_QS" -gt 0 ] && echo _ens)}
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
-export HF_HOME=/workspace/junmo_cho/hf_cache
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 PY=$REPO/third_party/RLDX-1/.venv/bin/python
 

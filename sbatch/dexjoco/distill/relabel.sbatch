@@ -8,8 +8,8 @@
 #SBATCH --no-requeue   # preempt 되면 조용히 재시작하지 말고 죽어라
 #SBATCH --time=6:00:00   # 결정 7300 x 후보 32. 요청 시간을 실측에 맞춰야
                        # Slurm backfill 이 빈 슬롯에 끼워 넣는다 (12h 를 걸면 대기가 길어진다)
-#SBATCH --output=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-relabel_%j.out
-#SBATCH --error=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-relabel_%j.err
+#SBATCH --output=out/dexjoco-relabel_%j.out
+#SBATCH --error=out/dexjoco-relabel_%j.err
 #
 # PA-RL 액션 최적화로 데이터셋의 action 컬럼을 갈아끼운다 (action distillation 1단계).
 # 서빙(rl/vla_rldx.py)이 89% 를 낸 절차와 **같은 설정**이 기본값이다:
@@ -26,7 +26,15 @@
 export MODEL_OUTPUT_DIR
 
 set -uo pipefail
-REPO=/rlwrld2/home/junmo_cho/ws/rd-rl
+# ── 머신에 따라 달라지는 것은 전부 환경변수로 덮을 수 있다 ────────────────────
+# REPO 는 sbatch 를 던진 디렉토리(= 레포 루트)에서 온다. 다른 머신에 레포가 다른
+# 경로로 있어도 그대로 돌아간다. 명시하고 싶으면 --export=ALL,REPO=... 로 준다.
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$(pwd)}}
+if [ ! -d "$REPO/configs/exp" ]; then
+    echo "REPO 가 레포 루트가 아니다: $REPO"
+    echo "  레포 루트에서 sbatch 를 던지거나 --export=ALL,REPO=<루트> 를 줄 것"
+    exit 2
+fi
 cd "$REPO"
 
 EXP=${EXP:-dexjoco_hammer_nail_d2r8_s0}
@@ -47,8 +55,8 @@ CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/$(printf 'critic_%06d.pt' $STEP)
 OUT=$REPO/rl-dataset/dexjoco/relabel_${EXP}__${CTAG}@$((STEP/1000))k${EPS:+_$EPS}
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
-export HF_HOME=/workspace/junmo_cho/hf_cache
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 
 echo "=== $(date -Is)  relabel  $EXP  critic=$CTAG@$STEP  eps=$EPS"

@@ -8,8 +8,8 @@
 #SBATCH --no-requeue   # preempt 되면 조용히 재시작하지 말고 죽어라
                        # (background 는 PreemptMode=REQUEUE 라 런이 섞인다)
 #SBATCH --time=12:00:00
-#SBATCH --output=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-cogfeat_%j.out
-#SBATCH --error=/rlwrld2/home/junmo_cho/ws/rd-rl/out/dexjoco-cogfeat_%j.err
+#SBATCH --output=out/dexjoco-cogfeat_%j.out
+#SBATCH --error=out/dexjoco-cogfeat_%j.err
 #
 # cogfeat + actnorm 캐시만 만든다. critic 학습 잡을 여러 개 동시에 던지기 전에
 # EXP 당 한 번 돌려야 한다 — 안 그러면 여러 잡이 같은 캐시를 동시에 쓰며 깨진다.
@@ -20,15 +20,23 @@
 export MODEL_OUTPUT_DIR
 
 set -uo pipefail
-REPO=/rlwrld2/home/junmo_cho/ws/rd-rl
+# ── 머신에 따라 달라지는 것은 전부 환경변수로 덮을 수 있다 ────────────────────
+# REPO 는 sbatch 를 던진 디렉토리(= 레포 루트)에서 온다. 다른 머신에 레포가 다른
+# 경로로 있어도 그대로 돌아간다. 명시하고 싶으면 --export=ALL,REPO=... 로 준다.
+REPO=${REPO:-${SLURM_SUBMIT_DIR:-$(pwd)}}
+if [ ! -d "$REPO/configs/exp" ]; then
+    echo "REPO 가 레포 루트가 아니다: $REPO"
+    echo "  레포 루트에서 sbatch 를 던지거나 --export=ALL,REPO=<루트> 를 줄 것"
+    exit 2
+fi
 cd "$REPO"
 
 EXP=${EXP:-dexjoco_hammer_nail_d2r8_s0}
 DATA=$(awk '/^dataset:/{print $2; exit}' configs/exp/$EXP.yaml)
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
-export HF_HOME=/workspace/junmo_cho/hf_cache
-export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 PY=$REPO/third_party/RLDX-1/.venv/bin/python
 
