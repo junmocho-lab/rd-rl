@@ -12,6 +12,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 [ -d configs/exp ] || { echo "레포 루트에서 실행할 것"; exit 2; }
+ROOT=$(pwd)                     # 아래 서브셸에서 상대경로를 쓰지 않기 위해 한 번만 잡는다
 
 EXP=fuji_preflight
 SRC=rl-dataset/fuji/0831_fuji_all/rby1m_rh56f1_inference_s180_20260829_234913
@@ -80,28 +81,28 @@ $PY -u -m rl.relabel_parl --exp $EXP --data "$MINI" --checkpoints checkpoints \
     --out "${MINI}_relabel" || die "relabel 본편 — parquet 쓰기 / 관절 순열"
 
 step "7. LoRA 학습 5 스텝 — 인자가 fuji 에 맞는지"
-BASE=$PWD/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
+BASE=$ROOT/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
 MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
 AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
 RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
 echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD"
 ( cd third_party/RLDX-1 && .venv/bin/python -m rldx.experiment.launch_train \
-    --base-model-path "$BASE" --dataset-path "$PWD/../../${MINI}_relabel" \
+    --base-model-path "$BASE" --dataset-path "$ROOT/${MINI}_relabel" \
     --embodiment-tag GENERAL_EMBODIMENT --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora True --save-trainable-only True \
     --tune-projector False --tune-llm False --tune-visual False \
     --global-batch-size 4 --learning-rate 1e-4 --max-steps 5 --save-steps 5 \
     --num-gpus 1 --dataloader-num-workers 2 \
-    --output-dir "$PWD/../../checkpoints/fuji_distill/_preflight" \
+    --output-dir "$ROOT/checkpoints/fuji_distill/_preflight" \
     --experiment-name fuji_preflight ) || die "LoRA 학습 — launch_train 인자"
 
 step "8. LoRA 병합"
 CK=$(ls -d checkpoints/fuji_distill/_preflight/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
 [ -n "$CK" ] || die "LoRA 체크포인트가 안 나왔다"
 ( cd third_party/RLDX-1 && .venv/bin/python scripts/merge_lora_checkpoint.py \
-    --trainable-ckpt "$PWD/../../$CK" --base-ckpt "$BASE" \
-    --output "$PWD/../../checkpoints/fuji_distill/_preflight_merged" ) || die "merge_lora_checkpoint"
+    --trainable-ckpt "$ROOT/$CK" --base-ckpt "$BASE" \
+    --output "$ROOT/checkpoints/fuji_distill/_preflight_merged" ) || die "merge_lora_checkpoint"
 
 echo
 echo "════════ 전부 통과 ════════"
