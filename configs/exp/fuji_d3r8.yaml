@@ -1,0 +1,95 @@
+# fuji (rby1m_rh56f1) — critic 학습용 exp.  latency 3 / replan 8.
+#
+# 이 이름이 캐시 디렉토리(<checkpoints>/fuji_d3r8-critic/)를 정한다.
+#
+# ── 왜 exp 가 하나인가 ───────────────────────────────────────────────────────
+# 0831_fuji_only_success 는 0831_fuji_all 의 부분집합임을 확인했다 (7개 세션의 성공
+# 에피소드가 개수도 길이도 정확히 일치). 그러므로 all 하나만 두고 트레이너의
+# --train-eps success|all 로 두 critic 을 만든다. dexjoco 와 같은 방식이다.
+#
+# 그편이 단순할 뿐 아니라 **더 낫다**: only_success 로 학습하면 홀드아웃에 실패가 없어
+# AUC 를 계산할 수 없다. all 을 쓰면 --train-eps success 여도 홀드아웃에는 실패가 남아
+# (offline_iql_qvgm.py:226 은 train 만 필터한다) 학습 내내 AUC 를 볼 수 있다.
+#
+# ── 데이터 실측 (0831_fuji_all: 335ep / 218,359프레임 / 30fps) ───────────────
+#   teleop A+B            143ep  성공 143 (100%)     전문가 시연
+#   hil_anchor x2          39ep  성공  39 (100%)     is_intervention / is_stop 컬럼이 있다
+#   inference 롤아웃      153ep  성공  70 (45.8%)
+#     rollout_101146        32ep  93.8%
+#     rollout_dark          39ep  76.9%              조명 조건이 다르다
+#     s180_20260829         51ep  19.6%
+#     fail_cases            31ep   0.0%              **큐레이션된 실패 모음** (무작위 표본 아님)
+#
+#   주의: 전체 75.2% 를 BC 기준선으로 읽으면 안 된다. teleop(전부 성공)과 큐레이션된
+#   실패가 섞인 값이다. 정책의 실제 성공률을 알려면 별도의 무작위 롤아웃이 필요하다.
+#
+#   next.success 는 진짜 태스크 라벨이다 (에피소드 마지막 프레임에 True). fail_cases 를
+#   뺀 0831_fuji 만 보면 전부 성공이라 라벨이 없는 것처럼 보이니 주의.
+#
+# 데이터에서 자동으로 나오는 것은 여기 적지 않는다 (robot_type, 차원, 그룹 경계,
+# 카메라 수·이름, language prompt) — 전부 <세션>/meta/{modality,info,tasks} 에서 온다.
+
+name: fuji_d3r8
+dataset: rl-dataset/fuji/0831_fuji_all
+robot: rby1m_rh56f1               # info.json 의 robot_type 과 교차검증
+
+# --- 모달리티 레이아웃의 정본 -------------------------------------------------
+# state/action/video 의 concat 순서는 이 파일이 정본이다. modality.json 의 start/end 는
+# raw 컬럼에서 잘라낼 때만 쓴다. 어긋난 채 쓰면 관절이 조용히 뒤섞인다.
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+modality: modality/rby1m_rh56f1/modality.json
+
+# --- 정책 -------------------------------------------------------------------
+# <checkpoints>/ 아래 상대경로. config.json 실측: action_horizon 40,
+# rtc_training_max_delay 4, n_cog_tokens 64, video_length 1.
+base_policy: fuji/rldx_img_0828-40k-2gpu-128b-A-only
+
+# --- 액션 청크 --------------------------------------------------------------
+# 배포 컨트롤러 값 (확인함). 어긋나면 n-step 리턴 창이 실제 실행 길이와 달라져
+# critic 이 엉뚱한 것을 학습한다.
+# 제약: action_horizon >= inference_latency + replan_steps  (40 >= 11) ✓
+#       action_horizon == 모델 config 의 action_horizon      (40) ✓
+action_horizon: 40
+replan_steps: 8
+inference_latency: 3
+
+# --- critic 이 보는 액션 그룹 -------------------------------------------------
+# 창은 latency+replan = 11 스텝. right_arm_joints 7개만 보므로 11 x 7 = **77차원**.
+#
+# dexjoco 에서 이 축이 성패를 갈랐다 (실측):
+#   전 관절 625차원          test-time 선택 -16pp (해로움)
+#   eef pos+rot 90차원       +17.5pp (이로움).  20K critic 으로 76.0% vs BC 61.5%
+#   (20,5) 세팅의 225차원    BC 보다 나빠짐
+# 77 은 90 과 같은 구간이다. 전 관절(11 x 34 = 374)은 쓰면 안 된다.
+explore_groups:
+  - right_arm_joints
+
+# --- 알고리즘 값 -------------------------------------------------------------
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.01
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+
+  # 프레임당 할인. 보상이 종료 시점 1회뿐이라 V(s_t) = discount^(T-t) 이고,
+  # 에피소드 시작 지점의 V 가 Q 동적 범위의 하한이 된다. fuji 평균 652 프레임:
+  #     0.995 -> 0.038   초반이 사실상 0
+  #     0.998 -> 0.271   ← 채택
+  #     0.999 -> 0.521   평평해서 초반/후반 구분이 흐려진다
+  # dexjoco 는 289 프레임에서 0.995 (0.235) 로 튜닝했다. 0.998 은 그 동적 범위를
+  # fuji 의 에피소드 길이로 옮긴 값이다 (옛 fuji.yaml 의 0.999 는 너무 평평하다).
+  discount: 0.998
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
