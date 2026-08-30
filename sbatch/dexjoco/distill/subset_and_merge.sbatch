@@ -40,14 +40,15 @@ export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 
 if [ "$MODE" = subset ]; then
     SRC=$(awk '/^dataset:/{print $2; exit}' configs/exp/$EXP.yaml)
-    REL=${REL:-rl-dataset/dexjoco/relabel_${EXP}__success@20k_success}
+    DSDIR=$(dirname "$SRC")          # rl-dataset/dexjoco 또는 rl-dataset/fuji
+    REL=${REL:-$DSDIR/relabel_${EXP}__success@20k_success}
     echo "=== $(date -Is)  subset"
     # arm1: 원본 액션, 성공만 — "성공 에피소드로 파인튜닝만 해도 오른다" 를 재는 대조군.
     #       이게 없으면 arm2 의 숫자를 액션 개선 덕으로 귀속시킬 수 없다.
-    $V rl/make_subset.py --data "$SRC" --out rl-dataset/dexjoco/distill_arm1_bc_success --eps success || exit 1
+    $V rl/make_subset.py --data "$SRC" --out "$DSDIR/distill_arm1_bc_success" --eps success || exit 1
     # arm2: relabel 된 액션, 성공만
     if [ -d "$REL" ]; then
-        $V rl/make_subset.py --data "$REL" --out rl-dataset/dexjoco/distill_arm2_relabel_success --eps success || exit 1
+        $V rl/make_subset.py --data "$REL" --out "$DSDIR/distill_arm2_relabel_success" --eps success || exit 1
     else
         echo "[경고] relabel 출력이 없다: $REL — arm2 는 건너뛴다"
     fi

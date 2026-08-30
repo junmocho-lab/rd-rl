@@ -65,7 +65,10 @@ DRY=${DRY:-0}
 
 CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/$(printf 'critic_%06d.pt' $STEP)
 [ -f "$CRITIC" ] || { echo "critic 없음: $CRITIC"; exit 3; }
-OUT=$REPO/rl-dataset/dexjoco/relabel_${EXP}__${CTAG}@$((STEP/1000))k${EPS:+_$EPS}
+# 데이터셋 계열 디렉토리를 exp yaml 에서 유도한다 (dexjoco / fuji 를 하드코딩하면
+# 태스크를 옮길 때 경로가 어긋나 체인이 조용히 끊긴다).
+DSDIR=$(dirname "$(awk '/^dataset:/{print $2; exit}' configs/exp/$EXP.yaml)")
+OUT=$REPO/$DSDIR/relabel_${EXP}__${CTAG}@$((STEP/1000))k${EPS:+_$EPS}
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
 export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
