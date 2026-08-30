@@ -68,6 +68,25 @@ EMB=${EMB:-GENERAL_EMBODIMENT}
 [ -d "$BASE" ] || { echo "base policy 없음: $BASE"; exit 3; }
 [ -d "$REPO/$DATA" ] || { echo "데이터 없음: $REPO/$DATA"; exit 3; }
 
+# LeRobot 데이터셋 경로 목록을 만든다.
+#   dexjoco : 루트 자체가 하나의 데이터셋      → 1개
+#   fuji    : 루트 아래에 세션 디렉토리 여러 개 → N개
+# relabel/make_subset 출력도 입력과 같은 구조를 유지하므로 여기서 한 번에 처리한다.
+# launch_train 은 --dataset-paths (복수) 가 --dataset-path 보다 우선한다.
+collect_datasets() {
+    local root=$1
+    if [ -f "$root/meta/info.json" ]; then
+        echo "$root"
+    else
+        local d
+        for d in "$root"/*/; do
+            [ -f "$d/meta/info.json" ] && echo "${d%/}"
+        done
+    fi
+}
+mapfile -t DPATHS < <(collect_datasets "$REPO/$DATA")
+[ ${#DPATHS[@]} -gt 0 ] || { echo "LeRobot 데이터셋을 못 찾았다: $REPO/$DATA"; exit 3; }
+
 export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
@@ -93,10 +112,16 @@ echo "    data $REPO/$DATA"
 echo "    out  $OUT"
 echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD  embodiment=$EMB"
 echo "    steps=$STEPS  batch=$BATCH (장당 $((BATCH/NGPU)))  save마다=$SAVE → 체크포인트 $((STEPS/SAVE))개"
+echo "    데이터셋 ${#DPATHS[@]}개:"
+printf '      %s\n' "${DPATHS[@]}"
 "$REPO/third_party/RLDX-1/.venv/bin/python" -c "
-import json;i=json.load(open('$REPO/$DATA/meta/info.json'))
-print(f\"    데이터셋 {i['total_episodes']}ep / {i['total_frames']}프레임 → \"
-      f\"배치 $BATCH 에서 {i['total_frames']//$BATCH} 스텝/epoch, $STEPS 스텝 = {$STEPS/(i['total_frames']//$BATCH):.1f} epoch\")"
+import json,sys
+ps=sys.argv[1:]
+ep=sum(json.load(open(p+'/meta/info.json'))['total_episodes'] for p in ps)
+fr=sum(json.load(open(p+'/meta/info.json'))['total_frames'] for p in ps)
+spe=max(fr//$BATCH,1)
+print(f'    합계 {ep}ep / {fr}프레임 → 배치 $BATCH 에서 {spe} 스텝/epoch, '
+      f'$STEPS 스텝 = {$STEPS/spe:.1f} epoch')" "${DPATHS[@]}"
 
 cd "$REPO/third_party/RLDX-1"
 # use_wandb 기본값이 False 라 (train_config.py:390) WANDB=0 이면 아무것도 안 붙인다.
@@ -106,7 +131,7 @@ cd "$REPO/third_party/RLDX-1"
 torchrun --nproc_per_node="$NGPU" --standalone \
     rldx/experiment/launch_train.py \
     --base-model-path "$BASE" \
-    --dataset-path "$REPO/$DATA" \
+    --dataset-paths "${DPATHS[@]}" \
     --embodiment-tag "$EMB" \
     --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 \
