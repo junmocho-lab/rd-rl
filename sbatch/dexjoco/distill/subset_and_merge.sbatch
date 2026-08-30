@@ -33,7 +33,7 @@ cd "$REPO"
 
 EXP=${EXP:-dexjoco_hammer_nail_d2r8_s0}
 MODE=${MODE:?MODE 를 줘야 한다 (subset | merge)}
-V=/workspace/junmo_cho/dexjoco/venv/bin/python
+V=${V:-$REPO/third_party/RLDX-1/.venv/bin/python}
 export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
@@ -56,11 +56,11 @@ if [ "$MODE" = subset ]; then
 elif [ "$MODE" = merge ]; then
     TAG=${TAG:?TAG 를 줘야 한다}
     BASE=$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
-    RUN=$REPO/checkpoints/dexjoco_distill/${TAG}
+    RUN=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}
     # 마지막 체크포인트를 고른다
     CK=$(ls -d $RUN/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
     [ -n "$CK" ] || { echo "체크포인트 없음: $RUN"; exit 3; }
-    OUT=$REPO/checkpoints/dexjoco_distill/${TAG}_merged
+    OUT=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}_merged
     echo "=== $(date -Is)  merge  $CK → $OUT"
     cd "$REPO/third_party/RLDX-1"
     .venv/bin/python scripts/merge_lora_checkpoint.py \

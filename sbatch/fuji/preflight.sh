@@ -1,0 +1,113 @@
+#!/bin/bash
+# fuji 파이프라인 전체를 **8 에피소드 부분집합**으로 관통시킨다. 30~40분.
+#
+# 밤새 도는 긴 잡을 던지기 전에 이걸 먼저 돌린다. 잡히는 것들:
+#   · 경로/venv/HF 캐시 문제        · modality·관절 순서 불일치
+#   · 액션 차원 계산 오류            · qvgm critic 로딩
+#   · relabel 의 관절 순열 왕복      · LoRA 인자 (modality-config / horizon / rtc-delay)
+#   · LoRA 병합
+#
+# GPU 1장 있는 곳에서 (srun 안이든 로그인 노드든) 그냥 실행한다:
+#   bash sbatch/fuji/preflight.sh
+set -uo pipefail
+cd "$(dirname "$0")/../.." || exit 1
+[ -d configs/exp ] || { echo "레포 루트에서 실행할 것"; exit 2; }
+
+EXP=fuji_preflight
+SRC=rl-dataset/fuji/0831_fuji_all/rby1m_rh56f1_inference_s180_20260829_234913
+MINI=rl-dataset/fuji/_preflight
+PY=third_party/RLDX-1/.venv/bin/python
+
+export HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
+export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
+export PYTHONPATH="$PWD/third_party/RLDX-1:$PWD"
+[ -f "$HOME/.rldx_secrets.sh" ] && source "$HOME/.rldx_secrets.sh"
+
+step() { echo; echo "════════ $* ════════"; }
+die()  { echo; echo "✗ 실패: $*"; echo "  여기서 멈춘다. 위 로그를 보고 고친 뒤 다시 실행."; exit 1; }
+
+step "0. 백본이 오프라인으로 풀리나"
+$PY -c "
+from transformers import AutoConfig, AutoProcessor
+AutoConfig.from_pretrained('RLWRLD/RLDX-1-VLM'); AutoProcessor.from_pretrained('RLWRLD/RLDX-1-VLM')
+print('  ✓ RLDX-1-VLM config/processor 해결됨')" || die "HF 캐시에 RLDX-1-VLM 이 없다.
+  HF_TOKEN 을 넣고 HF_HUB_OFFLINE=0 으로 한 번 받거나, HF_HOME 을 캐시 있는 곳으로 지정할 것"
+
+step "1. 8 에피소드 미니 데이터셋 (성공/실패 섞어서)"
+rm -rf "$MINI"
+EPS=$($PY - <<PYEOF
+import pandas as pd, glob, json
+ok, ng = [], []
+for f in sorted(glob.glob("$SRC/data/*/*.parquet")):
+    d = pd.read_parquet(f, columns=["next.success","episode_index"])
+    (ok if d["next.success"].to_numpy().astype(bool).any() else ng).append(int(d["episode_index"].iloc[0]))
+print(",".join(str(x) for x in ok[:4] + ng[:4]))
+PYEOF
+) || die "에피소드 고르기"
+echo "  고른 에피소드: $EPS"
+$PY rl/make_subset.py --data "$SRC" --out "$MINI" --episodes "$EPS" || die "make_subset"
+
+step "2. 임시 exp yaml"
+sed -e "s|^name: .*|name: $EXP|" -e "s|^dataset: .*|dataset: $MINI|" \
+    configs/exp/fuji_d3r8.yaml > configs/exp/$EXP.yaml || die "yaml 생성"
+$PY -c "
+import yaml; d=yaml.safe_load(open('configs/exp/$EXP.yaml'))
+print(f\"  name={d['name']} dataset={d['dataset']} groups={d['explore_groups']}\")"
+
+step "3. cogfeat 추출 (8 에피소드)"
+$PY -u -m rl.extract_cogfeat --exp $EXP --data "$MINI" --checkpoints checkpoints --batch 16 --resume \
+    || die "extract_cogfeat — 모달리티/카메라/모델 로딩 문제"
+
+step "4. critic 학습 200 스텝 — 액션 차원이 77 로 찍혀야 한다"
+$PY -u -m rl.offline_iql_qvgm --exp $EXP --data "$MINI" --checkpoints checkpoints \
+    --features cogfeat.npy --action-groups right_arm_joints \
+    --train-eps all --discount 0.998 --expectile 0.8 --num-qs 2 --bins 128 --q-range 0,1 \
+    --latent 2048 --state-latent 256 --hidden 1024,512 --no-stepwise \
+    --steps 200 --holdout 0.25 --eval-every 100 --keep-last 2 --keep-steps 100 --no-wandb \
+    --tag smoke || die "critic 학습"
+
+step "5. relabel dry-run 8 결정 — 관절 순열 왕복까지 확인된다"
+$PY -u -m rl.relabel_parl --exp $EXP --data "$MINI" --checkpoints checkpoints \
+    --critic checkpoints/${EXP}-critic/smoke/critic_latest.pt --features cogfeat.npy \
+    --num-samples 4 --num-keep 2 --num-steps 2 --guide-move 0.05 --temp 0.001 \
+    --dry-run --limit 8 || die "relabel_parl — critic 로딩 / 액션 인덱스 / 후보 생성"
+
+step "6. relabel 본편 (8 에피소드) — parquet 재작성 + 순열 검증"
+$PY -u -m rl.relabel_parl --exp $EXP --data "$MINI" --checkpoints checkpoints \
+    --critic checkpoints/${EXP}-critic/smoke/critic_latest.pt --features cogfeat.npy \
+    --num-samples 4 --num-keep 2 --num-steps 2 --guide-move 0.05 --temp 0.001 \
+    --out "${MINI}_relabel" || die "relabel 본편 — parquet 쓰기 / 관절 순열"
+
+step "7. LoRA 학습 5 스텝 — 인자가 fuji 에 맞는지"
+BASE=$PWD/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
+MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
+AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
+RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
+echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD"
+( cd third_party/RLDX-1 && .venv/bin/python -m rldx.experiment.launch_train \
+    --base-model-path "$BASE" --dataset-path "$PWD/../../${MINI}_relabel" \
+    --embodiment-tag GENERAL_EMBODIMENT --modality-config-path "$MODCFG" \
+    --video-length 1 --n-cog-tokens 64 --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
+    --action-model-use-lora True --save-trainable-only True \
+    --tune-projector False --tune-llm False --tune-visual False \
+    --global-batch-size 4 --learning-rate 1e-4 --max-steps 5 --save-steps 5 \
+    --num-gpus 1 --dataloader-num-workers 2 \
+    --output-dir "$PWD/../../checkpoints/fuji_distill/_preflight" \
+    --experiment-name fuji_preflight ) || die "LoRA 학습 — launch_train 인자"
+
+step "8. LoRA 병합"
+CK=$(ls -d checkpoints/fuji_distill/_preflight/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
+[ -n "$CK" ] || die "LoRA 체크포인트가 안 나왔다"
+( cd third_party/RLDX-1 && .venv/bin/python scripts/merge_lora_checkpoint.py \
+    --trainable-ckpt "$PWD/../../$CK" --base-ckpt "$BASE" \
+    --output "$PWD/../../checkpoints/fuji_distill/_preflight_merged" ) || die "merge_lora_checkpoint"
+
+echo
+echo "════════ 전부 통과 ════════"
+echo "파이프라인 8단계가 끝까지 돌았다. 이제 본편을 걸어도 된다:"
+echo "    bash sbatch/fuji/chain.sh"
+echo
+echo "정리 (본편 전에 지울 것 — 미니 캐시가 본편 이름과 겹치지는 않지만 용량을 먹는다):"
+echo "    rm -rf $MINI ${MINI}_relabel checkpoints/${EXP}-critic checkpoints/fuji_distill/_preflight*"
+echo "    rm -f configs/exp/$EXP.yaml"

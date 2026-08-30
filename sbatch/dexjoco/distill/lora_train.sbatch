@@ -42,9 +42,14 @@ TAG=${TAG:?TAG 를 줘야 한다 (arm1 / arm2 / arm4)}
 STEPS=${STEPS:-2000}
 BATCH=${BATCH:-64}
 LR=${LR:-1e-4}
-OUT=$REPO/checkpoints/dexjoco_distill/${TAG}
+OUT=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}
 
 BASE=$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
+# ★ 전부 exp yaml / 모델 config 에서 온다. 하드코딩하면 태스크를 옮길 때 조용히 틀린다
+#   (dexjoco 는 panda_allegro / 32 / 8, fuji 는 rby1_f1 / 40 / 4).
+MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
+AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
+RTCD=$(python3 -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
 [ -d "$BASE" ] || { echo "base policy 없음: $BASE"; exit 3; }
 [ -d "$REPO/$DATA" ] || { echo "데이터 없음: $REPO/$DATA"; exit 3; }
 
@@ -58,7 +63,8 @@ echo "=== $(date -Is)  distill LoRA  tag=$TAG  gpus=$NGPU"
 echo "    base $BASE"
 echo "    data $REPO/$DATA"
 echo "    out  $OUT"
-/workspace/junmo_cho/dexjoco/venv/bin/python -c "
+echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD"
+"$REPO/third_party/RLDX-1/.venv/bin/python" -c "
 import json;i=json.load(open('$REPO/$DATA/meta/info.json'))
 print(f\"    데이터셋 {i['total_episodes']}ep / {i['total_frames']}프레임 → \"
       f\"배치 $BATCH 에서 {i['total_frames']//$BATCH} 스텝/epoch, $STEPS 스텝 = {$STEPS/(i['total_frames']//$BATCH):.1f} epoch\")"
@@ -70,9 +76,9 @@ torchrun --nproc_per_node="$NGPU" --standalone \
     --base-model-path "$BASE" \
     --dataset-path "$REPO/$DATA" \
     --embodiment-tag GENERAL_EMBODIMENT \
-    --modality-config-path rldx/configs/data/dexjoco_panda_allegro_config.py \
+    --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 \
-    --action-horizon 32 --rtc-training-max-delay 8 \
+    --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora True --save-trainable-only True \
     --tune-projector False --tune-llm False --tune-visual False \
     --global-batch-size "$BATCH" --learning-rate "$LR" \

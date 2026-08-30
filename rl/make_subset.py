@@ -21,20 +21,56 @@ p.add_argument("--eps", default="success", choices=("all", "success", "fail"))
 p.add_argument("--episodes", default="", help="쉼표로 나열한 원본 episode_index. --eps 보다 우선")
 a = p.parse_args()
 
+# fuji 처럼 세션 디렉토리 여러 개가 한 루트 아래 있는 데이터셋이면 세션마다 재귀한다.
+# (dexjoco 는 루트 자체가 하나의 LeRobot 데이터셋이라 이 분기를 안 탄다)
+if not (a.data / "meta/info.json").is_file():
+    subs = sorted(d for d in a.data.iterdir() if (d / "meta/info.json").is_file())
+    if not subs:
+        raise SystemExit(f"LeRobot 데이터셋이 아니다 (meta/info.json 없음): {a.data}")
+    print(f"[다중 세션] {len(subs)}개 세션에 각각 적용한다")
+    import subprocess, sys
+    for d in subs:
+        r = subprocess.run([sys.executable, __file__, "--data", str(d),
+                            "--out", str(a.out / d.name), "--eps", a.eps]
+                           + (["--episodes", a.episodes] if a.episodes else []))
+        if r.returncode == 3:
+            print(f"  [건너뜀] {d.name} — --eps {a.eps} 에 맞는 에피소드가 없다")
+        elif r.returncode:
+            raise SystemExit(f"세션 실패: {d.name}")
+    kept = sum(1 for d in subs if (a.out / d.name / "meta/info.json").is_file())
+    tot = sum(json.loads((a.out / d.name / "meta/info.json").read_text())["total_episodes"]
+              for d in subs if (a.out / d.name / "meta/info.json").is_file())
+    print(f"[출력] {a.out}  세션 {kept}/{len(subs)}개  에피소드 {tot}")
+    raise SystemExit(0)
+
 info = json.loads((a.data / "meta/info.json").read_text())
 meta = [json.loads(l) for l in (a.data / "meta/episodes.jsonl").read_text().splitlines() if l.strip()]
 CH = info["chunks_size"]
+
+def is_success(m):
+    """성공 라벨은 데이터셋마다 어디 있는지 다르다.
+
+    dexjoco : meta/episodes.jsonl 에 success 키가 있다.
+    fuji    : episodes.jsonl 에는 episode_index/tasks/length 뿐이고, 라벨은 parquet 의
+              next.success (에피소드 마지막 프레임에 True) 에 있다.
+    """
+    if "success" in m:
+        return bool(m["success"])
+    e = m["episode_index"]
+    f = a.data / info["data_path"].format(episode_chunk=e // CH, episode_index=e)
+    return bool(pd.read_parquet(f, columns=["next.success"])["next.success"].to_numpy().any())
 
 if a.episodes:
     want = [int(x) for x in a.episodes.replace(",", " ").split()]
 elif a.eps == "all":
     want = [m["episode_index"] for m in meta]
 else:
-    want = [m["episode_index"] for m in meta if bool(m.get("success")) == (a.eps == "success")]
+    want = [m["episode_index"] for m in meta if is_success(m) == (a.eps == "success")]
 by = {m["episode_index"]: m for m in meta}
 print(f"[선택] {len(want)}/{len(meta)} 에피소드  (--eps {a.eps})")
 if not want:
-    raise SystemExit("고른 에피소드가 없다")
+    print("고른 에피소드가 없다")
+    raise SystemExit(3)          # 부모(다중 세션)가 이 코드를 건너뛰기로 읽는다
 
 a.out.mkdir(parents=True, exist_ok=True)
 (a.out / "meta").mkdir(exist_ok=True)
