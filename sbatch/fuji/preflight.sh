@@ -31,6 +31,17 @@ export PYTHONPATH="$PWD/third_party/RLDX-1:$PWD"
 # 건너뛴 단계의 산출물이 없으면 그 자리에서 멈춘다.
 FROM=${FROM:-0}
 
+# GPU 가 없으면 3·4·5·6·7 단계가 전부 죽는다 (flash-attn 이 CUDA 를 요구한다).
+# 로그인 노드에서 실수로 돌리는 것을 여기서 잡는다 — 모델 로딩에 2분 쓰고 죽는 것보다 낫다.
+if ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "✗ GPU 가 안 보인다 (host=$(hostname))."
+    echo "  로그인 노드에서 직접 돌리면 안 된다. 둘 중 하나로:"
+    echo "      sbatch --export=ALL,FROM=$FROM sbatch/fuji/preflight.sbatch"
+    echo "      srun --gres=gpu:1 --pty bash   # 안에서 다시 실행"
+    exit 2
+fi
+echo "[GPU] $(nvidia-smi -L | wc -l)장  host=$(hostname)"
+
 step() { echo; echo "════════ $* ════════"; }
 skip() { echo; echo "──────── $* — 건너뜀 (FROM=$FROM) ────────"; }
 die()  { echo; echo "✗ 실패: $*"; echo "  여기서 멈춘다. 위 로그를 보고 고친 뒤 다시 실행."; exit 1; }
@@ -44,6 +55,8 @@ RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_train
 # conf.yaml 은 소문자 값을, CLI 는 enum 이름(대문자)을 쓴다.
 EMB=$(grep -m1 -oP '^\s*embodiment_tag:\s*\K\S+' "$BASE/experiment_cfg/conf.yaml" 2>/dev/null | tr 'a-z' 'A-Z')
 EMB=${EMB:-GENERAL_EMBODIMENT}
+# 백본 LLM 상단 N개 층 학습. 기본값 4 를 그대로 두면 800M 파라미터가 풀 파인튜닝된다.
+TOPLLM=${TOPLLM:-0}
 
 # 건너뛴 단계의 산출물이 실제로 있는지 먼저 확인한다. 없는 채로 진행하면
 # 엉뚱한 곳에서 죽어 원인 찾기가 어렵다.
@@ -174,6 +187,7 @@ echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD embodiment=$EMB"
     --video-length 1 --n-cog-tokens 64 --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora --save-trainable-only \
     --save-only-model \
+    --tune-top-llm-layers "$TOPLLM" \
     --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size 4 --learning-rate 1e-4 --max-steps 5 --save-steps 5 \
     --num-gpus 1 --dataloader-num-workers 2 \

@@ -54,6 +54,15 @@ BATCH=${BATCH:-128}                     # 전역 배치. GPU 4장이면 장당 3
 # 훨씬 작아진다 — 그래야 촘촘히 저장하는 것이 의미가 있다.
 SAVE=${SAVE:-1000}
 [ "$SAVE" -gt "$STEPS" ] && SAVE=$STEPS
+# ★ save_total_limit 기본값이 5 라 그냥 두면 **마지막 5개만 남고 나머지는 지워진다.**
+#   촘촘히 저장하는 목적이 "나중에 최적 스텝을 고르는 것" 이므로 전부 남겨야 한다.
+# ★ --tune-top-llm-layers 기본값이 **4** 다. tune_llm=False 여도 백본 LLM 상단 4개 층이
+#   학습 대상이 되어 (adapter.py:242) 800M 파라미터가 풀 파인튜닝된다 — 체크포인트가
+#   2.9GB 가 된 이유이자, "action expert 만 LoRA" 라는 설계와 다른 실험이 되는 이유다.
+#   0 으로 꺼야 어댑터만 학습된다. 백본까지 흔들고 싶으면 TOPLLM=4 로 되돌린다.
+TOPLLM=${TOPLLM:-0}
+NCK=$((STEPS / SAVE))
+SAVE_LIMIT=${SAVE_LIMIT:-$NCK}
 LR=${LR:-1e-4}
 OUT=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}
 
@@ -113,8 +122,10 @@ echo "=== $(date -Is)  distill LoRA  tag=$TAG  gpus=$NGPU"
 echo "    base $BASE"
 echo "    data $REPO/$DATA"
 echo "    out  $OUT"
-echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD  embodiment=$EMB"
-echo "    steps=$STEPS  batch=$BATCH (장당 $((BATCH/NGPU)))  save마다=$SAVE → 체크포인트 $((STEPS/SAVE))개"
+echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD  embodiment=$EMB  top_llm_layers=$TOPLLM"
+echo "    steps=$STEPS  batch=$BATCH (장당 $((BATCH/NGPU)))  save마다=$SAVE"
+echo "    체크포인트 ${NCK}개 보존 (save_total_limit=$SAVE_LIMIT) — preflight 실측 2.9GB/개 기준 약 $((NCK * 29 / 10))GB"
+df -h "$(dirname "$OUT")" 2>/dev/null | tail -1 | awk '{print "    디스크 여유 "$4" ("$5" 사용)"}'
 echo "    데이터셋 ${#DPATHS[@]}개:"
 printf '      %s\n' "${DPATHS[@]}"
 "$REPO/third_party/RLDX-1/.venv/bin/python" -c "
@@ -141,9 +152,10 @@ torchrun --nproc_per_node="$NGPU" --standalone \
     --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora --save-trainable-only \
     --save-only-model \
+    --tune-top-llm-layers "$TOPLLM" \
     --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size "$BATCH" --learning-rate "$LR" \
-    --max-steps "$STEPS" --save-steps "$SAVE" \
+    --max-steps "$STEPS" --save-steps "$SAVE" --save-total-limit "$SAVE_LIMIT" \
     --num-gpus "$NGPU" --dataloader-num-workers 8 \
     --output-dir "$OUT" \
     --experiment-name "${EXP%%_*}_distill_${TAG}" \
