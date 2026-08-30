@@ -49,6 +49,9 @@ BATCH=${BATCH:-128}                     # 전역 배치. GPU 4장이면 장당 3
 # 촘촘히 남겨 두면 나중에 "몇 스텝이 최적인가" 를 재학습 없이 고를 수 있다.
 # dexjoco 에서 critic 스텝이 성능을 18pp 갈랐고 세팅마다 최적점이 달랐다. 같은 일이
 # distillation 스텝에서도 일어난다면 여기 남겨둔 체크포인트가 그대로 답이 된다.
+# --save-only-model 을 켜서 optimizer/scheduler/RNG 상태를 안 남긴다. 그게 없으면
+# 체크포인트 하나가 8.7GB 가 되어 (preflight 실측) 30개면 260GB 다. 어댑터만 남기면
+# 훨씬 작아진다 — 그래야 촘촘히 저장하는 것이 의미가 있다.
 SAVE=${SAVE:-1000}
 [ "$SAVE" -gt "$STEPS" ] && SAVE=$STEPS
 LR=${LR:-1e-4}
@@ -137,6 +140,7 @@ torchrun --nproc_per_node="$NGPU" --standalone \
     --video-length 1 --n-cog-tokens 64 \
     --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora --save-trainable-only \
+    --save-only-model \
     --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size "$BATCH" --learning-rate "$LR" \
     --max-steps "$STEPS" --save-steps "$SAVE" \

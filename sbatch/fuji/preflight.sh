@@ -35,6 +35,16 @@ step() { echo; echo "════════ $* ════════"; }
 skip() { echo; echo "──────── $* — 건너뜀 (FROM=$FROM) ────────"; }
 die()  { echo; echo "✗ 실패: $*"; echo "  여기서 멈춘다. 위 로그를 보고 고친 뒤 다시 실행."; exit 1; }
 
+# 7·8 단계가 함께 쓰는 값. 게이트 밖에 둬야 FROM=8 로 병합만 돌릴 때도 정의된다.
+BASE=$ROOT/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
+MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
+AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
+RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
+# embodiment tag 는 BC 학습이 쓴 값과 같아야 한다 (dexjoco=general, fuji=new).
+# conf.yaml 은 소문자 값을, CLI 는 enum 이름(대문자)을 쓴다.
+EMB=$(grep -m1 -oP '^\s*embodiment_tag:\s*\K\S+' "$BASE/experiment_cfg/conf.yaml" 2>/dev/null | tr 'a-z' 'A-Z')
+EMB=${EMB:-GENERAL_EMBODIMENT}
+
 # 건너뛴 단계의 산출물이 실제로 있는지 먼저 확인한다. 없는 채로 진행하면
 # 엉뚱한 곳에서 죽어 원인 찾기가 어렵다.
 if [ "$FROM" -gt 0 ]; then
@@ -139,9 +149,6 @@ fi
 
 if [ "$FROM" -le 7 ]; then
 step "7. LoRA 학습 5 스텝 — 인자가 fuji 에 맞는지"
-BASE=$ROOT/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)
-MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
-AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
 
 # LeRobot 데이터셋 경로 목록을 만든다.
 #   dexjoco : 루트 자체가 하나의 데이터셋      → 1개
@@ -160,18 +167,13 @@ collect_datasets() {
 }
 mapfile -t DPATHS < <(collect_datasets "$ROOT/${MINI}_relabel")
 echo "  학습 데이터셋 ${#DPATHS[@]}개: ${DPATHS[*]}"
-RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
-# ★ embodiment tag 는 **BC 학습이 쓴 값과 같아야 한다.** 하드코딩하면 태스크를 옮길 때
-#   조용히 틀린다 (dexjoco=general_embodiment, fuji=new_embodiment).
-#   conf.yaml 은 소문자 값을, CLI 는 enum 이름(대문자)을 쓴다.
-EMB=$(grep -m1 -oP '^\s*embodiment_tag:\s*\K\S+' "$BASE/experiment_cfg/conf.yaml" 2>/dev/null | tr 'a-z' 'A-Z')
-EMB=${EMB:-GENERAL_EMBODIMENT}
 echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD embodiment=$EMB"
 ( cd third_party/RLDX-1 && .venv/bin/python -m rldx.experiment.launch_train \
     --base-model-path "$BASE" --dataset-paths "${DPATHS[@]}" \
     --embodiment-tag "$EMB" --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
     --action-model-use-lora --save-trainable-only \
+    --save-only-model \
     --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size 4 --learning-rate 1e-4 --max-steps 5 --save-steps 5 \
     --num-gpus 1 --dataloader-num-workers 2 \
