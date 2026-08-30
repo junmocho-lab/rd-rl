@@ -28,7 +28,20 @@
 # --guide-all 은 Q 가 반드시 높아지는데도 실측이 낮았다 (72% vs 84%) — critic 이
 # 가장 크게 과대평가한 것이 뽑히기 때문이다. 그래서 top-M 필터가 필요하다.
 
-: "${MODEL_OUTPUT_DIR:=/rlwrld-unified-checkpoints/junmo_cho/dexjoco-rl}"
+# 제출 플러그인이 MODEL_OUTPUT_DIR 를 요구하는데 **머신마다 허용 접두사가 다르다**:
+#   rlwrld2 : /rlwrld-unified-checkpoints/$USER/...
+#   fsx     : /fsx/rlwrld-unified-checkpoints/$USER/...
+# 이 잡은 거기에 아무것도 쓰지 않는다 (산출물은 전부 $REPO 아래). 플러그인 통과용이다.
+#
+# ★ 플러그인은 **제출 시점의 환경**을 본다. 그래서 아래 기본값은 `bash 이 파일` 로
+#   직접 돌릴 때만 효과가 있고, sbatch 로 던질 때는 셸에서 미리 export 해야 한다:
+#       export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
+#   그 뒤 --export=ALL 이 그것을 실어 나른다.
+if [ -z "${MODEL_OUTPUT_DIR:-}" ]; then
+    for _p in /fsx/rlwrld-unified-checkpoints /rlwrld-unified-checkpoints; do
+        if [ -d "$_p/$USER" ]; then MODEL_OUTPUT_DIR="$_p/$USER/rd-rl"; break; fi
+    done
+fi
 export MODEL_OUTPUT_DIR
 
 set -uo pipefail
@@ -65,7 +78,10 @@ case $METHOD in
 esac
 PARL_TEMP=${PARL_TEMP:-0}
 
-CKPT=$REPO/checkpoints/dexjoco/dexjoco_hammer_nail_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs16_30k_1gpu_mlxp
+# 평가할 정책. 기본은 exp yaml 의 base_policy 이고, distillation 결과를 재려면
+# MODEL_PATH 로 덮는다 (예: checkpoints/dexjoco_distill/arm2_merged).
+CKPT=${MODEL_PATH:-$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.yaml)}
+[ -d "$CKPT" ] || { echo "정책 체크포인트 없음: $CKPT"; exit 3; }
 if [ "$METHOD" = bc ]; then
   NAME=${NAME:-bc}
   CRITIC=""

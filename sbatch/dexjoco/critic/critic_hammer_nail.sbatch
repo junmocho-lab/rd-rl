@@ -19,7 +19,20 @@
 #
 # ※ EXP 당 cogfeat.sbatch 를 먼저 한 번 돌린 뒤에 던질 것 (캐시 경쟁 방지).
 
-: "${MODEL_OUTPUT_DIR:=/rlwrld-unified-checkpoints/junmo_cho/dexjoco-rl}"
+# 제출 플러그인이 MODEL_OUTPUT_DIR 를 요구하는데 **머신마다 허용 접두사가 다르다**:
+#   rlwrld2 : /rlwrld-unified-checkpoints/$USER/...
+#   fsx     : /fsx/rlwrld-unified-checkpoints/$USER/...
+# 이 잡은 거기에 아무것도 쓰지 않는다 (산출물은 전부 $REPO 아래). 플러그인 통과용이다.
+#
+# ★ 플러그인은 **제출 시점의 환경**을 본다. 그래서 아래 기본값은 `bash 이 파일` 로
+#   직접 돌릴 때만 효과가 있고, sbatch 로 던질 때는 셸에서 미리 export 해야 한다:
+#       export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
+#   그 뒤 --export=ALL 이 그것을 실어 나른다.
+if [ -z "${MODEL_OUTPUT_DIR:-}" ]; then
+    for _p in /fsx/rlwrld-unified-checkpoints /rlwrld-unified-checkpoints; do
+        if [ -d "$_p/$USER" ]; then MODEL_OUTPUT_DIR="$_p/$USER/rd-rl"; break; fi
+    done
+fi
 export MODEL_OUTPUT_DIR
 
 set -uo pipefail
