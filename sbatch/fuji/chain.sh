@@ -24,7 +24,18 @@ LSTEP=${LSTEP:-30000}         # LoRA 학습 스텝
 GPUS=${GPUS:-4}               # LoRA 학습에 쓸 GPU 수. global-batch-size 는 전역이라
                               # 몇 장을 쓰든 유효 배치는 같고 속도만 바뀐다
 WANDB_PROJECT=${WANDB_PROJECT:-rd-rl-distill}
-P=${PART:+-p $PART}
+# 파티션은 머신마다 다르다 (rlwrld2 = rlwrld, fsx = dedicated-rd). sbatch 파일의
+# #SBATCH --partition 은 명령줄 -p 가 덮으므로, 실제로 존재하는 것을 골라 붙인다.
+if [ -z "${PART:-}" ]; then
+    for _p in rlwrld dedicated-rd batch; do
+        if sinfo -h -p "$_p" >/dev/null 2>&1 && [ -n "$(sinfo -h -p "$_p" -o %P 2>/dev/null)" ]; then
+            PART=$_p; break
+        fi
+    done
+fi
+[ -n "${PART:-}" ] || { echo "쓸 수 있는 파티션을 못 찾았다. PART=<이름> 으로 지정할 것"; exit 2; }
+echo "파티션: $PART   LoRA GPU: ${GPUS:-4}장/arm"
+P="-p $PART"
 sb() { sbatch --parsable $P "$@"; }
 
 echo "══════ 1. cogfeat (218,359프레임, images.mm ~118GB, 약 1.5h) ══════"
