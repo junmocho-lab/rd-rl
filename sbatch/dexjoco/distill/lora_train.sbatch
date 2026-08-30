@@ -4,7 +4,9 @@
 #SBATCH --wckey=project-short-name:rd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:4   # 할당된 만큼 전부 쓴다 (NGPU 를 nvidia-smi 로 세어 torchrun 에 넘긴다).
+                       # 더/덜 쓰려면 제출할 때 sbatch --gres=gpu:N 으로 덮으면 된다.
+                       # --global-batch-size 는 "전역" 이라 GPU 수가 바뀌어도 유효 배치는 같다
 #SBATCH --no-requeue
 #SBATCH --time=4:00:00
 #SBATCH --output=out/dexjoco-distill-lora_%j.out
@@ -40,7 +42,15 @@ EXP=${EXP:-dexjoco_hammer_nail_d2r8_s0}
 DATA=${DATA:?DATA 를 줘야 한다 (학습할 LeRobot 데이터셋, 레포 상대경로)}
 TAG=${TAG:?TAG 를 줘야 한다 (arm1 / arm2 / arm4)}
 STEPS=${STEPS:-2000}
-BATCH=${BATCH:-64}
+WANDB=${WANDB:-1}                       # 0 이면 끈다
+WANDB_PROJECT=${WANDB_PROJECT:-rd-rl-distill}
+BATCH=${BATCH:-128}                     # 전역 배치. GPU 4장이면 장당 32
+# 저장 간격. LoRA 어댑터만 저장하므로(--save-trainable-only) 체크포인트가 작다 —
+# 촘촘히 남겨 두면 나중에 "몇 스텝이 최적인가" 를 재학습 없이 고를 수 있다.
+# dexjoco 에서 critic 스텝이 성능을 18pp 갈랐고 세팅마다 최적점이 달랐다. 같은 일이
+# distillation 스텝에서도 일어난다면 여기 남겨둔 체크포인트가 그대로 답이 된다.
+SAVE=${SAVE:-1000}
+[ "$SAVE" -gt "$STEPS" ] && SAVE=$STEPS
 LR=${LR:-1e-4}
 OUT=$REPO/checkpoints/${EXP%%_*}_distill/${TAG}
 
@@ -50,6 +60,11 @@ BASE=$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.
 MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
 AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
 RTCD=$(python3 -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
+# ★ embodiment tag 는 **BC 학습이 쓴 값과 같아야 한다.** 하드코딩하면 태스크를 옮길 때
+#   조용히 틀린다 (dexjoco=general_embodiment, fuji=new_embodiment).
+#   conf.yaml 은 소문자 값을, CLI 는 enum 이름(대문자)을 쓴다.
+EMB=$(grep -m1 -oP '^\s*embodiment_tag:\s*\K\S+' "$BASE/experiment_cfg/conf.yaml" 2>/dev/null | tr 'a-z' 'A-Z')
+EMB=${EMB:-GENERAL_EMBODIMENT}
 [ -d "$BASE" ] || { echo "base policy 없음: $BASE"; exit 3; }
 [ -d "$REPO/$DATA" ] || { echo "데이터 없음: $REPO/$DATA"; exit 3; }
 
@@ -58,32 +73,50 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_O
 export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
 [ -f "$HOME/.rldx_secrets.sh" ] && source "$HOME/.rldx_secrets.sh"
 
+# wandb 는 있으면 쓰고 없으면 조용히 끈다. 30K 스텝짜리 학습이 로깅 키 하나 없다고
+# 죽으면 안 된다 — 밤새 도는 체인에서는 특히.
+WB_ARGS=""
+if [ "$WANDB" = 1 ]; then
+    if [ -n "${WANDB_API_KEY:-}" ]; then
+        WB_ARGS="--use-wandb --wandb-project $WANDB_PROJECT"
+        echo "    wandb: $WANDB_PROJECT / ${EXP%%_*}_distill_${TAG}"
+    else
+        echo "    [경고] WANDB=1 인데 WANDB_API_KEY 가 없다 → 로깅 없이 진행한다"
+        echo "           ~/.rldx_secrets.sh 에 export WANDB_API_KEY=... 를 넣을 것"
+    fi
+fi
+
 NGPU=$(nvidia-smi -L | wc -l)
 echo "=== $(date -Is)  distill LoRA  tag=$TAG  gpus=$NGPU"
 echo "    base $BASE"
 echo "    data $REPO/$DATA"
 echo "    out  $OUT"
-echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD"
+echo "    modality=$MODCFG  horizon=$AH  rtc_max_delay=$RTCD  embodiment=$EMB"
+echo "    steps=$STEPS  batch=$BATCH (장당 $((BATCH/NGPU)))  save마다=$SAVE → 체크포인트 $((STEPS/SAVE))개"
 "$REPO/third_party/RLDX-1/.venv/bin/python" -c "
 import json;i=json.load(open('$REPO/$DATA/meta/info.json'))
 print(f\"    데이터셋 {i['total_episodes']}ep / {i['total_frames']}프레임 → \"
       f\"배치 $BATCH 에서 {i['total_frames']//$BATCH} 스텝/epoch, $STEPS 스텝 = {$STEPS/(i['total_frames']//$BATCH):.1f} epoch\")"
 
 cd "$REPO/third_party/RLDX-1"
-# use_wandb 기본값이 False 라 (train_config.py:390) 따로 끄지 않는다.
+# use_wandb 기본값이 False 라 (train_config.py:390) WANDB=0 이면 아무것도 안 붙인다.
+# tyro 파서는 불리언을 --flag / --no-flag 로 받는다. "--flag True" 로 주면
+#   Unrecognized arguments: True True False False False
+# 로 죽는다 (PARL-DISTILL.md 의 예시가 그 형식이라 그대로 옮기면 안 된다).
 torchrun --nproc_per_node="$NGPU" --standalone \
     rldx/experiment/launch_train.py \
     --base-model-path "$BASE" \
     --dataset-path "$REPO/$DATA" \
-    --embodiment-tag GENERAL_EMBODIMENT \
+    --embodiment-tag "$EMB" \
     --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 \
     --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
-    --action-model-use-lora True --save-trainable-only True \
-    --tune-projector False --tune-llm False --tune-visual False \
+    --action-model-use-lora --save-trainable-only \
+    --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size "$BATCH" --learning-rate "$LR" \
-    --max-steps "$STEPS" --save-steps $((STEPS/4)) \
+    --max-steps "$STEPS" --save-steps "$SAVE" \
     --num-gpus "$NGPU" --dataloader-num-workers 8 \
     --output-dir "$OUT" \
-    --experiment-name "dexjoco_distill_${TAG}" || exit 1
+    --experiment-name "${EXP%%_*}_distill_${TAG}" \
+    $WB_ARGS || exit 1
 echo "=== $(date -Is)  완료  $OUT"

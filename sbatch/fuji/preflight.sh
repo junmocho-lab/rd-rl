@@ -85,13 +85,18 @@ BASE=$ROOT/checkpoints/$(awk '/^base_policy:/{print $2; exit}' configs/exp/$EXP.
 MODCFG=$(awk '/^rldx_data_config:/{print $2; exit}' configs/exp/$EXP.yaml)
 AH=$(awk '/^action_horizon:/{print $2; exit}' configs/exp/$EXP.yaml)
 RTCD=$($PY -c "import json;print(json.load(open('$BASE/config.json'))['rtc_training_max_delay'])")
-echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD"
+# ★ embodiment tag 는 **BC 학습이 쓴 값과 같아야 한다.** 하드코딩하면 태스크를 옮길 때
+#   조용히 틀린다 (dexjoco=general_embodiment, fuji=new_embodiment).
+#   conf.yaml 은 소문자 값을, CLI 는 enum 이름(대문자)을 쓴다.
+EMB=$(grep -m1 -oP '^\s*embodiment_tag:\s*\K\S+' "$BASE/experiment_cfg/conf.yaml" 2>/dev/null | tr 'a-z' 'A-Z')
+EMB=${EMB:-GENERAL_EMBODIMENT}
+echo "  modality=$MODCFG horizon=$AH rtc_max_delay=$RTCD embodiment=$EMB"
 ( cd third_party/RLDX-1 && .venv/bin/python -m rldx.experiment.launch_train \
     --base-model-path "$BASE" --dataset-path "$ROOT/${MINI}_relabel" \
-    --embodiment-tag GENERAL_EMBODIMENT --modality-config-path "$MODCFG" \
+    --embodiment-tag "$EMB" --modality-config-path "$MODCFG" \
     --video-length 1 --n-cog-tokens 64 --action-horizon "$AH" --rtc-training-max-delay "$RTCD" \
-    --action-model-use-lora True --save-trainable-only True \
-    --tune-projector False --tune-llm False --tune-visual False \
+    --action-model-use-lora --save-trainable-only \
+    --no-tune-projector --no-tune-llm --no-tune-visual \
     --global-batch-size 4 --learning-rate 1e-4 --max-steps 5 --save-steps 5 \
     --num-gpus 1 --dataloader-num-workers 2 \
     --output-dir "$ROOT/checkpoints/fuji_distill/_preflight" \

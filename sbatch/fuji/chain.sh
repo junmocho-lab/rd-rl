@@ -21,6 +21,9 @@ export MODEL_OUTPUT_DIR HF_HOME
 E=fuji_d3r8
 CSTEP=${CSTEP:-5000}          # distillation 에 쓸 critic 스텝
 LSTEP=${LSTEP:-30000}         # LoRA 학습 스텝
+GPUS=${GPUS:-4}               # LoRA 학습에 쓸 GPU 수. global-batch-size 는 전역이라
+                              # 몇 장을 쓰든 유효 배치는 같고 속도만 바뀐다
+WANDB_PROJECT=${WANDB_PROJECT:-rd-rl-distill}
 P=${PART:+-p $PART}
 sb() { sbatch --parsable $P "$@"; }
 
@@ -64,14 +67,14 @@ SUB=$(sb --dependency=afterok:$RS \
       sbatch/dexjoco/distill/subset_and_merge.sbatch)
 echo "  $SUB  subset (after $RS)"
 
-echo "══════ 5. LoRA distill 2개 (각 $LSTEP 스텝) → 병합 ══════"
-L_S=$(sb --dependency=afterok:$SUB \
+echo "══════ 5. LoRA distill 2개 (각 $LSTEP 스텝, GPU ${GPUS}장, wandb=$WANDB_PROJECT) → 병합 ══════"
+L_S=$(sb --dependency=afterok:$SUB --gres=gpu:$GPUS \
       -J fuji-rby1m-rh56f1-distill-lora-finetune-success-arm-action-expert-30000steps \
-      --export=ALL,EXP=$E,DATA=rl-dataset/fuji/distill_arm2_relabel_success,TAG=S,STEPS=$LSTEP \
+      --export=ALL,EXP=$E,DATA=rl-dataset/fuji/distill_arm2_relabel_success,TAG=S,STEPS=$LSTEP,WANDB=1,WANDB_PROJECT=$WANDB_PROJECT \
       sbatch/dexjoco/distill/lora_train.sbatch)
-L_A=$(sb --dependency=afterok:$RA \
+L_A=$(sb --dependency=afterok:$RA --gres=gpu:$GPUS \
       -J fuji-rby1m-rh56f1-distill-lora-finetune-all-episodes-arm-action-expert-30000steps \
-      --export=ALL,EXP=$E,DATA=rl-dataset/fuji/relabel_${E}__all@$((CSTEP/1000))k_all,TAG=A,STEPS=$LSTEP \
+      --export=ALL,EXP=$E,DATA=rl-dataset/fuji/relabel_${E}__all@$((CSTEP/1000))k_all,TAG=A,STEPS=$LSTEP,WANDB=1,WANDB_PROJECT=$WANDB_PROJECT \
       sbatch/dexjoco/distill/lora_train.sbatch)
 for spec in "S:$L_S" "A:$L_A"; do
     T=${spec%%:*}; D=${spec##*:}
