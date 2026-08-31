@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fuji-rby1m-rh56f1-preflight-end-to-end-pipeline-smoke-test-8-episodes
-#SBATCH --partition=rlwrld
+#SBATCH --partition=dedicated-rd
 #SBATCH --wckey=project-short-name:rd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

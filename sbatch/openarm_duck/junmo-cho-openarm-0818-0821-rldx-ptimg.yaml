@@ -1,0 +1,149 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: junmo-cho-0818-0821-openarm-rh56f1-rldx-ptimg
+  namespace: p-rlwrld
+  labels:
+    project-code: rd
+    project-short-name: rd
+    mlxp/job-class: normal
+    user: junmo_cho # 2-1. 사용자 이름
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  activeDeadlineSeconds: 43200 # 12h (8 GPU 실측 2h54m; 6 GPU 예상 ~4h의 3배 여유)
+  template:
+    metadata:
+      labels:
+        project-code: rd
+        project-short-name: rd
+        mlxp/job-class: normal
+        user: junmo_cho # 2-2. 사용자 이름
+      annotations:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mlxp-registry
+      nodeSelector:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+      containers:
+        - name: main
+          image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+          env:
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/0818-0821-openarm-rh56f1-rldx-ptimg
+            - name: HF_HOME
+              value: /data/junmo_cho/hf_cache
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -euo pipefail
+
+              RUN_ID="$(date +%Y%m%d-%H%M%S)"
+              LOG_DIR="/data/junmo_cho/workspace/logs"
+              LOG_FILE="${LOG_DIR}/${RUN_ID}.log"
+
+              mkdir -p "$MODEL_OUTPUT_DIR"
+              mkdir -p "$LOG_DIR"
+
+              exec > >(tee "$LOG_FILE") 2>&1
+
+              command -v ffmpeg >/dev/null || (apt-get update -qq && apt-get install -y -qq ffmpeg)
+              cd /data/junmo_cho/workspace/RLDX-1
+              source .venv/bin/activate
+              export NO_ALBUMENTATIONS_UPDATE=1
+
+              DATA=/data/junmo_cho/workspace/datasets/openarm_data/openarm_0818_0819_rh56f1_teleop
+              DATA2=/data/junmo_cho/workspace/datasets/openarm_data/0821_openarm_rh56f1_teleop/openarm_rh56f1_teleop
+              export NUM_GPUS=4      # 아래 resources의 nvidia.com/gpu 와 반드시 일치시킬 것
+
+              # --dataset-mix-ratios: 프레임 비례 샘플링.
+              # RLDX-1 은 --dataset-paths 의 경로마다 spec 을 하나씩 만들어서
+              # factory.py 의 dataset_relative_lengths 가 항상 [1.0] 이 된다
+              # -> weight = 1.0 x mix_ratio. 즉 ratio 를 생략하면 서브셋이 크기와
+              # 무관하게 동일 확률로 뽑힌다.
+              # 값은 유효 step 수 = frames - eps x (action_horizon-1).
+              # openarm 은 action_horizon 16 이므로 에피소드당 15 프레임을 버린다:
+              #   0818_112551  15ep   4503f   4278   2.8%   (ep len 249-358)
+              #   0818_162411  59ep  18403f  17518  11.4%   (ep len 247-386)
+              #   0818_172202  70ep  19602f  18552  12.0%   (ep len 224-363)
+              #   0818_181023   4ep   1113f   1053   0.7%   (ep len 244-323)
+              #   0819_100515  45ep  13778f  13103   8.5%   (ep len 247-417)
+              #   0819_103502  30ep   8660f   8210   5.3%   (ep len 246-332)
+              #   0821_141301  50ep  13256f  12506   8.1%   (ep len 216-349)
+              #   0821_145647  75ep  20824f  19699  12.8%   (ep len 219-352)
+              #   0821_154908  50ep  13676f  12926   8.4%   (ep len 213-360)
+              #   0821_161813  50ep  12582f  11832   7.7%   (ep len 204-331)
+              #   0821_164402  50ep  12638f  11888   7.7%   (ep len 198-315)
+              #   0821_173409  50ep  12092f  11342   7.4%   (ep len 192-340)
+              #   0821_180252  14ep   3310f   3100   2.0%   (ep len 216-265)
+              #   0821_181537  36ep   8813f   8273   5.4%   (ep len 194-306)
+              #   0818_0819 소계 223ep  66059f  62714  40.7%
+              #   0821      소계 375ep  97191f  91566  59.3%
+              #   합계          598ep 163250f 154280
+              # 특정 서브셋을 강조/억제하려면 해당 값에 배수를 곱하면 된다.
+              # epoch = 30000 x 128 / 154280 = 24.9
+              #
+              # --action-horizon 16 은 openarm_inspire_config.py 의
+              # action delta_indices=list(range(16)) 과 반드시 일치해야 한다.
+              # 불일치면 assembly.py:305 의 _validate_action_horizon_matches_modality
+              # 가 ValueError 로 즉시 죽는다 (CJL 은 40 이었다).
+              # 이 데이터셋은 20 fps 이므로 16 step = 0.8초
+              # (CJL 은 30 fps / 40 step = 1.33초).
+              torchrun --nproc_per_node=$NUM_GPUS --standalone \
+                  rldx/experiment/launch_train.py \
+                  --base-model-path RLWRLD/RLDX-1-PT-IMG \
+                  --backbone-path RLWRLD/RLDX-1-VLM \
+                  --dataset-paths $DATA/red_20260818_112551_320x192 \
+                                  $DATA/red_20260818_162411_320x192 \
+                                  $DATA/red_20260818_172202_320x192 \
+                                  $DATA/red_20260818_181023_320x192 \
+                                  $DATA/red_20260819_100515_320x192 \
+                                  $DATA/red_20260819_103502_320x192 \
+                                  $DATA2/red_20260821_141301_320x192 \
+                                  $DATA2/red_20260821_145647_320x192 \
+                                  $DATA2/red_20260821_154908_320x192 \
+                                  $DATA2/red_20260821_161813_320x192 \
+                                  $DATA2/red_20260821_164402_320x192 \
+                                  $DATA2/red_20260821_173409_320x192 \
+                                  $DATA2/red_20260821_180252_320x192 \
+                                  $DATA2/red_20260821_181537_320x192 \
+                  --dataset-mix-ratios 4278 17518 18552 1053 13103 8210 \
+                                       12506 19699 12926 11832 11888 11342 3100 8273 \
+                  --embodiment-tag GENERAL_EMBODIMENT \
+                  --modality-config-path rldx/configs/data/openarm_inspire_config.py \
+                  --output-dir "$MODEL_OUTPUT_DIR" \
+                  --video-length 1 \
+                  --n-cog-tokens 64 \
+                  --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
+                  --global-batch-size 128 \
+                  --learning-rate 1e-4 \
+                  --max-steps 30000 \
+                  --dataloader-num-workers 32 \
+                  --experiment-name openarm_0818_0819_0821_rh56f1_teleop_all598ep_egostereo_ptimg_framewt_drop03_rtc12tr_bs128_30k_4gpu_mlxp \
+                  --use-wandb --wandb-project RLDX-1 \
+                  --action-horizon 16 \
+                  --rtc-training-max-delay 12 \
+                  --state-dropout-prob 0.3 \
+                  --num-gpus $NUM_GPUS \
+                  --random-crop-fraction 0.95
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+          # 4 GPU — 레퍼런스(8 GPU 96c/1408Gi)의 GPU당 12c/176Gi 비례 유지.
+          resources:
+            requests: { cpu: "32", memory: "704Gi", nvidia.com/gpu: "4" }
+            limits: { cpu: "32", memory: "704Gi", nvidia.com/gpu: "4" }

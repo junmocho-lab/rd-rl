@@ -1,0 +1,139 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: junmo-cho-0828-openarm-duck-rldx-ptimg
+  namespace: p-rlwrld
+  labels:
+    project-code: rd
+    project-short-name: rd
+    mlxp/job-class: normal
+    user: junmo_cho
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 0
+  # 12h. 이 데이터셋(16232 eff step)은 0818-0821 믹스(154280)의 1/9.5 크기지만
+  # step 수가 같으므로 wall-clock 은 데이터 크기와 무관하게 거의 동일하다.
+  activeDeadlineSeconds: 43200
+  template:
+    metadata:
+      labels:
+        project-code: rd
+        project-short-name: rd
+        mlxp/job-class: normal
+        user: junmo_cho
+      annotations:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+        sidecar.istio.io/inject: "false"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: mlxp-registry
+      nodeSelector:
+        mlx.navercorp.com/zone: private-h200-rlwrld-0
+      volumes:
+        - name: ddn
+          persistentVolumeClaim:
+            claimName: ddn-rlwrld-shared
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Gi
+      containers:
+        - name: main
+          image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+          env:
+            - name: MODEL_OUTPUT_DIR
+              value: /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/0828-openarm-duck-rldx-ptimg
+            - name: HF_HOME
+              value: /data/junmo_cho/hf_cache
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              #!/bin/bash
+              set -euo pipefail
+
+              RUN_ID="$(date +%Y%m%d-%H%M%S)"
+              LOG_DIR="/data/junmo_cho/workspace/logs"
+              LOG_FILE="${LOG_DIR}/${RUN_ID}.log"
+
+              mkdir -p "$MODEL_OUTPUT_DIR"
+              mkdir -p "$LOG_DIR"
+
+              exec > >(tee "$LOG_FILE") 2>&1
+
+              command -v ffmpeg >/dev/null || (apt-get update -qq && apt-get install -y -qq ffmpeg)
+
+              # sbatch 판(sbatch/openarm_duck/openarm_duck_rldx.sbatch)의
+              # /fsx/rlwrld/junmo_cho/ws/rd-rl/third_party/RLDX-1 에 대응하는 DDN 경로.
+              cd /data/junmo_cho/workspace/rd-rl/third_party/RLDX-1
+              source .venv/bin/activate
+              export NO_ALBUMENTATIONS_UPDATE=1
+
+              DATA=/data/junmo_cho/workspace/datasets/duckdoll_20260828
+              export NUM_GPUS=2    # 아래 resources 의 nvidia.com/gpu 와 반드시 일치시킬 것
+
+              # 단일 데이터셋: duckdoll_20260828_320x192fit
+              # 100 ep / 17732 frames / 16232 유효 step
+              # (= frames - ep x (action_horizon-1); horizon 16 이므로 에피소드당 15 프레임을
+              # 버린다). 20 fps, 에피소드 길이 143-234. 2026-08-28 meta/info.json 기준.
+              #   epoch = 30000 x 128 / 16232 = 236.6
+              #
+              # --dataset-mix-ratios 는 없다: --dataset-paths 항목이 하나면 dataset spec 도
+              # 하나뿐이라 weight 가 무조건 1.0 이다. (0818-0821 yaml 은 서브셋이 14개여서
+              # 프레임 비례 ratio 가 필요했다.)
+              #
+              # meta/ 에 stats.json 이 있다 — lerobot_episode_loader.py 가 assert 하는 파일.
+              # relative_stats.json 은 필요 없다: openarm_inspire_config.py 는 neck/arm 그룹에
+              # ActionRepresentation.DELTA 를 쓰고, 이 파일을 읽는 건 RELATIVE 그룹뿐이다
+              # (stats.py:253, state_action_processor.py:365).
+              #
+              # modality.json 이 openarm_inspire_config.py 와 일치한다: 조인트 그룹 5개
+              # (neck 0:2 / left_arm 2:9 / left_hand 9:15 / right_arm 15:22 /
+              # right_hand 22:28) + ego 카메라 2개. openarm 은 ego-stereo 뿐이고 wrist
+              # 카메라가 없다 (rby1_f1 쪽 config 는 wrist_left 를 세 번째 view 로 갖는다).
+              #
+              # --action-horizon 16 은 openarm_inspire_config.py 의
+              # action delta_indices=list(range(16)) 과 반드시 일치해야 한다. 불일치면
+              # assembly.py 의 _validate_action_horizon_matches_modality 가 ValueError 로
+              # 즉시 죽는다. 이 데이터셋은 20 fps 이므로 16 step = 0.8초
+              # (rby1_f1 fuji 런은 30 fps / 40 step = 1.33초).
+              #
+              # --embodiment-tag GENERAL_EMBODIMENT (projector id 0, 사전학습된 warm 슬롯)
+              # 은 openarm_inspire_config.py 가 등록하는 태그다. rby1_f1 런처럼
+              # NEW_EMBODIMENT 로 바꾸면 MODALITY_CONFIGS 조회에서 KeyError 가 난다.
+              torchrun --nproc_per_node=$NUM_GPUS --standalone \
+                  rldx/experiment/launch_train.py \
+                  --base-model-path RLWRLD/RLDX-1-PT-IMG \
+                  --backbone-path RLWRLD/RLDX-1-VLM \
+                  --dataset-paths $DATA/duckdoll_20260828_320x192fit \
+                  --embodiment-tag GENERAL_EMBODIMENT \
+                  --modality-config-path rldx/configs/data/openarm_inspire_config.py \
+                  --output-dir "$MODEL_OUTPUT_DIR" \
+                  --video-length 1 \
+                  --n-cog-tokens 64 \
+                  --color-jitter-params brightness 0.3 contrast 0.4 saturation 0.5 hue 0.08 \
+                  --global-batch-size 128 \
+                  --learning-rate 1e-4 \
+                  --max-steps 40000 \
+                  --dataloader-num-workers 16 \
+                  --experiment-name openarm_duck_0828_100ep_inspire_egostereo_ptimg_drop03_rtc5tr_bs128_40k_${NUM_GPUS}gpu_mlxp \
+                  --use-wandb --wandb-project RLDX-1 \
+                  --action-horizon 16 \
+                  --rtc-training-max-delay 5 \
+                  --state-dropout-prob 0.3 \
+                  --num-gpus $NUM_GPUS \
+                  --random-crop-fraction 0.95 \
+                  --save-only-model \
+                  --save-steps 10000
+          volumeMounts:
+            - name: ddn
+              mountPath: /data
+            - name: shm
+              mountPath: /dev/shm
+          # 8 GPU — 레퍼런스(8 GPU 96c/1408Gi)의 GPU당 12c/176Gi 비례 유지.
+          # 0818-0821 yaml 은 4 GPU(32c/704Gi)였으나, 이 yaml 은 sbatch 판의
+          # --gres=gpu:8 을 따라 8 GPU 로 맞췄다. 4 GPU 로 돌리려면 여기와
+          # 위의 NUM_GPUS 를 함께 32/704Gi/4 로 내릴 것.
+          resources:
+            requests: { cpu: "24", memory: "352Gi", nvidia.com/gpu: "2" }
+            limits: { cpu: "24", memory: "352Gi", nvidia.com/gpu: "2" }
