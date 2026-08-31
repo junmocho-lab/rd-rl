@@ -5,3 +5,12 @@
 [submodule "third_party/expo-ft"]
 	path = third_party/expo-ft
 	url = git@github.com:junmocho-lab/expo-ft.git
+[submodule "third_party/dexjoco"]
+	path = third_party/dexjoco
+	url = https://github.com/brave-eai/dexjoco.git
+[submodule "third_party/PolicyAgnosticRL"]
+	path = third_party/PolicyAgnosticRL
+	url = https://github.com/MaxSobolMark/PolicyAgnosticRL.git
+[submodule "third_party/qam"]
+	path = third_party/qam
+	url = https://github.com/ColinQiyangLi/qam.git

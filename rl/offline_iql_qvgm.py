@@ -167,7 +167,15 @@ if _stale:
 mod, _ = resolve_modality(a.data, None, RLDX, exp["rldx_data_config"], base)
 sessions = find_sessions(a.data)
 flat = build_flat(sessions, mod)
-build_images(sessions, flat, work / "images.mm", mod)
+# images.mm 은 **이미지 판 critic 일 때만** 필요하다. --features 로 미리 뽑아둔
+# cogfeat 을 쓰면 아래에서 npy 를 읽으므로 이 파일을 만들 이유가 없다 (실제로 이 함수의
+# 반환값을 쓰는 곳이 없고 open_images 도 호출되지 않는다).
+#   d5r20 기준 106GB / 비디오 디코딩 수십 분. 다른 머신으로 옮길 때도 이만큼이 빠진다.
+# 정렬은 아래 `fp.shape[0] == len(flat)` assert 가 지킨다.
+if not a.features:
+    build_images(sessions, flat, work / "images.mm", mod)
+else:
+    print(f"[skip] images.mm 생략 — feature 판 critic ({a.features})")
 proc = load_state_action_processor(base, RLDX, exp["rldx_data_config"])
 snorm = normalize_states(proc, mod.embodiment_tag, mod, flat.state)
 if not (work / "actnorm.npy").is_file():
