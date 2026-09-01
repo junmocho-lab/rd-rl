@@ -45,6 +45,10 @@ STEPS=${STEPS:-2000}
 WANDB=${WANDB:-1}                       # 0 이면 끈다
 WANDB_PROJECT=${WANDB_PROJECT:-rd-rl-distill}
 BATCH=${BATCH:-128}                     # 전역 배치. GPU 4장이면 장당 32
+# ★ 전역 배치라 **GPU 수가 곧 장당 배치를 정한다**. fsx H100 80GB 실측(잡 792):
+#   장당 128 -> OOM (79.0GiB 사용 후 280MiB 부족).  즉 GPU 1장 + BATCH 128 은 불가.
+#   장당 64 (GPU 2장) 이 안전한 하한이고, GPU 4장(장당 32)이면 여유롭다.
+#   GPU 를 줄이려면 BATCH 도 같이 줄여야 한다 — 유효 배치가 바뀌므로 실험이 달라진다.
 # 저장 간격. LoRA 어댑터만 저장하므로(--save-trainable-only) 체크포인트가 작다 —
 # 촘촘히 남겨 두면 나중에 "몇 스텝이 최적인가" 를 재학습 없이 고를 수 있다.
 # dexjoco 에서 critic 스텝이 성능을 18pp 갈랐고 세팅마다 최적점이 달랐다. 같은 일이
@@ -102,6 +106,8 @@ mapfile -t DPATHS < <(collect_datasets "$REPO/$DATA")
 export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
+# 단편화로 인한 OOM 을 줄인다 (OOM 메시지가 직접 권하는 설정).
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 [ -f "$HOME/.rldx_secrets.sh" ] && source "$HOME/.rldx_secrets.sh"
 
 # wandb 는 있으면 쓰고 없으면 조용히 끈다. 30K 스텝짜리 학습이 로깅 키 하나 없다고
@@ -138,11 +144,17 @@ print(f'    합계 {ep}ep / {fr}프레임 → 배치 $BATCH 에서 {spe} 스텝/
       f'$STEPS 스텝 = {$STEPS/spe:.1f} epoch')" "${DPATHS[@]}"
 
 cd "$REPO/third_party/RLDX-1"
+# ★ torchrun 은 **venv 안의 것**을 절대경로로 부른다. 맨 `torchrun` 은 PATH 에 의존해서
+#   venv 를 활성화하지 않은 클러스터에서 "torchrun: command not found" 로 2초 만에 죽는다
+#   (fsx 실측: 잡 783). 다른 단계들은 .venv/bin/python 을 절대경로로 쓰는데 여기만
+#   빠져 있었다.
+TORCHRUN="$REPO/third_party/RLDX-1/.venv/bin/torchrun"
+[ -x "$TORCHRUN" ] || { echo "torchrun 이 없다: $TORCHRUN"; exit 3; }
 # use_wandb 기본값이 False 라 (train_config.py:390) WANDB=0 이면 아무것도 안 붙인다.
 # tyro 파서는 불리언을 --flag / --no-flag 로 받는다. "--flag True" 로 주면
 #   Unrecognized arguments: True True False False False
 # 로 죽는다 (PARL-DISTILL.md 의 예시가 그 형식이라 그대로 옮기면 안 된다).
-torchrun --nproc_per_node="$NGPU" --standalone \
+"$TORCHRUN" --nproc_per_node="$NGPU" --standalone \
     rldx/experiment/launch_train.py \
     --base-model-path "$BASE" \
     --dataset-paths "${DPATHS[@]}" \
@@ -160,4 +172,13 @@ torchrun --nproc_per_node="$NGPU" --standalone \
     --output-dir "$OUT" \
     --experiment-name "${EXP%%_*}_distill_${TAG}" \
     $WB_ARGS || exit 1
+
+# ── 어댑터를 serve 의 --artifacts 형식(.pt)으로 변환 ─────────────────────────
+# merge(13GB/arm) 대신 이걸 쓴다. ExpoServer._load (rl/vla_rldx.py:540) 가
+# sd["lora"] 를 읽어 base 위에 LoRA 를 주입하는 경로가 이미 있고 (EXPO-FT 가 쓰던 것),
+# 키 이름도 그대로 맞는다. 체크포인트당 10MB 라 전 스텝을 남겨도 부담이 없고,
+# 그래야 "몇 스텝이 최적인가" 를 재학습·재merge 없이 고를 수 있다.
+"$REPO/third_party/RLDX-1/.venv/bin/python" "$REPO/utils/adapter_to_artifacts.py" \
+    --arm "$TAG" --all-steps || echo "  [경고] artifacts 변환 실패 — 나중에 수동으로 돌릴 것"
+
 echo "=== $(date -Is)  완료  $OUT"

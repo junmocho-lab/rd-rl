@@ -13,6 +13,13 @@ rollout한 데이터를 기반으로 critic을 학습한다. `sbatch/dexjoco/cri
 ## 4. Rollout with Critic
 학습한 critic을 활용하여 rollout을 진행한다. Test-time Q selection, Test-time Q guidance 같은 방법을 활용할 수 있다. action distillation을 하기전에 실제 critic으로 최적화한 action이 좋게 작동하는지 확인이 가능하다. `sbatch/dexjoco/rollout_w_critic` 참고.
 
+# Fuji
+```
+export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
+sbatch -p dedicated-rd --export=ALL,EXP=fuji_d4r16,HF_HOME=/fsx/rlwrld/junmo_cho/hf_cache sbatch/dexjoco/critic/cogfeat.sbatch
+```
+
+
 ## 1. 태스크: `hammer_nail`
 
 ### 1.1 왜 이 태스크인가
