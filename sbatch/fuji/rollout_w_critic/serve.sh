@@ -96,10 +96,11 @@ echo "    rrc 쪽 inference_latency_steps 가 $LATENCY, execution_horizon 이 $R
 # sim 클라이언트용이다. 실기 rrc 는 중첩 dict 를 보내므로 씌우면 키가 안 맞는다.
 ARGS=(--exp "$EXP" --model-path "$CKPT"
       --rtc-inference-mode trained --rtc-exec-horizon "$REPLAN"
-      --host "$HOST" --port "$PORT" --device "$DEVICE" --log-every "$LOG_EVERY")
+      --host "$HOST" --port "$PORT" --device "$DEVICE" --log-every "$LOG_EVERY"
+      --n-cand "$N_CAND")
 if [ -n "$CRITIC" ]; then
   ARGS+=(--artifacts "$CRITIC"
-         --n-cand "$N_CAND" --parl-keep "$PARL_KEEP" --parl-temp "$PARL_TEMP"
+         --parl-keep "$PARL_KEEP" --parl-temp "$PARL_TEMP"
          --guide-steps "$GUIDE_STEPS" --guide-move "$GUIDE_MOVE"
          --ood-gate "$OOD_GATE")
 fi

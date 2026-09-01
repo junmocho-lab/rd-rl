@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: junmo-cho-data-pod-2           # 주의: k8s 이름은 언더스코어 불가 (소문자/숫자/하이픈만)
+  namespace: p-rlwrld
+  labels:
+    project-code: rd
+    project-short-name: rd
+    mlxp/job-class: dedicated
+    user: junmo_cho
+  annotations:
+    mlx.navercorp.com/zone: private-h200-rlwrld-0
+    sidecar.istio.io/inject: "false"    # istio 주입은 pod 레벨 annotation 이어야 적용됨
+spec:
+  restartPolicy: Never          # 실패 시 컨테이너 재시작 안 함 (라운드 상태 꼬임 방지)
+  imagePullSecrets:
+  - name: mlxp-registry
+  volumes:
+  - name: ddn
+    persistentVolumeClaim:
+      claimName: ddn-rlwrld-shared
+  - name: dshm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
+  nodeSelector:
+    mlx.navercorp.com/zone: "private-h200-rlwrld-0"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/hostname
+            operator: In
+            values:
+            - h200-03-w-3c55
+  containers:
+  - name: main
+    image: mlxp.kr.ncr.ntruss.com/rlwrld-gpu-base:latest
+    env:
+      - name: RDRL_EXP
+        value: "__RUN_ID__"
+      - name: MODEL_OUTPUT_DIR
+        value: /data/rlwrld-unified-checkpoints/junmo_cho/checkpoints/0814-rby1-wuji2-cjl-v9-rldx-ptimg
+      - name: WANDB_API_KEY
+        value: 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
+    command: ["sleep", "infinity"]
+    resources:
+      requests:
+        cpu: "32"
+        memory: "440Gi"
+        nvidia.com/gpu: "4"
+      limits:
+        cpu: "32"
+        memory: "440Gi"
+        nvidia.com/gpu: "4"
+    volumeMounts:
+    - name: ddn
+      mountPath: /data
+    - name: dshm
+      mountPath: /dev/shm
