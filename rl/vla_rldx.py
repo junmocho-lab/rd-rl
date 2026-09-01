@@ -335,6 +335,7 @@ class ExpoServer:
 
     def __init__(self, exp: dict, model_path: Path, modality: Path, rldx_root: Path,
                  device: str = "cuda", artifacts: Path | None = None, seed: int = 0,
+                 lora: Path | None = None,
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
@@ -398,6 +399,27 @@ class ExpoServer:
                       f"[{self.latency},{self.latency + self.replan}) x 관절 {len(jsel)}개 "
                       f"= {int(self.cog_mask.sum())}/{self.cog.full} 차원")
         self.loaded = self._load(artifacts) if self.cog is None else ["cog-critic"]
+
+        # ── distillation LoRA 어댑터 (--lora) ────────────────────────────────
+        # --artifacts 는 인자가 하나라 cog-critic 을 넣으면 그 경로가 _load 를 건너뛴다
+        # (위 삼항). 그래서 증류 정책 + test-time guidance 를 **함께** 쓰려면 어댑터를
+        # 별도 인자로 받아야 한다. 키 이름은 setup_training(lora=True) 이 주입하는 것과
+        # 같아야 한다 — 다르면 strict=False 라 조용히 아무것도 안 붙고 base BC 가 뜬다.
+        if lora is not None:
+            lp = Path(lora)
+            if not lp.is_file():
+                raise SystemExit(f"--lora 파일이 없다: {lp}")
+            lsd = torch.load(lp, map_location=device, weights_only=True)
+            tensors = lsd.get("lora", lsd)          # {"lora": sd} 또는 sd 자체
+            self.vla.setup_training(lora=True)      # LoRA 주입 (옵티마이저는 안 쓴다)
+            r = self.vla.model.load_state_dict(tensors, strict=False)
+            if r.unexpected_keys:
+                raise SystemExit(f"--lora 키가 모델에 없다: {r.unexpected_keys[:3]}")
+            n_lora = sum("lora" in k for k in tensors)
+            meta = lsd.get("meta", {})
+            print(f"  [LoRA] {lp.name}  텐서 {len(tensors)} (lora {n_lora})"
+                  + (f"  arm={meta.get('arm')} step={meta.get('step')}" if meta else ""))
+            self.loaded = list(self.loaded) + [f"lora({n_lora})"]
 
         self.policy, self.runtime = self.vla.policy, self.vla.runtime
         if self.runtime.use_memory:
@@ -1117,6 +1139,11 @@ def _serve(argv: list[str]) -> int:
     p.add_argument("--model-path", required=True, type=Path, help="base BC 정책 디렉토리")
     p.add_argument("--modality", type=Path,
                    help="modality/<embodiment>/modality.json. 기본값은 exp yaml 의 modality 키")
+    p.add_argument("--lora", type=Path,
+                   help="distillation LoRA 어댑터(.pt). base 정책 위에 얹는다. "
+                        "--artifacts 로 critic 을 같이 주면 **증류 정책 + test-time "
+                        "guidance** 가 된다 (두 인자가 분리돼 있는 이유다). "
+                        "checkpoint-N/adapter.pt 를 그대로 주면 된다")
     p.add_argument("--artifacts", type=Path,
                    help="라운드 산출물 .pt (critic/encoder/residual). 없으면 랜덤 초기화")
     p.add_argument("--host", default="127.0.0.1")
@@ -1216,7 +1243,7 @@ def _serve(argv: list[str]) -> int:
     w, h = (int(v) for v in a.critic_image_size.lower().split("x"))
     print(f"EXPO 정책 서버 — 실험 {a.exp}")
     srv = ExpoServer(exp, a.model_path, modality, repo / "third_party" / "RLDX-1",
-                     device=a.device, artifacts=a.artifacts, seed=a.seed,
+                     device=a.device, artifacts=a.artifacts, seed=a.seed, lora=a.lora,
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,

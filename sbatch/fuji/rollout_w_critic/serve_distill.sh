@@ -78,17 +78,34 @@ if [ -z "${LORA:-}" ] || [ ! -f "$LORA" ]; then
 fi
 LSTEP_SHOWN=$(echo "$LORA" | sed 's|.*/checkpoint-\([0-9]*\)/.*|\1|')
 
-N_CAND=${N_CAND_OVERRIDE:-1}     # 증류 정책은 후보를 고르지 않는다
 
-# ★ --artifacts 인자는 하나뿐이라 LoRA 와 critic 을 동시에 넘길 수 없다.
-#   증류 정책은 액션 개선이 이미 안에 들어 있으므로 critic 없이 쓰는 것이 정상이다.
-#   test-time critic 과 비교하고 싶으면 base 정책에 대해 serve.sh 를 쓸 것.
-if [ "$METHOD" != bc ]; then
-  echo "METHOD=$METHOD 는 지원하지 않는다 — --artifacts 하나에 LoRA 와 critic 을 같이"
-  echo "넣을 수 없다. 증류 정책은 METHOD=bc 로 서빙하고, critic 비교는 serve.sh 로 할 것."
-  exit 2
+# 방법 프리셋. bc 면 증류 정책만, 나머지는 그 위에 test-time critic 을 얹는다
+# (--lora 와 --artifacts 가 분리돼 있어 둘을 동시에 쓸 수 있다).
+# guide_move 0.01 근거: fuji 1프레임 자연 변화량이 0.0051 이라 0.01 = 2.0 프레임치이고,
+# openarm 에서 89% 를 낸 0.05 가 그쪽 기준 2.3 프레임치였다. 실기에서 0.02 는 흔들렸다.
+case $METHOD in
+  bc)          N_CAND=1  ; PARL_KEEP=0  ; GUIDE_STEPS=0 ; GUIDE_MOVE=0    ; TEMP=0 ;;
+  sel32)       N_CAND=32 ; PARL_KEEP=0  ; GUIDE_STEPS=0 ; GUIDE_MOVE=0    ; TEMP=0 ;;
+  parl)        N_CAND=32 ; PARL_KEEP=10 ; GUIDE_STEPS=4 ; GUIDE_MOVE=0.01 ; TEMP=0 ;;
+  parl_sample) N_CAND=32 ; PARL_KEEP=10 ; GUIDE_STEPS=4 ; GUIDE_MOVE=0.01 ; TEMP=0.001 ;;
+  *) echo "METHOD 는 bc | sel32 | parl | parl_sample"; exit 2 ;;
+esac
+N_CAND=${N_CAND_OVERRIDE:-$N_CAND}
+PARL_KEEP=${PARL_KEEP_OVERRIDE:-$PARL_KEEP}
+GUIDE_STEPS=${GUIDE_STEPS_OVERRIDE:-$GUIDE_STEPS}
+GUIDE_MOVE=${GUIDE_MOVE_OVERRIDE:-$GUIDE_MOVE}
+PARL_TEMP=${PARL_TEMP:-$TEMP}
+OOD_GATE=${OOD_GATE:-0}
+
+if [ "$METHOD" = bc ]; then
+  CRITIC=""; NAME=${NAME:-distill_${ARM}@${LSTEP_SHOWN}}
+else
+  if [ "$STEP" -eq 0 ]; then CF=critic_latest.pt; else CF=$(printf 'critic_%06d.pt' "$STEP"); fi
+  CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/${CF}
+  [ -f "$CRITIC" ] || { echo "critic 없음: $CRITIC"; echo "있는 것:"; \
+        ls "$REPO/checkpoints/${EXP}-critic/${CTAG}" 2>/dev/null | grep '^critic_'; exit 3; }
+  NAME=${NAME:-distill_${ARM}@${LSTEP_SHOWN}__${METHOD}_${CTAG}@$((STEP/1000))k}
 fi
-NAME=${NAME:-distill_${ARM}@${LSTEP_SHOWN}}
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
 export HF_HOME=${HF_HOME:-/fsx/rlwrld/junmo_cho/hf_cache}
@@ -97,22 +114,30 @@ export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
 [ -x "$PY" ] || { echo "python 이 없다: $PY"; exit 3; }
 
-export RD_SERVE_INFO="{\"exp\":\"$EXP\",\"kind\":\"distill\",\"arm\":\"$ARM\",\"lora_step\":$LSTEP_SHOWN,\"lora\":\"$LORA\",\"base\":\"$CKPT\"}"
+export RD_SERVE_INFO="{\"exp\":\"$EXP\",\"kind\":\"distill\",\"arm\":\"$ARM\",\"lora_step\":$LSTEP_SHOWN,\"lora\":\"$LORA\",\"base\":\"$CKPT\",\"method\":\"$METHOD\",\"critic\":\"$CRITIC\"}"
 
 echo "=== $(date -Is)  fuji serve (distill)  $NAME"
 echo "    base   $CKPT"
 echo "    LoRA   $LORA"
 echo "    스텝   $LSTEP_SHOWN"
+echo "    critic ${CRITIC:-(없음 — 증류 정책만)}"
+echo "    n_cand=$N_CAND keep=$PARL_KEEP temp=$PARL_TEMP guide=${GUIDE_STEPS}x${GUIDE_MOVE} ood_gate=$OOD_GATE"
 echo "    replan=$REPLAN latency=$LATENCY  ->  $HOST:$PORT"
 echo "    ★ rrc 쪽 execution_horizon=$REPLAN, inference_latency_steps=$LATENCY 로 맞출 것"
 echo "      (d3r8 시절의 8/3 이 남아 있으면 청크가 어긋난다)"
 
 # --sim-wrapper 는 쓰지 않는다: flat 키를 보내는 sim 클라이언트용이고, 실기 rrc 는
 # 중첩 dict 를 보낸다.
-ARGS=(--exp "$EXP" --model-path "$CKPT" --artifacts "$LORA"
+ARGS=(--exp "$EXP" --model-path "$CKPT" --lora "$LORA"
       --rtc-inference-mode trained --rtc-exec-horizon "$REPLAN"
       --host "$HOST" --port "$PORT" --device "$DEVICE" --log-every "$LOG_EVERY"
       --n-cand "$N_CAND")
+if [ -n "$CRITIC" ]; then
+  ARGS+=(--artifacts "$CRITIC"
+         --parl-keep "$PARL_KEEP" --parl-temp "$PARL_TEMP"
+         --guide-steps "$GUIDE_STEPS" --guide-move "$GUIDE_MOVE"
+         --ood-gate "$OOD_GATE")
+fi
 [ -n "${DUMP_OBS:-}" ] && ARGS+=(--dump-obs "$DUMP_OBS")
 [ -n "${GUIDE_GROUPS:-}" ] && ARGS+=(--guide-groups "$GUIDE_GROUPS")
 
