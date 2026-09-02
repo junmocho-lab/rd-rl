@@ -48,6 +48,9 @@ class Config:
     """후보를 N개 내주는 서버 (expo.N 이 후보 수)."""
     episodes: int = 10
     seed: int = 0
+    fixed_scene: int = -1
+    """>=0 이면 그 시드로 장면을 고정한다 (A·B 세팅). -1 이면 에피소드마다 랜덤 (C 세팅).
+    공식은 rollout_dexjoco.py 와 같아야 페어 비교가 된다."""
     replan: int = 20
     rtc_delay: int = 5
     max_steps: int = 360
@@ -68,18 +71,24 @@ def snapshot(raw):
     n = mujoco.mj_stateSize(raw._model, mujoco.mjtState.mjSTATE_INTEGRATION)
     buf = np.empty(n, np.float64)
     mujoco.mj_getState(raw._model, raw._data, buf, mujoco.mjtState.mjSTATE_INTEGRATION)
+    # ★ env_step 을 반드시 포함해야 한다. panda_hammer_nail_env.step 이
+    #   self.env_step += 1 ; terminated = self.env_step >= 1000
+    # 이므로, 후보 32개를 시험하면 결정 하나에 660 스텝이 올라 두 번째 결정에서
+    # 환경이 영구 종료된다 (실측: sigma>0 에서 전부 0% / 깊이 0.0000 / 전부 동점).
     return (buf, float(raw._nail_depth), raw._data.mocap_pos.copy(),
-            raw._data.mocap_quat.copy(), list(getattr(raw, "_vz_buf", [])))
+            raw._data.mocap_quat.copy(), list(getattr(raw, "_vz_buf", [])),
+            int(getattr(raw, "env_step", 0)))
 
 
 def restore(raw, s):
-    buf, depth, mp, mq, vz = s
+    buf, depth, mp, mq, vz, estep = s
     mujoco.mj_setState(raw._model, raw._data, buf, mujoco.mjtState.mjSTATE_INTEGRATION)
     raw._nail_depth = depth
     raw._data.mocap_pos[:] = mp
     raw._data.mocap_quat[:] = mq
     if hasattr(raw, "_vz_buf"):
         raw._vz_buf.clear(); raw._vz_buf.extend(vz)
+    raw.env_step = estep
     mujoco.mj_forward(raw._model, raw._data)
 
 
@@ -91,6 +100,9 @@ def main(cfg: Config) -> None:
     while not hasattr(raw, "_nail_depth"):
         raw = raw.env                              # 래퍼를 벗긴다
     client = PolicyClient(cfg.host, cfg.port)
+    # 서버 기동(VLA 로딩)이 늦어도 기다린다. 고정 sleep 에 의존하면 3시간 세션이
+    # 첫 몇 분에 죽는다 — rollout_dexjoco 와 같은 재시도 루프를 쓴다.
+    client.wait_ready()
     cam_keys = dict(zip(DEFAULT_CAMERA_KEYS, TASK_CAMERAS[cfg.task]))
     prompt = TASK_PROMPTS[cfg.task]
 
@@ -133,8 +145,13 @@ def main(cfg: Config) -> None:
     for sg in [float(x) for x in cfg.sigma.split(",")]:
         n_succ, depths, ties, calls = 0, [], 0, 0
         for ep in range(cfg.episodes):
-            random.seed(cfg.seed + 7919 * ep)
-            np.random.seed(cfg.seed + 7919 * ep)
+            # ★ 씬 시드 공식을 rollout_dexjoco.py 와 **같게** 맞춘다. 다르면 오라클과
+            # BC/eval 이 서로 다른 장면을 보게 되어 같은 장면 페어 비교(McNemar)를 쓸 수
+            # 없다. fixed_scene >= 0 이면 그 값으로 고정하는 것도 같은 규약이다.
+            sd = (cfg.fixed_scene if cfg.fixed_scene >= 0
+                  else (cfg.seed * 1_000_003 + ep)) % (2 ** 31 - 1)
+            random.seed(sd)
+            np.random.seed(sd)
             obs, _ = env.reset()
             client.reset()
             rng = np.random.default_rng(1000 * ep + int(sg * 1e5))

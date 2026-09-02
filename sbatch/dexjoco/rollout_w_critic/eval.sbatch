@@ -70,12 +70,21 @@ RTC_DELAY=$(awk '/^inference_latency:/{print $2; exit}' configs/exp/$EXP.yaml)
 case $EXP in *_s0) SCENE=0 ;; *) SCENE=-1 ;; esac      # _s0 = 고정 장면
 
 # ── 방법 프리셋 ──────────────────────────────────────────────────────────────
+# 프리셋은 **기본값**이고 env 로 덮을 수 있다 (${X:-기본} 형태여야 한다 — 무조건
+# 대입하면 --export 로 준 값이 무시된다).
+#
+# ★ GUIDE_MOVE 는 세팅을 옮길 때마다 다시 재야 한다. 0.05 는 A(고정씬, 90차원)에서
+#   튜닝한 값인데 B 에는 우연히 잘 맞았고(87.5%) C(랜덤씬)에서는 재앙이었다
+#   (54% -> 29%, p=0.0008). critic 이 학습에서 못 본 배치를 만나면 상승이 액션을
+#   외삽 영역으로 밀고, keep-best 는 같은 critic 으로 판정하므로 자기 오차를 못 잡는다.
+#   A 에서도 0.01~0.05 가 정점이고 0.1 에서 꺾였다.
 case $METHOD in
-  bc)    N_CAND=1  ; PARL_KEEP=0  ; GUIDE_STEPS=0 ; GUIDE_MOVE=0    ;;
-  sel32) N_CAND=32 ; PARL_KEEP=0  ; GUIDE_STEPS=0 ; GUIDE_MOVE=0    ;;
-  parl)  N_CAND=32 ; PARL_KEEP=10 ; GUIDE_STEPS=4 ; GUIDE_MOVE=0.05 ;;
+  bc)    N_CAND=${N_CAND:-1}  ; PARL_KEEP=${PARL_KEEP:-0}  ; GUIDE_STEPS=${GUIDE_STEPS:-0} ; GM_DEF=0    ;;
+  sel32) N_CAND=${N_CAND:-32} ; PARL_KEEP=${PARL_KEEP:-0}  ; GUIDE_STEPS=${GUIDE_STEPS:-0} ; GM_DEF=0    ;;
+  parl)  N_CAND=${N_CAND:-32} ; PARL_KEEP=${PARL_KEEP:-10} ; GUIDE_STEPS=${GUIDE_STEPS:-4} ; GM_DEF=0.05 ;;
   *) echo "METHOD 는 bc | sel32 | parl"; exit 2 ;;
 esac
+GUIDE_MOVE=${GUIDE_MOVE:-$GM_DEF}
 PARL_TEMP=${PARL_TEMP:-0}
 
 # 평가할 정책. 기본은 exp yaml 의 base_policy 이고, distillation 결과를 재려면
@@ -88,7 +97,10 @@ if [ "$METHOD" = bc ]; then
 else
   if [ "$STEP" -eq 0 ]; then CF=critic_latest.pt; else CF=$(printf 'critic_%06d.pt' $STEP); fi
   CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/${CF}
-  NAME=${NAME:-${METHOD}__${CTAG}@$((STEP/1000))k}
+  # guide_move 가 프리셋 기본값과 다르면 이름에 박는다 — 스윕이 서로 덮어쓰면 안 된다.
+  _gm=""
+  [ "$GUIDE_MOVE" != "$GM_DEF" ] && _gm="_gm$(echo "$GUIDE_MOVE" | tr -d '.')"
+  NAME=${NAME:-${METHOD}${_gm}__${CTAG}@$((STEP/1000))k}
   [ -f "$CRITIC" ] || { echo "critic 없음: $CRITIC"; exit 3; }
 fi
 OUT=$REPO/rl-dataset/dexjoco/eval_${EXP}/${NAME}
@@ -100,6 +112,16 @@ SIM_PY=${SIM_PY:-/workspace/junmo_cho/dexjoco/venv/bin/python}   # dexjoco 는 p
 
 # 결과가 무엇으로 나왔는지 rollout_summary.json["serve"] 에 박힌다
 export RD_SERVE_INFO="{\"method\":\"$METHOD\",\"critic\":\"$CRITIC\",\"ctag\":\"$CTAG\",\"step\":$STEP,\"n_cand\":$N_CAND,\"parl_keep\":$PARL_KEEP,\"parl_temp\":$PARL_TEMP,\"guide_steps\":$GUIDE_STEPS,\"guide_move\":$GUIDE_MOVE,\"base_policy\":\"$CKPT\"}"
+
+# DUMP_N>0 이면 서버가 결정 프레임(후보 32개 + 상승 액션)을 npz 로 남긴다.
+# sim/dexjoco/cand_vs_guided.py 가 이걸 읽는다. 카메라는 뺀다 (프레임당 수 MB).
+DUMP_N=${DUMP_N:-0}
+DUMP_ARGS=""
+if [ "$DUMP_N" -gt 0 ]; then
+  DUMP_NPZ=${DUMP_NPZ:-$REPO/rl-dataset/dexjoco/eval_${EXP}/${NAME}__dump.npz}
+  DUMP_ARGS="--dump-obs $DUMP_NPZ --dump-n $DUMP_N --dump-no-cams"
+  echo "    dump   $DUMP_NPZ ($DUMP_N 프레임)"
+fi
 
 echo "=== $(date -Is)  $EXP / $NAME"
 echo "    replan=$REPLAN rtc_delay=$RTC_DELAY scene=$SCENE ep=$EPISODES port=$PORT"
@@ -118,7 +140,7 @@ else
       --exp $EXP --model-path "$CKPT" --artifacts "$CRITIC" \
       --rtc-inference-mode trained --rtc-exec-horizon $REPLAN \
       --n-cand $N_CAND --parl-keep $PARL_KEEP --parl-temp $PARL_TEMP \
-      --guide-steps $GUIDE_STEPS --guide-move $GUIDE_MOVE \
+      --guide-steps $GUIDE_STEPS --guide-move $GUIDE_MOVE $DUMP_ARGS \
       --sim-wrapper --log-every 25 --host 127.0.0.1 --port $PORT &
 fi
 trap "kill $! 2>/dev/null" EXIT

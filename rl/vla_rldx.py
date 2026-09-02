@@ -340,6 +340,7 @@ class ExpoServer:
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
                  log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64,
+                 dump_cams: bool = True,
                  ood_ref: float = 0.0, ood_gate: float = 0.0,
                  guide_groups: list[str] | None = None,
                  parl_keep: int = 0, parl_temp: float = 0.0):
@@ -440,6 +441,11 @@ class ExpoServer:
         # 실기 관측을 저장해 두면 오프라인에서 학습 데이터와 직접 대조할 수 있다.
         # critic 이 실기에서 OOD 인 이유(전처리 차이 vs 데이터 커버리지)를 가르는 유일한 길이다.
         self.dump_obs, self.dump_n, self.dumped = dump_obs, dump_n, []
+        self.dump_cams = dump_cams
+        # 에피소드/결정 인덱스. 롤아웃 클라이언트는 에피소드마다 reset 을 정확히 한 번
+        # 부른다(rollout_dexjoco.py:530, env.reset 직후) — run() 에서 그걸 가로챈다.
+        # 이게 있어야 덤프를 성공/실패로 가르고 에피소드 구간별로 볼 수 있다.
+        self._ep, self._dec = -1, 0
         # OOD 기준선: critic 이 **학습 분포 안**에서 보이는 앙상블 불일치.
         # 체크포인트에 기록돼 있으면 그것을 쓴다 (offline_iql 이 홀드아웃에서 재서 저장).
         # 없으면 --ood-ref, 그것도 없으면 실측 범위(0.007~0.02)의 보수적 상한 0.02.
@@ -605,8 +611,6 @@ class ExpoServer:
             self.vla.proc, self.vla.tag, self.mod, _cat_state(request.obs, self.mod))).to(f.device)
         cog = C.cog_of(f)
         lat = C.latent(cog, state)
-        if self.dump_obs is not None and len(self.dumped) < self.dump_n:
-            self._dump(request, cog, state, acts)
         rl_, rs = lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0)
 
         def score(a, k=None, lat_=None, st_=None):      # (B,k,full) → (B,k) 앙상블 min
@@ -631,6 +635,7 @@ class ExpoServer:
             M = min(self.parl_keep, n)
             keep = q_pre.topk(M, dim=1).indices                       # (B, M) 원본 인덱스
             acts = torch.gather(acts, 1, keep[..., None].expand(-1, -1, acts.shape[-1]))
+            kept0 = acts                       # 상승 **전** top-M. 덤프가 부모를 찾는 데 쓴다
             rlM, rsM = lat.repeat_interleave(M, 0), state.repeat_interleave(M, 0)
             if self.guide_steps > 0:
                 gd, _ = self._cog_guide(rlM, rsM, acts.reshape(B * M, -1))
@@ -646,6 +651,7 @@ class ExpoServer:
             # top-M 은 순서를 바꾸므로 원본 인덱스로 되돌려야 한다.
             chosen = acts[torch.arange(B, device=acts.device), sel]
             best = keep.gather(1, sel[:, None]).squeeze(1)
+            parent = kept0[torch.arange(B, device=acts.device), sel]
         elif self.guide_steps > 0 and self.guide_all:
             # 후보 **전부** 상승 → argmax. 처음엔 낮았는데 상승 후 더 높아지는 후보를 잡을 수
             # 있다. critic 이 작은 MLP 라 n배 비용이 지연에 거의 안 보인다.
@@ -658,6 +664,7 @@ class ExpoServer:
             best = q.argmax(dim=1)
         if self.parl_keep <= 0:
             chosen = acts[torch.arange(B, device=acts.device), best]
+            parent = acts0[torch.arange(B, device=acts0.device), best]
 
         # 편집 **전** 앙상블 불일치. 이게 이미 크면 그 상태 자체가 critic 의 학습 분포
         # 밖이라는 뜻이고, 편집 후에만 커지면 guidance 가 밀어낸 것이다 — 원인이 다르다.
@@ -676,34 +683,57 @@ class ExpoServer:
                 qf = C.q(lat, state, chosen, target=True)
                 gain = float(qf.min(0).values.mean()) - q0
                 gstd = float(qf.std(0).mean())
+        if self.dump_obs is not None and len(self.dumped) < self.dump_n:
+            self._dump(request, cog, state, acts0, chosen, parent, best_pre, q_pre,
+                       q0 + gain)
+        self._dec += 1
         return chosen, best, {"chosen_q": q0 + gain, "parl_entropy": ent,
                               "candidate_q_std": float(q_pre.std(dim=1).mean()),
                               "guide_gain": gain, "guide_ens_std": gstd,
                               "ens_std_pre": std_pre, "gated": skip,
                               "select_ratio_with_residual": 0.0}
 
-    def _dump(self, request, cog, state, acts):
-        """실기 관측 한 프레임을 모은다. dump_n 개가 차면 npz 로 쓴다.
+    def _dump(self, request, cog, state, acts, chosen, parent, best_pre, q_pre,
+              q_post):
+        """결정 한 프레임을 모은다. dump_n 개가 차면 npz 로 쓴다.
 
-        저장하는 것: 원본 uint8 카메라 프레임(프로세서 통과 **전**), 정규화된 state,
-        서버가 계산한 cog feature, base 후보 청크. 오프라인에서
-        `verify-cog --real-obs` 가 이걸 먹어 학습 데이터와 나란히 비교한다.
+        저장하는 것: 정규화된 state, 서버가 계산한 cog feature, base 후보 청크 전부,
+        **그리고 서버가 실제로 내보낸 액션(chosen)** — 상승을 했으면 상승 후 값이다.
+        후보 구름과 chosen 이 같은 공간에 있으므로 "guidance 가 BC 분포 밖으로 얼마나
+        나갔나" 를 오프라인에서 직접 잴 수 있다 (sim/dexjoco/cand_vs_guided.py).
+        카메라 프레임은 verify-cog --real-obs 용이라 --dump-no-cams 로 끌 수 있다
+        (프레임당 수 MB 라, 액션 분석만 할 때는 켤 이유가 없다).
         """
-        cams = {nm: np.asarray(request.obs["video"][nm])[:, -1][0]
-                for nm, _ in self.mod.video}          # (H,W,3) uint8 원본
-        self.dumped.append({"cog": cog[0].float().cpu().numpy(),
-                            "state": state[0].float().cpu().numpy(),
-                            "acts": acts[0].float().cpu().numpy(),
-                            **{f"cam_{k}": v for k, v in cams.items()}})
-        if len(self.dumped) >= self.dump_n:
+        rec = {"cog": cog[0].float().cpu().numpy(),
+               "state": state[0].float().cpu().numpy(),
+               "acts": acts[0].float().cpu().numpy(),
+               "chosen": chosen[0].float().cpu().numpy(),
+               "parent": parent[0].float().cpu().numpy(),
+               "best_pre": np.int64(int(best_pre[0])),
+               "q_pre": q_pre[0].float().cpu().numpy(),
+               "q_post": np.float32(q_post),
+               "ep": np.int64(self._ep), "dec": np.int64(self._dec)}
+        if self.dump_cams:
+            rec.update({f"cam_{nm}": np.asarray(request.obs["video"][nm])[:, -1][0]
+                        for nm, _ in self.mod.video})   # (H,W,3) uint8 원본
+        self.dumped.append(rec)
+        every = max(1, self.dump_n // 4)
+        if len(self.dumped) >= self.dump_n or len(self.dumped) % every == 0:
             out = {k: np.stack([d[k] for d in self.dumped])
                    for k in self.dumped[0]}
+            out["cog_mask"] = self.cog_mask.cpu().numpy()
+            out["guide_move"] = np.float32(self.guide_move)
+            out["guide_steps"] = np.int64(self.guide_steps)
+            out["parl_keep"] = np.int64(self.parl_keep)
             self.dump_obs.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(self.dump_obs, **out)
             sz = self.dump_obs.stat().st_size / 1e6
-            print(f"[덤프] 실기 관측 {len(self.dumped)} 프레임 → {self.dump_obs} ({sz:.1f}MB)\n"
-                  f"       오프라인 대조: python -m rl.vla_rldx verify-cog ... "
-                  f"--real-obs {self.dump_obs}", flush=True)
+            done = len(self.dumped) >= self.dump_n
+            print(f"[덤프] {len(self.dumped)}/{self.dump_n} 프레임 → {self.dump_obs} "
+                  f"({sz:.1f}MB){'' if done else '  …수집 계속'}", flush=True)
+            if done:
+                print(f"       분석: python sim/dexjoco/cand_vs_guided.py {self.dump_obs}",
+                      flush=True)
 
     def _cog_guide(self, lat, state, act):
         """test-time Q guidance — ∇_A Q 상승 + keep-best. (편집 액션, 최종 Q)
@@ -841,6 +871,20 @@ class ExpoServer:
             policy = RLDXSimPolicyWrapper(policy, strict=True)
             print("  [래퍼] RLDXSimPolicyWrapper — flat 관측 키를 중첩 dict 로 바꾼다 "
                   "(run_rldx_server.py --use-sim-policy-wrapper 와 동일)")
+        if self.dump_obs is not None:
+            # 에피소드 경계. PolicyServer 는 "reset" 을 policy.reset 으로 보내고
+            # (server_client.py:99), 롤아웃 클라이언트는 에피소드마다 정확히 한 번
+            # 부른다 (rollout_dexjoco.py:530, env.reset 직후).
+            # **래핑 뒤**에 걸어야 한다 — 위에서 policy 가 갈리기 때문이다.
+            _orig_reset = policy.reset
+
+            def _reset_counting(*args, **kw):
+                self._ep, self._dec = self._ep + 1, 0
+                return _orig_reset(*args, **kw)
+
+            policy.reset = _reset_counting
+            print("  [덤프] 에피소드 경계를 reset 으로 센다")
+
         print(f"\n  듣는다 tcp://{host}:{port}   (rrc zmq_client 가 붙으면 된다)", flush=True)
         PolicyServer(policy=policy, host=host, port=port).run()
 
@@ -1193,6 +1237,9 @@ def _serve(argv: list[str]) -> int:
                         "`verify-cog --real-obs <npz>` 로 학습 데이터와 대조해 critic 이 "
                         "실기에서 OOD 인 이유를 가른다")
     p.add_argument("--dump-n", type=int, default=64, help="덤프할 프레임 수")
+    p.add_argument("--dump-no-cams", action="store_true",
+                   help="덤프에서 카메라 프레임을 뺀다. 액션 분포 분석(cand_vs_guided)만 할 때 "
+                        "쓴다 — 프레임당 수 MB 가 빠져 수천 프레임을 모을 수 있다")
     p.add_argument("--log-every", type=int, default=25,
                    help="[EXPO] 한 줄을 몇 호출마다 찍을지. 1 이면 매 스텝 (진단용)")
     p.add_argument("--rtc-exec-horizon", type=int, default=0,
@@ -1248,6 +1295,7 @@ def _serve(argv: list[str]) -> int:
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
                      log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n,
+                     dump_cams=not a.dump_no_cams,
                      ood_ref=a.ood_ref, ood_gate=a.ood_gate,
                      parl_keep=a.parl_keep, parl_temp=a.parl_temp,
                      guide_groups=(None if not a.guide_groups else
