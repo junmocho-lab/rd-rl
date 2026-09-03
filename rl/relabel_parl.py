@@ -71,13 +71,15 @@ p.add_argument("--out", type=Path, help="출력 데이터셋 (기본: <data>-par
 p.add_argument("--groups", default="", help="편집할 action 그룹 (기본: exp yaml 의 explore_groups)")
 p.add_argument("--num-samples", type=int, default=32, help="PA-RL num_base_policy_actions")
 p.add_argument("--num-keep", type=int, default=10, help="PA-RL num_actions_to_keep")
-p.add_argument("--num-steps", type=int, default=10, help="PA-RL local optimization steps")
+p.add_argument("--num-steps", type=int, default=10,
+               help="PA-RL local optimization steps (원본 기본값 10). raw gradient 를\n"
+                    "쓰므로 스텝마다 |g| 를 다시 재고, 그래서 스텝 수가 실제로 의미를 갖는다\n"
+                    "(정규화 방식에서는 ‖g‖ 가 불변이라 스텝 수가 무의미했다)")
 p.add_argument("--step-size", type=float, default=3e-4, help="PA-RL 기본값")
 p.add_argument("--guide-move", type=float, default=0.0,
-               help="서빙(rl.vla_rldx)과 같은 스텝 파라미터화를 쓴다.\n"
-                    "매 스텝 g/‖g‖ 로 정규화해 총 이동거리를 guide_move·√d 로 고정한다.\n"
-                    "89%% 를 낸 설정이 --guide-move 0.05 --num-steps 4 다.\n"
-                    "0 이면 옛 방식(--step-size / --auto-step)")
+               help="[비권장] g/‖g‖ 정규화 방식. 총 이동거리를 guide_move·√d 로 **고정**한다.\n"
+                    "critic 이 평평한 상태에서도 같은 거리를 밀어붙이므로 PA-RL 원본보다\n"
+                    "공격적이다. 0(기본) 이면 원본과 같은 raw-gradient 방식을 쓴다.")
 p.add_argument("--auto-step", type=float, default=0.0,
                help="차원당 목표 이동거리 D. 주면 ‖g‖ 를 재서 step_size 를 잡는다 "
                     "(PA-RL 의 3e-4 는 우리 Q 스케일에서 사실상 아무 일도 안 한다)")
@@ -130,13 +132,16 @@ QVGM = torch.load(ck, map_location="cpu").get("kind") == "qvgm"
 if QVGM:
     from rl.critic_io import load_stepwise_critic
     C = load_stepwise_critic(ck, work, snorm, dev=dev)
-    # 서빙(rl/vla_rldx.py)과 **정확히 같은 집계**를 쓴다. 89% 를 낸 것이 이 조합이다:
-    #   후보 선택 / keep-best 판정 → 앙상블 min  (:590, :715)
-    #   상승 방향 ∇_A Q           → 앙상블 mean (:709, PA-RL 원본이 mean 인 자리)
+    # PA-RL 원본과 **같은 집계**를 쓴다 (action_optimization.py):
+    #   상승 방향 ∇_A Q  → 앙상블 mean  (optimize_critic_ensemble_min=False 가 기본값)
+    #   후보 선택/판정   → 앙상블 mean  (:365 forward_critic(...).mean(axis=0) 하드코딩)
+    # 이전에는 선택만 min 을 썼다 (보수적 의도). 상승과 선택이 다른 목적함수를 보면
+    # "상승이 올린 것"과 "선택이 고르는 것"이 어긋나므로 원본대로 통일한다.
     def q_min(lat, st, act):
         return C.q(lat, act)                       # 이미 min(헤드) + sum(위치)
     def q_mean(lat, st, act):
         return C.q_all(lat, act).mean(0).sum(-1)
+    q_sel = q_mean                                 # 선택도 mean (PA-RL 원본)
     def v_of(lat, st):
         return C.v(lat)
 else:
@@ -146,6 +151,7 @@ else:
         return C.q(lat, st, act).min(0).values
     def q_mean(lat, st, act):
         return C.q(lat, st, act).mean(0)
+    q_sel = q_mean                                 # 선택도 mean (PA-RL 원본)
     def v_of(lat, st):
         return C.v(lat, st)
 
@@ -214,7 +220,7 @@ def candidates(idx):
     st = torch.from_numpy(snorm[idx]).to(dev)
     lat = C.latent_of(idx, st)
     with torch.no_grad():
-        q = q_min(lat.repeat_interleave(a.num_samples, 0),
+        q = q_sel(lat.repeat_interleave(a.num_samples, 0),
                   st.repeat_interleave(a.num_samples, 0),
                   acts.reshape(b * a.num_samples, FULL))   # 서빙과 같게 앙상블 min
     top = q.view(b, a.num_samples).topk(min(a.num_keep - 1, a.num_samples), dim=1).indices
@@ -234,22 +240,29 @@ def ascend(cand, lat, st):
     rl_, rs = lat.repeat_interleave(K, 0), st.repeat_interleave(K, 0)
     best = cand.reshape(b * K, FULL)
     with torch.no_grad():
-        bq = q_min(rl_, rs, best)
+        bq = q_sel(rl_, rs, best)
+    # step_size 0 = **상승 없음, 선택만**. 순수한 ablation arm 이라 정확히 끊어야 한다:
+    # 루프를 그냥 돌면 cur = (cur + 0*g).clamp(-1,1) 이 되는데, BC 샘플이 ±1 을 살짝
+    # 벗어나 있으면 clamp 가 값을 바꿔 "상승 없음" 이 아니게 된다.
+    if a.step_size == 0 and a.guide_move == 0:
+        return best.view(b, K, FULL), bq.view(b, K), torch.zeros(b * K, device=best.device)
     cur, g_last = best, torch.zeros_like(best)
     for _ in range(a.num_steps):
         cur = cur.clone().detach().requires_grad_(True)
         with torch.enable_grad():
-            qm = q_mean(rl_, rs, cur).sum()          # 방향만 mean (PA-RL 원본 자리)
+            qm = q_mean(rl_, rs, cur).sum()          # 상승 방향: 앙상블 mean (PA-RL 원본)
             g, = torch.autograd.grad(qm, cur)
         g = g * MASK
         g_last = g
-        if a.guide_move > 0:                          # 서빙과 같은 per-example 정규화
-            gn = g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            cur = (cur.detach() + STEP * g / gn).clamp(-1.0, 1.0)
-        else:
-            cur = (cur.detach() + a.step_size * g).clamp(-1.0, 1.0)
+        # PA-RL 원본과 같은 raw-gradient 갱신 (action_optimization.py:129):
+        #     actions = actions + step_size * critic_gradient
+        # **정규화하지 않는다.** g/‖g‖ 로 정규화하면 critic 이 평평한 상태(= 신뢰할 수
+        # 없는 상태)에서도 정해진 거리를 밀어붙인다. raw gradient 는 ‖∇Q‖ 에 비례하므로
+        # OOD 에서 분포형 헤드가 포화해 |g| 가 작아지면 자동으로 덜 움직인다 —
+        # 그 자기 제한이 보수성의 핵심이다.
+        cur = (cur.detach() + a.step_size * g).clamp(-1.0, 1.0)
         with torch.no_grad():
-            qq = q_min(rl_, rs, cur)                  # 채택 판정은 min (보수적)
+            qq = q_sel(rl_, rs, cur)
         take = qq > bq
         best = torch.where(take[:, None], cur.detach(), best)
         bq = torch.maximum(bq, qq)
@@ -273,12 +286,14 @@ elif a.auto_step:
     a.step_size = a.auto_step / max(a.num_steps * gmed, 1e-12)
     print(f"[auto-step] median‖g‖/√d = {gmed:.3e} → step_size {a.step_size:.4g} "
           f"(목표 이동 {a.auto_step}/차원, PA-RL 기본값의 {a.step_size/3e-4:.0f}배)")
-print(f"[상승] num_steps {a.num_steps}, step_size {a.step_size:.4g}, "
-      f"선택 {'argmax' if a.temp <= 0 else f'Categorical(Q/{a.temp})'}")
+print(f"[상승] num_steps {a.num_steps}, step_size {a.step_size:.4g}, raw gradient "
+      f"(정규화 없음), 앙상블 축약 mean (상승·선택 동일, PA-RL 원본)")
+print(f"[선택] {'argmax' if a.temp <= 0 else f'Categorical(Q/{a.temp})'}"
+      f"{'  (PA-RL distill_argmax=True 와 동일)' if a.temp <= 0 else ''}")
 
 # --- 4. relabel --------------------------------------------------------------
 NEW = flat.action.copy()                              # (T, A) raw 공간, 원본에서 출발
-stat = {"dq": [], "d": [], "won_logged": 0, "n": 0, "g": [], "adv": [], "ok": []}
+stat = {"dq": [], "d": [], "d1": [], "won_logged": 0, "n": 0, "g": [], "adv": [], "ok": []}
 t0 = time.time()
 for c in range(0, len(dec), a.batch):
     idx = dec[c:c + a.batch]
@@ -291,8 +306,8 @@ for c in range(0, len(dec), a.batch):
         pick = torch.distributions.Categorical(logits=q / a.temp).sample()
     chosen = torch.gather(opt, 1, pick[:, None, None].expand(-1, 1, FULL))[:, 0]
     with torch.no_grad():
-        q_log = q_min(lat, st, logged)
-        q_new = q_min(lat, st, chosen)
+        q_log = q_sel(lat, st, logged)
+        q_new = q_sel(lat, st, chosen)
     # advantage A = Q(s, a_new) - V(s).
     # **BC 손실은 타깃이 얼마나 좋은지를 모른다.** 이미 망가진 상태에서 후보 32개 중
     # 최선을 골라도 그 액션은 여전히 나쁠 수 있는데, 좋은 상태의 좋은 액션과 똑같은
@@ -304,6 +319,10 @@ for c in range(0, len(dec), a.batch):
     stat["ok"].append(flat.is_success[idx].astype(bool))
     stat["dq"].append((q_new - q_log).cpu().numpy())
     stat["d"].append((chosen - logged)[:, spec.index].norm(dim=-1).cpu().numpy() / NIDX ** 0.5)
+    # L1 평균 = mean|Δ| — utils/probe_rtc_actions.py 가 쓰는 눈금이다. RMS 와 나란히
+    # 찍어 두면 probe 에서 고른 step_size 가 전체 데이터에서도 같은 크기인지 바로 대조된다
+    # (RMS/L1 비가 크면 이동이 소수 차원에 몰려 있다는 뜻이다).
+    stat["d1"].append((chosen - logged)[:, spec.index].abs().mean(-1).cpu().numpy())
     stat["g"].append((gn / NIDX ** 0.5).cpu().numpy())
     stat["won_logged"] += int((pick == K - 1).sum())   # 로그된 액션이 이긴 횟수
     stat["n"] += len(idx)
@@ -320,14 +339,21 @@ for c in range(0, len(dec), a.batch):
         print(f"  {done}/{len(dec)}  {el:.0f}s  ({done/max(el,1e-9):.1f} 결정/s, "
               f"남은 {(len(dec)-done)/max(done/max(el,1e-9),1e-9)/60:.0f}분)  "
               f"ΔQ {np.concatenate(stat['dq']).mean():+.4f}  "
-              f"이동 {np.concatenate(stat['d']).mean():.4f}", flush=True)
+              f"이동 RMS {np.concatenate(stat['d']).mean():.4f} / "
+              f"L1 {np.concatenate(stat['d1']).mean():.4f}", flush=True)
 
 dq, dd, gg = (np.concatenate(stat[k]) for k in ("dq", "d", "g"))
 print(f"\n[결과] 결정 {stat['n']}개")
 print(f"  ΔQ (선택 - 로그)  평균 {dq.mean():+.4f}  중앙 {np.median(dq):+.4f}  "
       f"p95 {np.percentile(dq,95):+.4f}  개선된 비율 {(dq>0).mean():.1%}")
-print(f"  이동거리/차원      평균 {dd.mean():.4f}  중앙 {np.median(dd):.4f}  "
+print(f"  이동거리 RMS/차원  평균 {dd.mean():.4f}  중앙 {np.median(dd):.4f}  "
       f"p95 {np.percentile(dd,95):.4f}   (액션 공간 ±1)")
+_d1 = np.concatenate(stat["d1"])
+print(f"  이동거리 L1 평균    평균 {_d1.mean():.4f}  중앙 {np.median(_d1):.4f}  "
+      f"p95 {np.percentile(_d1,95):.4f}   <- probe 와 같은 눈금")
+print(f"    RMS/L1 = {dd.mean()/max(_d1.mean(),1e-12):.2f}  "
+      f"(1.25 면 등방, 크면 소수 차원에 몰려 있다는 뜻: 유효 차원 ~"
+      f"{NIDX/(dd.mean()/max(_d1.mean(),1e-12))**2:.0f}/{NIDX})")
 print(f"  ‖g‖/√d            중앙 {np.median(gg):.3e}")
 _adv = np.concatenate(stat["adv"]); _ok = np.concatenate(stat["ok"])
 print(f"  advantage A=Q(s,a_new)-V(s)   전체 평균 {_adv.mean():+.4f}  A>0 비율 {(_adv>0).mean():.1%}")

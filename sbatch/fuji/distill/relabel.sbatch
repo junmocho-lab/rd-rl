@@ -13,7 +13,7 @@
 #SBATCH --error=out/fuji-relabel_%j.err
 #
 # PA-RL 액션 최적화로 데이터셋의 action 컬럼을 갈아끼운다 (action distillation 1단계).
-#   후보 32 -> Q(min) 상위 10 -> ∇_A Q 상승 4스텝(keep-best) -> Categorical(Q/0.001)
+#   후보 32 -> Q(mean) 상위 10 + 로그액션 1 -> ∇_A Q 상승 10스텝(raw, keep-best) -> argmax
 #
 # ── dexjoco 판(sbatch/dexjoco/distill/relabel.sbatch)과 다른 점 ──────────────
 # **출력 경로에 GMOVE 를 넣는다.** dexjoco 판은
@@ -23,8 +23,8 @@
 # step size 를 쓸어보려면 둘 다 갈라야 한다.
 #
 #   export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
-#   sbatch --export=ALL,EXP=fuji_d4r16,CTAG=success,STEP=10000,GMOVE=0.01 \
-#          sbatch/fuji/distill/relabel.sbatch
+#   sbatch --export=ALL,EXP=fuji_d4r16_0902_fuji_rc_success,CTAG=success_ens_full,\
+#            STEP=25000,SSIZE=3 sbatch/fuji/distill/relabel.sbatch
 #
 # EPS 를 비우면 CTAG 에 맞춘다 (success critic -> success 에피소드만). critic 이 본
 # 분포 밖은 외삽이라 맞춰 주는 게 안전하다 (relabel_parl --eps 도움말).
@@ -58,11 +58,29 @@ EXP=${EXP:-fuji_d4r16}
 CTAG=${CTAG:-success}
 STEP=${STEP:-10000}
 EPS=${EPS:-}                   # 비우면 CTAG 에 맞춘다
-GMOVE=${GMOVE:-0.01}
-GSTEPS=${GSTEPS:-4}            # ‖g‖ 가 불변이라 실질 효과 없음. 4 로 고정한다
+# ── 상승 파라미터 (2026-09-02 재설계) ──────────────────────────────────────
+# 예전에는 GMOVE(=--guide-move) 로 g/‖g‖ 정규화 후 **총 이동거리를 고정**했다.
+# 그것은 critic 이 평평한 곳에서도 같은 거리를 밀어붙여 PA-RL 원본보다 공격적이다.
+# 지금은 원본과 같은 raw gradient 를 쓰고 --step-size 로 조절한다.
+#
+# SSIZE 근거 (utils/probe_rtc_actions.py, critic success_ens_full@25k, 6ep/250결정):
+#   |∂Q/∂a| = 4.5e-4.  자연변화 1프레임 = 0.00624.  BC 자체 샘플 산포 = 0.00437.
+#     ss    상승이동    nat배   raw/관절   ΔQ->프레임   판정
+#     0.3   0.00143     0.23    0.19°      +0.75f     BC 잡음보다 작다 -> 학습 불가
+#     1     0.00469     0.75    0.60°      +1.17f     BC 잡음과 같은 크기
+#     3     0.01370     2.20    1.75°      +2.24f   <- 채택 (잡음의 3.1배)
+#     10    0.04347     7.0     3.0°       +5.15f     너무 큼
+#     100   0.39792     64      22°        +81.9f     OOD 폭주 (critic 헛소리)
+#   PA-RL 원본 3e-4 가 우리에게서 아무 일도 안 하는 이유는 순수하게 Q 스케일이다
+#   (원본 [-100,0] vs 우리 [0,1] -> 4627배).
+SSIZE=${SSIZE:-3}
+GMOVE=${GMOVE:-0}              # >0 이면 옛 정규화 방식으로 돌아간다 (비권장)
+GSTEPS=${GSTEPS:-10}           # raw gradient 라 스텝마다 |g| 를 다시 재므로 의미가 있다
 NCAND=${NCAND:-32}
 KEEP=${KEEP:-10}
-TEMP=${TEMP:-0.001}
+TEMP=${TEMP:-0}                # 0 = argmax (PA-RL distill_argmax=True 와 동일).
+                               # >0 이면 Categorical(Q/temp) — 우리 Q 산포가 1e-4
+                               # 수준이라 온도를 잘못 주면 균등추첨이 된다
 LIMIT=${LIMIT:-0}
 DRY=${DRY:-0}
 [ -n "$EPS" ] || EPS=$CTAG
@@ -72,8 +90,9 @@ DSDIR=$(dirname "$DATA")
 CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/$(printf 'critic_%06d.pt' "$STEP")
 [ -f "$CRITIC" ] || { echo "critic 없음: $CRITIC"; exit 3; }
 
-# ★ GMOVE 를 경로와 npy 이름에 넣는다 (dexjoco 판과 갈라지는 지점).
-SUF="${CTAG}@$((STEP/1000))k_${EPS}_m${GMOVE}"
+# ★ 상승 파라미터를 경로와 npy 이름에 넣는다 (dexjoco 판과 갈라지는 지점).
+#   안 넣으면 step_size 만 다른 두 런이 같은 디렉토리와 같은 npy 를 덮어쓴다.
+SUF="${CTAG}@$((STEP/1000))k_${EPS}_ss${SSIZE}n${GSTEPS}"
 OUT=$REPO/$DSDIR/relabel_${EXP}__${SUF}
 NPY=parl_actions__${SUF}.npy
 
@@ -83,9 +102,9 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_O
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 PY=$REPO/third_party/RLDX-1/.venv/bin/python
 
-echo "=== $(date -Is)  relabel  $EXP  critic=$CTAG@$STEP  eps=$EPS  move=$GMOVE"
+echo "=== $(date -Is)  relabel  $EXP  critic=$CTAG@$STEP  eps=$EPS  ss=$SSIZE"
 echo "    data   $DATA"
-echo "    후보 $NCAND -> keep $KEEP -> 상승 ${GSTEPS}스텝 x move $GMOVE -> temp $TEMP"
+echo "    후보 $NCAND -> keep $KEEP -> 상승 ${GSTEPS}스텝 (raw, step_size=$SSIZE) -> temp $TEMP"
 echo "    out    $OUT"
 echo "    npy    checkpoints/${EXP}-critic/$NPY"
 
@@ -94,7 +113,7 @@ $PY -u -m rl.relabel_parl \
     --critic "$CRITIC" --features cogfeat.npy \
     --eps "$EPS" \
     --num-samples "$NCAND" --num-keep "$KEEP" \
-    --num-steps "$GSTEPS" --guide-move "$GMOVE" --temp "$TEMP" \
+    --num-steps "$GSTEPS" --step-size "$SSIZE" --guide-move "$GMOVE" --temp "$TEMP" \
     --out "$OUT" --npy-out "$NPY" \
     $([ "$LIMIT" -gt 0 ] && echo "--limit $LIMIT") \
     $([ "$DRY" = 1 ] && echo "--dry-run") || exit 1

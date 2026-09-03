@@ -1,0 +1,109 @@
+# fuji (rby1m_rh56f1) — critic 학습용 exp.  latency 4 / replan 16.
+#
+# 이 이름이 캐시 디렉토리(<checkpoints>/fuji_d4r16_0902_fuji_rc_success-critic/)를 정한다.
+#
+# ★ exp 이름에 **데이터셋 이름을 그대로** 박아 둔다. cogfeat.npy 와 actnorm.npy 가
+#   <EXP>-critic/ 안에 들어가므로 데이터셋마다 exp 를 나누는 것이 필수인데,
+#   cc/rc 같은 약칭을 쓰면 어느 데이터셋으로 학습한 critic 인지 나중에 헷갈린다.
+#   같은 EXP 로 다른 데이터셋을 돌리면 두 런이 같은 캐시를 두고 충돌하고,
+#   프레임 수가 달라 critic.sbatch 의 검증이 매번 재추출(1.5h)을 시킨다.
+#
+# ── fuji_d3r8 과 다른 점 ────────────────────────────────────────────────────
+# 1. inference_latency 3 -> 4.  base_policy 의 config.json 실측이
+#    rtc_training_max_delay: 4 인데 d3r8 은 3 을 써서 **어긋나 있었다**. 맞춘 것이다.
+# 2. replan_steps 8 -> 16.  창이 11 -> 20 스텝이 되고 critic 입력이 77 -> 140차원이다.
+#    rrc 쪽 execution_horizon 도 16, inference_latency_steps 도 4 여야 한다 — 어긋나면
+#    n-step 리턴 창이 실제 실행 길이와 달라져 critic 이 엉뚱한 것을 학습한다.
+# 3. dataset: is_stop(HiL 정지 프레임) 을 제거한 _nostop 판을 쓴다.
+#
+# ── 왜 exp 가 하나인가 ───────────────────────────────────────────────────────
+# 0831_fuji_only_success 는 0831_fuji_all 의 부분집합임을 확인했다 (7개 세션의 성공
+# 에피소드가 개수도 길이도 정확히 일치). 그러므로 all 하나만 두고 트레이너의
+# --train-eps success|all 로 두 critic 을 만든다. dexjoco 와 같은 방식이다.
+#
+# 그편이 단순할 뿐 아니라 **더 낫다**: only_success 로 학습하면 홀드아웃에 실패가 없어
+# AUC 를 계산할 수 없다. all 을 쓰면 --train-eps success 여도 홀드아웃에는 실패가 남아
+# (offline_iql_qvgm.py:226 은 train 만 필터한다) 학습 내내 AUC 를 볼 수 있다.
+#
+# ── 데이터 실측 (0902_fuji_rc_success) ─────────────────────
+#   아직 안 채웠다. 데이터가 다 받아지면 세션/에피소드/프레임 수를 여기 적을 것.
+#   critic.sbatch 시작 로그의 [cogfeat] 줄이 실제 값을 찍는다.
+#   점검할 것 두 가지 (0831 데이터에서 둘 다 나왔다):
+#     · is_stop 컬럼 — HiL 정지 프레임. utils/drop_stop_frames.py 로 제거
+#     · tasks.jsonl 에 없는 task_index — critic 은 통과하지만 BC/LoRA 에서 죽는다
+#
+
+name: fuji_d4r16_0902_fuji_rc_success
+dataset: rl-dataset/fuji/0902_fuji_rc_success
+robot: rby1m_rh56f1               # info.json 의 robot_type 과 교차검증
+
+# --- 모달리티 레이아웃의 정본 -------------------------------------------------
+# state/action/video 의 concat 순서는 이 파일이 정본이다. modality.json 의 start/end 는
+# raw 컬럼에서 잘라낼 때만 쓴다. 어긋난 채 쓰면 관절이 조용히 뒤섞인다.
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+modality: modality/rby1m_rh56f1/modality.json
+
+# --- 정책 -------------------------------------------------------------------
+# <checkpoints>/ 아래 상대경로. config.json 실측: action_horizon 40,
+# rtc_training_max_delay **8**, n_cog_tokens 64, video_length 1.
+# (이전 base rldx_img_0828-40k-2gpu-128b-A-only 는 max_delay 4 였다.)
+base_policy: fuji/rldx_img_0827-0901-40k-4gpu-128b
+
+# --- 액션 청크 --------------------------------------------------------------
+# 배포 컨트롤러 값 (확인함). 어긋나면 n-step 리턴 창이 실제 실행 길이와 달라져
+# critic 이 엉뚱한 것을 학습한다.
+# 제약: action_horizon >= inference_latency + replan_steps  (40 >= 20) ✓
+#       action_horizon == 모델 config 의 action_horizon      (40) ✓
+#       inference_latency <= config.json 의 rtc_training_max_delay  (4 <= 8) ✓
+#         max_delay 는 모델이 **감당하도록 학습된 최대 지연**이다. 같아야 하는 게 아니고
+#         그 이하면 된다. 이전 base 는 4 라 latency 4 가 상한이었지만, 새 base 는 8 이라
+#         4 는 여유 안쪽이다. 실기 컨트롤러 값(4)을 그대로 쓴다.
+action_horizon: 40
+replan_steps: 16
+inference_latency: 4
+
+# --- critic 이 보는 액션 그룹 -------------------------------------------------
+# 창은 latency+replan = 20 스텝. right_arm_joints 7개만 보므로 20 x 7 = **140차원**.
+#
+# ★ 140 은 검증된 구간이 아니다. dexjoco 실측은 90차원이 +17.5pp, 225차원이 BC 보다
+#   나빴다 — 140 은 그 사이다. d3r8 의 77 은 90 과 같은 구간이라 안전지대였다.
+#   여기서 나빠지면 replan 을 줄이거나 explore_groups 를 더 좁히는 쪽을 볼 것.
+#
+# dexjoco 에서 이 축이 성패를 갈랐다 (실측):
+#   전 관절 625차원          test-time 선택 -16pp (해로움)
+#   eef pos+rot 90차원       +17.5pp (이로움).  20K critic 으로 76.0% vs BC 61.5%
+#   (20,5) 세팅의 225차원    BC 보다 나빠짐
+# 전 관절(20 x 34 = 680)은 쓰면 안 된다 — 625차원이 -16pp 였다.
+explore_groups:
+  - right_arm_joints
+
+# --- 알고리즘 값 -------------------------------------------------------------
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.01
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+
+  # 프레임당 할인. 보상이 종료 시점 1회뿐이라 V(s_t) = discount^(T-t) 이고,
+  # 에피소드 시작 지점의 V 가 Q 동적 범위의 하한이 된다. fuji 평균 617 프레임
+  # (_nostop 기준. 정지 제거 전 652):
+  #     0.995 -> 0.038   초반이 사실상 0
+  #     0.998 -> 0.271   ← 채택
+  #     0.999 -> 0.521   평평해서 초반/후반 구분이 흐려진다
+  # dexjoco 는 289 프레임에서 0.995 (0.235) 로 튜닝했다. 0.998 은 그 동적 범위를
+  # fuji 의 에피소드 길이로 옮긴 값이다 (옛 fuji.yaml 의 0.999 는 너무 평평하다).
+  discount: 0.998
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0

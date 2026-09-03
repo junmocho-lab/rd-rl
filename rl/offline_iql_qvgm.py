@@ -112,6 +112,10 @@ p.add_argument("--holdout", default="0.2",
                help="세션 이름 문자열 또는 에피소드 비율(0<x<1). 기본값을 offline_iql 과\n"
                     "같게 둔다 — 다르면 같은 --holdout 을 줘도 태그 접미사가 한쪽만 붙어\n"
                     "(기본값과 다를 때만 붙는다) 디렉토리 이름이 비대칭이 된다")
+p.add_argument("--eval-frac", type=float, default=0.1,
+               help="--holdout 0 (전 데이터 학습)일 때 진단용으로 골라 볼 에피소드 비율.\n"
+                    "학습에서 빼지 않으므로 이 수치는 in-sample 이다 — 과적합 탐지에는\n"
+                    "쓸 수 없고, Q 곡선 모양/앙상블 std/발산 여부를 보는 용도다")
 p.add_argument("--train-eps", default="all", choices=("all", "success", "fail"))
 p.add_argument("--plot-eps", default="",
                help="플롯에 그릴 홀드아웃 에피소드 (all/success/fail). 비면 --train-eps 를 "
@@ -237,20 +241,43 @@ else:
 # done=1 이 에피소드 마지막 프레임에 반드시 있으므로(실측 300/300) 경계 부트스트랩도
 # mask 로 자동 차단된다 — 별도 valid 플래그가 필요 없다.
 
-frac = float(a.holdout) if a.holdout.replace(".", "", 1).isdigit() else 0.0
-if 0 < frac < 1:
+# --holdout 0 / none / off / "" → 홀드아웃 없음. **명시적으로 처리해야 한다**:
+# 예전에는 이것들이 아래 세션 이름 부분일치 분기로 떨어졌는데, 세션 이름에 날짜가
+# 들어 있어 "0" 이 거의 **모든** 세션에 매치돼 전 데이터가 홀드아웃이 되고 학습
+# 집합이 비었다 (조용히 죽는 함정이었다).
+_ho = a.holdout.strip().lower()
+NOHOLD = _ho in ("", "0", "0.0", "none", "off")
+frac = 0.0 if NOHOLD else (
+    float(a.holdout) if a.holdout.replace(".", "", 1).isdigit() else 0.0)
+_ep_ids = np.unique(flat.episode)
+if NOHOLD:
+    # 학습에서 아무것도 빼지 않는다. 그래도 진단(Q 곡선 / AUC / 앙상블 std)은 필요하므로
+    # **학습 데이터에서** 평가 에피소드를 골라 쓴다 = in-sample 평가.
+    # ★ in-sample 수치는 홀드아웃 수치보다 반드시 좋게 나온다. 과적합 탐지에는 못 쓴다.
+    #   그래서 로그·플롯에 'in-sample' 을 붙여 오독을 막는다.
+    hold = np.zeros(len(flat), bool)
+    eval_ids = _ep_ids[:: max(2, int(round(1 / a.eval_frac)))]
+    how = (f"없음 — 전 데이터 학습. 평가는 학습 에피소드 {len(eval_ids)}개를 "
+           f"골라 **in-sample**")
+elif 0 < frac < 1:
     every = max(2, int(round(1 / frac)))
-    hold = np.isin(flat.episode, np.unique(flat.episode)[::every])
+    eval_ids = _ep_ids[::every]
+    hold = np.isin(flat.episode, eval_ids)
     how = f"에피소드 {every}개마다 1개"
 else:
-    sel = [i for i, n in enumerate(flat.sessions) if a.holdout and a.holdout in n]
+    sel = [i for i, n in enumerate(flat.sessions) if a.holdout in n]
+    if not sel:
+        raise SystemExit(f"--holdout '{a.holdout}' 에 맞는 세션이 없다. 있는 세션:\n  "
+                         + "\n  ".join(flat.sessions))
     hold = np.isin(flat.session, sel)
-    how = f"세션 '{a.holdout}'"
+    eval_ids = np.unique(flat.episode[hold])
+    how = f"세션 {[flat.sessions[i] for i in sel]}"
+IN_SAMPLE = NOHOLD
 train = np.flatnonzero(~hold[:len(flat) - R])
 n_all = len(train)
 if a.train_eps != "all":
     train = train[flat.is_success[train] == (a.train_eps == "success")]
-eps = [(e, np.flatnonzero(flat.episode == e)) for e in np.unique(flat.episode[hold])]
+eps = [(e, np.flatnonzero(flat.episode == e)) for e in eval_ids]
 eps = [(e, fr, bool(flat.is_success[fr[-1]])) for e, fr in eps]
 
 print(f"[exp] {a.exp} replan={R} latency={LAT} horizon={H} → 액션 {FULL}차원, stepwise {R}개")
@@ -423,7 +450,8 @@ for step in range(1, a.steps + 1):
               f"V_sum {float(v.sum(-1).mean()):+.3f}  {(time.time()-t0)/step*1000:.0f}ms/step",
               flush=True)
 
-    if step % a.eval_every == 0 or step == a.steps:
+    # eps 가 비면(홀드아웃 없음) 아래 np.concatenate 가 ValueError 로 죽는다.
+    if eps and (step % a.eval_every == 0 or step == a.steps):
         with torch.no_grad():
             curves = {}
             for e, fr, ok in eps:
@@ -439,13 +467,16 @@ for step in range(1, a.steps + 1):
                 np.concatenate([fr[::max(1, len(fr) // 8)] for _, fr, _ in eps])[:512],
                 device=dev)
             ens_std_ref = float(q_of(critic(lat_of(_k), act_of(_k))).sum(-1).std(0).mean())
-        print(f"  [OOD 기준] 홀드아웃 로그 액션의 앙상블 std = {ens_std_ref:.4f}")
+        _WH = "in-sample" if IN_SAMPLE else "홀드아웃"
+        print(f"  [OOD 기준] {_WH} 로그 액션의 앙상블 std = {ens_std_ref:.4f}")
         fin = np.array([curves[e][0][-1] for e, _, _ in eps])
         okm = np.array([o for _, _, o in eps])
-        auc = float((fin[okm][:, None] > fin[~okm][None, :]).mean())
+        # 한쪽이 비면 쌍이 없어 nan 이 된다 (전부 성공인 데이터셋). 정상이다.
+        auc = (float((fin[okm][:, None] > fin[~okm][None, :]).mean())
+               if okm.any() and (~okm).any() else float("nan"))
         EVH["step"].append(step); EVH["auc"].append(float(auc))
         EVH["qs"].append(float(fin[okm].mean())); EVH["qf"].append(float(fin[~okm].mean()))
-        print(f"  [eval] step {step:6d}  AUC {auc:.3f}  "
+        print(f"  [eval/{_WH}] step {step:6d}  AUC {auc:.3f}  "
               f"Q(성공끝) {fin[okm].mean():+.3f}  Q(실패끝) {fin[~okm].mean():+.3f}")
         if wb is not None:
             wb.log({"eval/auc": auc, "eval/q_end_success": float(fin[okm].mean()),
@@ -518,11 +549,13 @@ if HIST["step"]:
     axs[1].plot(HIST["step"], HIST["vsum"], lw=1, label="V")
     axs[1].set_ylabel("train batch mean")
     if EVH["step"]:
-        axs[2].plot(EVH["step"], EVH["auc"], "o-", lw=1.5, label="holdout AUC")
+        _wl = "in-sample" if IN_SAMPLE else "holdout"
+        axs[2].plot(EVH["step"], EVH["auc"], "o-", lw=1.5, label=f"{_wl} AUC")
         axs[2].plot(EVH["step"], EVH["qs"], "s-", lw=1, label="Q(success end)")
         axs[2].plot(EVH["step"], EVH["qf"], "^-", lw=1, label="Q(fail end)")
         axs[2].axhline(0.5, color="gray", lw=.5)
-    axs[2].set_ylabel("holdout"); axs[2].set_xlabel("step")
+    axs[2].set_ylabel("in-sample" if IN_SAMPLE else "holdout")
+    axs[2].set_xlabel("step")
     for ax in axs:
         ax.legend(fontsize=8); ax.grid(alpha=.3)
     axs[0].set_title(f"{TAG}  train_eps={a.train_eps}  action {FULL}d  "

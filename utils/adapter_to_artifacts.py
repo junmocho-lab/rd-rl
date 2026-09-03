@@ -40,6 +40,8 @@ import torch
 from safetensors.torch import load_file
 
 REPO = Path(__file__).resolve().parent.parent
+# 기본은 fuji 지만 **하드코딩하면 안 된다** — dexjoco 판 lora_train.sbatch 도 이 스크립트를
+# 부르는데 그쪽 출력은 checkpoints/dexjoco_distill/ 이라 조용히 "arm 이 없다" 로 끝난다.
 DISTILL = REPO / "checkpoints/fuji_distill"
 
 
@@ -88,9 +90,15 @@ def main() -> int:
     p.add_argument("--all-steps", action="store_true",
                    help="그 arm 의 **모든** 체크포인트를 변환한다 (스텝 ablation 용). "
                         "하나가 10MB 라 8스텝 x 8arm 이어도 640MB 다")
+    p.add_argument("--root", type=Path, default=None,
+                   help="distill 출력 루트 (기본 checkpoints/fuji_distill). dexjoco 면 "
+                        "checkpoints/dexjoco_distill 을 준다")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="비우면 각 체크포인트 디렉토리 안에 adapter.pt 로 쓴다 (권장)")
     a = p.parse_args()
+    global DISTILL
+    if a.root is not None:
+        DISTILL = a.root if a.root.is_absolute() else REPO / a.root
 
     if not a.all and not a.arm:
         return print("--arm 또는 --all 을 줄 것") or 2

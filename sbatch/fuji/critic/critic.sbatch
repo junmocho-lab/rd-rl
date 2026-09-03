@@ -79,7 +79,12 @@ KEEP_LAST=${KEEP_LAST:-3}
 NUM_QS=${NUM_QS:-2}                                      # 2 = clipped double Q (Q-VGM)
 NUM_MIN_QS=${NUM_MIN_QS:-0}                              # >0 이면 REDQ (예: 10 / 2)
 HOLDOUT=${HOLDOUT:-0.1}
-TAG=${TAG:-${TRAIN_EPS}$([ "$NUM_MIN_QS" -gt 0 ] && echo _ens)}
+# TAG 가 저장 디렉토리(<exp>-critic/<TAG>/)를 정하므로, **설정이 다르면 TAG 도 달라야**
+# 한다. 안 그러면 이전 체크포인트를 조용히 덮어써서 비교가 불가능해진다.
+#   _ens   REDQ (num_min_qs > 0)
+#   _full  홀드아웃 없음 = 전 데이터 학습 (평가는 in-sample)
+case "$HOLDOUT" in 0|0.0|none|off|"") _HO_SFX=_full ;; *) _HO_SFX="" ;; esac
+TAG=${TAG:-${TRAIN_EPS}$([ "$NUM_MIN_QS" -gt 0 ] && echo _ens)${_HO_SFX}}
 
 # yaml 이 정본이다. 덮어쓰려면 --export 로 ACTION_GROUPS / DISCOUNT 를 준다.
 ACTION_GROUPS=${ACTION_GROUPS:-$(python3 -c "
@@ -106,12 +111,13 @@ echo "    data=$DATA  steps=$STEPS  qs=$NUM_QS/$NUM_MIN_QS  holdout=$HOLDOUT"
 echo "    action-groups=$ACTION_GROUPS  discount=$DISCOUNT  keep=$KEEP_STEPS"
 
 # ── cogfeat 캐시 검증 ──────────────────────────────────────────────────────
-# 프레임 수뿐 아니라 **세션 목록까지** 대조한다. 손상 세션을 빼는 것처럼 구성이
-# 바뀌면 프레임 합이 우연히 같더라도 캐시는 무효다.
+# 프레임 수 / 세션 목록 / **base 정책**까지 대조한다. 손상 세션을 빼거나 base 를
+# 갈아끼우면 캐시는 무효다 — 특히 base 는 프레임 수가 그대로라 안 보면 못 잡는다.
 COG=checkpoints/${EXP}-critic/cogfeat.json
-VERDICT=$($PY - "$DATA" "$COG" <<'PY'
+BASE_POLICY=checkpoints/$(awk '/^base_policy:/{print $2; exit}' "$YAML")
+VERDICT=$($PY - "$DATA" "$COG" "$BASE_POLICY" <<'PY'
 import json, os, sys
-root, cog = sys.argv[1], sys.argv[2]
+root, cog, base = sys.argv[1], sys.argv[2], sys.argv[3]
 if os.path.exists(os.path.join(root, "meta/info.json")):          # 단일 데이터셋
     sess = [os.path.basename(root.rstrip("/"))]
     frames = json.load(open(os.path.join(root, "meta/info.json")))["total_frames"]
@@ -133,6 +139,11 @@ if c.get("T") != frames:
     print(f"FRAMES 캐시 {c.get('T')} != 데이터 {frames}"); raise SystemExit
 if list(c.get("sessions", [])) != sess:
     print(f"SESSIONS 캐시 {len(c.get('sessions', []))}개 != 데이터 {len(sess)}개"); raise SystemExit
+# ★ cogfeat 은 base 정책의 백본에서 뽑은 feature 다. 정책이 바뀌면 프레임 수와 세션이
+#   같아도 **완전히 다른 값**이 된다. 이 검사가 없으면 base_policy 만 갈아끼웠을 때
+#   낡은 cogfeat 을 조용히 재사용해 엉뚱한 critic 이 나온다.
+if c.get("model") and os.path.normpath(c["model"]) != os.path.normpath(base):
+    print(f"MODEL 캐시 base={c['model']} != yaml base_policy={base}"); raise SystemExit
 print(f"OK {frames} 프레임 / 세션 {len(sess)}개")
 PY
 )
@@ -162,4 +173,11 @@ $PY -u -m rl.offline_iql_qvgm --exp "$EXP" --data "$DATA" \
 
 RUN=checkpoints/${EXP}-critic/${TAG}
 echo "=== 남은 체크포인트"; ls "$RUN" | grep '^critic_[0-9]' | sort
-echo "=== AUC (critic 이 성패를 구분하나)"; grep -h "AUC" "out/fuji-critic_${SLURM_JOB_ID}.out" | tail -5
+# 이 스크립트는 래퍼(critic_<dataset>.sbatch)에서 bash 로 불릴 수도 있어서 로그
+# 파일명이 out/fuji-critic_<잡ID>.out 이 아닐 수 있다. 없으면 조용히 넘어간다 —
+# 여기서 grep 이 exit 2 를 내면 **학습이 다 끝났는데 잡이 FAILED 로 기록된다**
+# (실측: 잡 1005/1006). || true 가 그것을 막는다.
+echo "=== AUC (critic 이 성패를 구분하나)"
+_LOG=$(ls -t "out/fuji-critic"*"_${SLURM_JOB_ID:-x}.out" 2>/dev/null | head -1)
+if [ -n "$_LOG" ]; then grep -h "AUC" "$_LOG" | tail -5; else echo "  (로그 파일을 못 찾음)"; fi
+true
