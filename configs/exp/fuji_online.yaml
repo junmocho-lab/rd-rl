@@ -79,7 +79,12 @@ expo:
 
 vla:
   lora_rank: 16
-  lora_lr: 3.0e-4
+  # 0.0 = actor(VLA LoRA) 동결. r000 실측: 배울 신호가 없는 데이터(자기 성공 롤아웃)에서
+  # 3e-4 로 60스텝 만에 정책 파괴 (|Δa| 평균 0.038/dim, 최대 1.16 — actor_loss 0.006
+  # 바닥에서 Adam 이 노이즈 방향으로 lr 크기만큼 표류). lr 을 낮춰도 표류는 누적되므로
+  # 신호가 생길 때까지 끈다. **켜는 조건**: candidate_q_std > 0.001 (critic 이 액션 구분
+  # 시작) + 성공 에피소드에 edit 실행분이 쌓였을 때 → 1e-5 부터.
+  lora_lr: 0.0
   freeze_backbone: true
 
 # --- 라운드 운영 (fuji.yaml 의 주석 참고 — EXPO-FT 프로토콜 대응) ---------------
