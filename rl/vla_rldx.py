@@ -338,6 +338,7 @@ class ExpoServer:
                  lora: Path | None = None,
                  rtc_mode: str = "trained", img_size: tuple[int, int] = (320, 192),
                  verbose: bool = False, guide_steps: int = 0, guide_move: float = 0.05,
+                 guide_step_size: float = 0.0,
                  guide_all: bool = False, rtc_exec_horizon: int | None = None,
                  log_every: int = 25, dump_obs: Path | None = None, dump_n: int = 64,
                  dump_cams: bool = True,
@@ -346,7 +347,7 @@ class ExpoServer:
                  parl_keep: int = 0, parl_temp: float = 0.0):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
-        from rl.nets import explore_spec
+        from rl.nets import ResidualActor, explore_spec
 
         self.replan = int(exp["replan_steps"])
         self.latency = int(exp["inference_latency"])
@@ -396,10 +397,33 @@ class ExpoServer:
                 mk = torch.zeros(self.cog.window, mod.action_dim, device=device)
                 mk[self.latency:self.latency + self.replan, jsel] = 1.0
                 self.cog_mask = mk.reshape(-1)
-                print(f"  [편집] 창 {self.cog.window}스텝 중 실행 "
-                      f"[{self.latency},{self.latency + self.replan}) x 관절 {len(jsel)}개 "
-                      f"= {int(self.cog_mask.sum())}/{self.cog.full} 차원")
-        self.loaded = self._load(artifacts) if self.cog is None else ["cog-critic"]
+                print(f"  [edit-mask] window {self.cog.window} steps, exec "
+                      f"[{self.latency},{self.latency + self.replan}) x {len(jsel)} joints "
+                      f"= {int(self.cog_mask.sum())}/{self.cog.full} dims")
+        # cog critic 이면 같은 theta.pt 안의 residual(edit policy)/lora 도 로드한다 —
+        # online EXPO 산출물(learner/loop.py qvgm_theta)이 이 형식으로 내보낸다.
+        self.cog_residual = None
+        if self.cog is not None:
+            self.loaded = ["cog-critic"]
+            if "residual" in probe:
+                dfeat = int(probe["feat_mu"].shape[-1])
+                self.cog_residual = ResidualActor(
+                    dfeat, mod.state_dim, spec, self.cfg.latent_dim_state,
+                    self.cfg.include_state, self.cfg.hidden_dims).to(device).eval()
+                self.cog_residual.load_state_dict(probe["residual"])
+                self.loaded.append("residual")
+                print(f"  [edit] residual actor loaded (input dfeat {dfeat}, "
+                      f"edit_scale {self.cfg.edit_scale}, "
+                      f"n_edit_samples {self.cfg.n_edit_samples})")
+            if probe.get("lora"):
+                self.vla.setup_training(lora=True)
+                r = self.vla.model.load_state_dict(probe["lora"], strict=False)
+                if r.unexpected_keys:
+                    raise SystemExit(f"--artifacts 의 lora 키가 모델에 없다: "
+                                     f"{r.unexpected_keys[:3]}")
+                self.loaded.append(f"lora({len(probe['lora'])}텐서)")
+        else:
+            self.loaded = self._load(artifacts)
 
         # ── distillation LoRA 어댑터 (--lora) ────────────────────────────────
         # --artifacts 는 인자가 하나라 cog-critic 을 넣으면 그 경로가 _load 를 건너뛴다
@@ -418,7 +442,7 @@ class ExpoServer:
                 raise SystemExit(f"--lora 키가 모델에 없다: {r.unexpected_keys[:3]}")
             n_lora = sum("lora" in k for k in tensors)
             meta = lsd.get("meta", {})
-            print(f"  [LoRA] {lp.name}  텐서 {len(tensors)} (lora {n_lora})"
+            print(f"  [LoRA] {lp.name}  tensors {len(tensors)} (lora {n_lora})"
                   + (f"  arm={meta.get('arm')} step={meta.get('step')}" if meta else ""))
             self.loaded = list(self.loaded) + [f"lora({n_lora})"]
 
@@ -436,6 +460,7 @@ class ExpoServer:
         self.runtime._run_inference = self._run_inference
         self.calls, self.ms, self.q, self.with_edit = 0, [], [], []
         self.guide_steps, self.guide_move, self.guide_all = guide_steps, guide_move, guide_all
+        self.guide_step_size = guide_step_size
         self.parl_keep, self.parl_temp = parl_keep, parl_temp
         self.log_every = max(1, log_every)
         # 실기 관측을 저장해 두면 오프라인에서 학습 데이터와 직접 대조할 수 있다.
@@ -463,61 +488,60 @@ class ExpoServer:
         self.gated = 0
         self.guide_gain = []
 
-        print(f"  [정책] {Path(model_path).name}")
-        print(f"  [태그] {self.vla.tag}  state_dim={mod.state_dim} action_dim={mod.action_dim} "
-              f"cams={mod.n_cams}")
-        print(f"  [청크] action_horizon={self.vla.action_horizon} latency={self.latency} "
-              f"replan={self.replan} → critic 이 보는 구간 "
+        print(f"  [policy] {Path(model_path).name}  tag={self.vla.tag} "
+              f"state={mod.state_dim} action={mod.action_dim} cams={mod.n_cams}")
+        print(f"  [chunk] horizon={self.vla.action_horizon} latency={self.latency} "
+              f"replan={self.replan} → critic window "
               f"[{self.latency},{self.latency + self.replan})")
-        print(f"  [탐색] {list(spec.groups)}  활성 {spec.active_dim}/{mod.action_dim} 차원")
+        print(f"  [explore] {list(spec.groups)}  active {spec.active_dim}/{mod.action_dim} dims")
         print(f"  [RTC] mode={rtc_mode} delay={self.latency} "
               f"exec_horizon={self.runtime.rtc_exec_horizon}  "
-              f"(delay = rrc 의 inference_latency_steps, "
-              f"exec_horizon = rrc 의 execution_horizon 이어야 한다)")
+              f"(must equal rrc inference_latency_steps / execution_horizon)")
         if self.cog is not None:
-            # cog 모드는 residual(edit) 후보를 만들지 않는다 — 시작 로그도 그렇게.
-            print(f"  [선택] base 후보 N={self.cfg.N} → target critic argmax "
-                  f"(edit 후보 미사용)")
-            print(f"         실측 경고: base 후보 8개의 차원당 표준편차 중앙값이 0.018 "
-                  f"(= 0.8 프레임치) 다.\n"
-                  f"         후보들이 이만큼 비슷하면 critic 이 구분하지 못해 argmax 가 "
-                  f"사실상 랜덤이 된다 —\n"
-                  f"         로그의 후보간Qstd 가 0 에 가까우면 그 상황이다. "
-                  f"그때는 guidance 만 유효하고,\n"
-                  f"         --guide-move 가 0.018 보다 **충분히 커야** 편집이 재샘플링과 "
-                  f"구분된다")
+            # cog mode never builds residual(edit) candidates — log accordingly.
+            _agg = ("online-mean" if self.guide_step_size > 0 else
+                    "target-min")   # must match score() aggregation (_cog_select)
+            print(f"  [select] N={self.cfg.N} base candidates → {_agg} argmax "
+                  f"(no edit candidates). If qstd≈0 in logs, selection is "
+                  f"effectively random and only guidance matters.")
         else:
-            print(f"  [선택] N={self.cfg.N} + edit={self.cfg.n_edit_samples} "
+            print(f"  [select] N={self.cfg.N} + edit={self.cfg.n_edit_samples} "
                   f"(edit_scale={self.cfg.edit_scale}) → target critic argmax")
-        print(f"  [critic 이미지] {img_size[0]}x{img_size[1]} 로 맞춘 뒤 인코더가 224 로 줄인다")
+        print(f"  [critic-img] resized to {img_size[0]}x{img_size[1]}, encoder downscales to 224")
         if self.loaded:
-            print(f"  [산출물] {artifacts} 에서 {self.loaded} 로드")
+            print(f"  [artifacts] loaded {self.loaded} from {artifacts}")
         if self.cog is not None:
-            print(f"  [진단 기준] 학습 분포 안에서의 앙상블 std = {self.ood_ref:.4f}"
-                  + ("  (체크포인트 기록)" if self.cog.meta.get("ens_std_ref") else
-                     "  (기본값 — 실측 0.007~0.02)"))
-            print(f"              실기에서 이 값의 2배 이내면 정상, 5배 넘으면 critic 을 "
-                  f"믿을 수 없다")
-            print(f"              카메라 전처리가 학습과 같은지: 아래 "
-                  f"[AspectAreaResizeAndCrop] 이 (192, 320) → crop (192, 320) 이어야 한다")
+            print(f"  [ood-ref] in-dist ensemble std = {self.ood_ref:.4f}"
+                  + (" (from checkpoint)" if self.cog.meta.get("ens_std_ref") else
+                     " (default; offline range 0.007~0.02)")
+                  + " — <2x ok, >5x critic unreliable")
+            if self.ood_gate > 0:
+                print(f"  [ood-gate] guidance skipped when pre-edit std > "
+                      f"{self.ood_gate:g} x {self.ood_ref:.4f} = "
+                      f"{self.ood_gate * self.ood_ref:.4f}")
         if self.cog is not None and self.guide_steps > 0:
-            print(f"  [guidance] test-time ∇_A Q 상승 {self.guide_steps}스텝, "
-                  f"차원당 목표 이동 {self.guide_move} "
-                  f"(1프레임 자연 변화가 ~0.022 이므로 약 {self.guide_move/0.022:.1f} 프레임치)")
-            print(f"             keep-best 라 Q 가 나빠지는 방향은 절대 채택하지 않는다")
-            print(f"             순서: {'후보 전부 상승 → argmax (PA-RL 방식)' if self.guide_all else 'argmax → 고른 하나만 상승'}")
+            if self.guide_step_size > 0:
+                print(f"  [guidance] raw ∇_A Q ascent, {self.guide_steps} steps x "
+                      f"step_size={self.guide_step_size} (unnormalized, matches "
+                      f"relabel_parl; ascent/select/keep all use online ensemble mean). "
+                      f"Move scales with ‖∇Q‖ — if gΔ≈0, raise step_size or distrust critic.")
+            else:
+                print(f"  [guidance] normalized ∇_A Q ascent, {self.guide_steps} steps, "
+                      f"total move/dim {self.guide_move} "
+                      f"(~{self.guide_move/0.022:.1f} frames of natural motion)")
+            print(f"             keep-best on (never accepts a Q decrease); order: "
+                  f"{'ascend all → argmax (PA-RL)' if self.guide_all else 'argmax → ascend chosen only'}")
         elif self.cog is not None:
-            print("  [guidance] 끔 (--guide-steps 0) → Q 선택만 한다")
+            print("  [guidance] off (--guide-steps 0) → Q selection only")
         if self.cog is not None:
-            print(f"  [critic] cog feature 경로 — 백본이 이미 계산한 backbone_features 에서\n"
-                  f"           cognition token {self.cog.n_cog}개를 mean-pool 한다 "
-                  f"(백본 재실행 없음, ResNet 인코더 미사용)")
+            print(f"  [critic] cog-feature path: mean-pools {self.cog.n_cog} cognition "
+                  f"tokens from backbone_features (no backbone rerun, no ResNet)")
         miss = [] if self.cog is not None else [
             k for k in ("enc", "critic", "target", "residual") if k not in self.loaded]
         if miss:
-            print(f"  [주의] {miss} 는 **랜덤 초기화** 상태다. EXPO-FT 의 warmup 과 같은 조건이고\n"
-                  f"         (랜덤 critic·랜덤 residual 로 수집) 그래서 edit 이 액션을 흔든다 —\n"
-                  f"         지금 필요한 탐색 데이터가 이렇게 만들어진다. 성공률은 base BC 보다 낮다.")
+            print(f"  [warn] {miss} are RANDOMLY INITIALIZED (EXPO-FT warmup condition: "
+                  f"random critic/residual shake actions to collect exploration data; "
+                  f"success rate will be below base BC)")
 
     def _load(self, path: Path | None) -> list[str]:
         """critic/encoder/residual 산출물 로드. 있는 키만 채운다.
@@ -549,9 +573,9 @@ class ExpoServer:
                         f"  기대   {want}\n"
                         f"  → 다시 받을 것: ./actor/recv_round.py --round "
                         f"{'init' if path.parent.name == 'init' else path.parent.name}")
-                print(f"  [산출물] sha256 대조 OK ({size/1e6:.0f} MB)")
+                print(f"  [artifacts] sha256 verified ({size/1e6:.0f} MB)")
         else:
-            print(f"  [산출물] meta.json 이 없어 sha256 대조를 건너뜀 ({size/1e6:.0f} MB)")
+            print(f"  [artifacts] no meta.json — sha256 check skipped ({size/1e6:.0f} MB)")
 
         try:
             sd = torch.load(path, map_location=self.learner.device, weights_only=True)
@@ -611,15 +635,36 @@ class ExpoServer:
             self.vla.proc, self.vla.tag, self.mod, _cat_state(request.obs, self.mod))).to(f.device)
         cog = C.cog_of(f)
         lat = C.latent(cog, state)
+        if self.cog_residual is not None and self.cfg.n_edit_samples > 0:
+            # residual(edit) 후보 — select_from_chunks 와 같은 규약: base 앞 k개에 edit 을
+            # 더해 뒤에 붙인다. 호출측(_run_inference)의 src = j - n 매핑이 이 순서를
+            # 가정하고, edit 은 spec.index(실행 구간 x explore_groups)에만 들어가므로
+            # RTC prefix 는 건드리지 않는다.
+            k = min(self.cfg.n_edit_samples, n)
+            zf = C.feat_std(cog)                       # residual 학습 입력과 같은 공간
+            base = acts[:, :k].reshape(B * k, -1)
+            with torch.no_grad():
+                edit, _ = self.cog_residual.sample(
+                    zf.repeat_interleave(k, 0), state.repeat_interleave(k, 0), base,
+                    self.cfg.edit_scale)
+            acts = torch.cat([acts, (base + edit).view(B, k, -1)], 1)
+            n = acts.shape[1]
         rl_, rs = lat.repeat_interleave(n, 0), state.repeat_interleave(n, 0)
 
-        def score(a, k=None, lat_=None, st_=None):      # (B,k,full) → (B,k) 앙상블 min
+        # 집계: raw guidance 모드(guide_step_size>0)면 relabel_parl 과 같은 online mean,
+        # 아니면 기존의 target min (보수적). 상승·선택·판정이 같은 목적함수를 봐야 한다 —
+        # 다르면 "상승이 올린 것"과 "선택이 고르는 것"이 어긋난다 (relabel_parl.py:135 주석).
+        _raw = self.guide_step_size > 0
+        _tgt = not _raw
+
+        def score(a, k=None, lat_=None, st_=None):      # (B,k,full) → (B,k)
             # k 를 인자로 받는다 — PA-RL 의 top-M 필터 뒤에는 후보 수가 n 이 아니다.
             k = k or a.shape[1]
             with torch.no_grad():
-                return C.q(lat_ if lat_ is not None else rl_,
-                           st_ if st_ is not None else rs,
-                           a.reshape(B * k, -1), target=True).min(dim=0).values.view(B, k)
+                q = C.q(lat_ if lat_ is not None else rl_,
+                        st_ if st_ is not None else rs,
+                        a.reshape(B * k, -1), target=_tgt)
+                return (q.mean(dim=0) if _raw else q.min(dim=0).values).view(B, k)
 
         q_pre = score(acts, n)
         best_pre = q_pre.argmax(dim=1)
@@ -680,8 +725,8 @@ class ExpoServer:
             if not self.guide_all and self.parl_keep <= 0:
                 chosen, _ = self._cog_guide(lat, state, chosen)
             with torch.no_grad():
-                qf = C.q(lat, state, chosen, target=True)
-                gain = float(qf.min(0).values.mean()) - q0
+                qf = C.q(lat, state, chosen, target=_tgt)
+                gain = float((qf.mean(0) if _raw else qf.min(0).values).mean()) - q0
                 gstd = float(qf.std(0).mean())
         if self.dump_obs is not None and len(self.dumped) < self.dump_n:
             self._dump(request, cog, state, acts0, chosen, parent, best_pre, q_pre,
@@ -738,10 +783,14 @@ class ExpoServer:
     def _cog_guide(self, lat, state, act):
         """test-time Q guidance — ∇_A Q 상승 + keep-best. (편집 액션, 최종 Q)
 
-        PA-RL 의 고정 step_size(3e-4) 를 쓰지 않는다. 우리 Q·액션 스케일에서 그 값은 이동이
-        1e-9 라 아무 일도 안 한다 (probe_actopt 에서 실측). 대신 **gradient 를 정규화**해
-        스텝마다 차원당 guide_move/steps 만큼 움직인다 — 스케일에 무관하고 상태마다 자동
-        적응한다.
+        두 가지 파라미터화가 있다 (relabel_parl.py 의 ascend 와 짝):
+          guide_step_size > 0 (raw, PA-RL 원본 = relabel 기본):
+            cur += step_size·g. 정규화하지 않는다 — raw gradient 는 ‖∇Q‖ 에 비례하므로
+            critic 이 평평(OOD/포화)하면 자동으로 덜 움직인다. 그 자기 제한이 보수성의
+            핵심이다. 집계는 상승·판정 모두 **online critic 앙상블 mean** (relabel 과 동일).
+          guide_step_size == 0 (legacy, 정규화):
+            gradient 를 g/‖g‖ 로 정규화해 스텝마다 차원당 guide_move/steps 만큼 움직인다.
+            판정은 target min-Q (보수적).
 
         keep-best (Q-VGM Eq. 7 의 장치): 매 스텝 Q 를 재보고 개선된 것만 채택한다. j=0 이
         원본이므로 **Q 가 나빠지는 방향은 절대 나가지 않는다** — 서빙에서 이게 안전장치다.
@@ -749,22 +798,30 @@ class ExpoServer:
         inference_mode 텐서는 autograd 에 못 쓰므로 clone 으로 꺼낸다 (실측 확인).
         """
         C = self.cog
+        raw = self.guide_step_size > 0
+        tgt = not raw                          # relabel(raw) 은 online critic 만 쓴다
+        judge = (lambda q: q.mean(0)) if raw else (lambda q: q.min(0).values)
         d = int(self.cog_mask.sum())
-        step = self.guide_move * (d ** 0.5) / max(self.guide_steps, 1)
+        step = (self.guide_step_size if raw
+                else self.guide_move * (d ** 0.5) / max(self.guide_steps, 1))
         best = act.clone()
         with torch.no_grad():
-            bq = C.q(lat, state, best, target=True).min(0).values
+            bq = judge(C.q(lat, state, best, target=tgt))
         cur = best
         for _ in range(self.guide_steps):
             cur = cur.clone().detach().requires_grad_(True)
             with torch.enable_grad():
-                qm = C.q(lat, state, cur, target=True).mean(0).sum()   # PA-RL: 앙상블 mean
+                qm = C.q(lat, state, cur, target=tgt).mean(0).sum()   # PA-RL: 앙상블 mean
                 g, = torch.autograd.grad(qm, cur)
             g = g * self.cog_mask
-            gn = g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            cur = (cur.detach() + step * g / gn).clamp(-1.0, 1.0)
+            if raw:
+                # relabel_parl.py ascend 와 같은 raw-gradient 갱신 (action_optimization.py:129)
+                cur = (cur.detach() + step * g).clamp(-1.0, 1.0)
+            else:
+                gn = g.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                cur = (cur.detach() + step * g / gn).clamp(-1.0, 1.0)
             with torch.no_grad():
-                qq = C.q(lat, state, cur, target=True).min(0).values
+                qq = judge(C.q(lat, state, cur, target=tgt))
             take = qq > bq
             best = torch.where(take[:, None], cur, best)
             bq = torch.maximum(bq, qq)
@@ -816,42 +873,41 @@ class ExpoServer:
         self.q.append(info["chosen_q"])
         self.with_edit.append(info["select_ratio_with_residual"])
         if self.verbose or self.calls <= 3 or self.calls % self.log_every == 0:
-            # guide Δ / 앙상블std 비율이 1 미만이면 그 개선은 앙상블 노이즈 안이다
-            # ens.std 절대값이 핵심이다: 오프라인 검증에서 0.007~0.02 였는데 실기에서
-            # 0.09~0.15 가 나오면 critic 이 학습 분포 밖이라는 뜻이다 (Δ/std 만 보면 놓친다).
+            # One compact line per query. Key ratio: guideΔ/std < 1 means the gain is
+            # inside ensemble noise; std >> ref (checkpoint ens_std_ref) means the
+            # state itself is outside the critic's training distribution.
             sp = info.get("ens_std_pre")
-            gtxt = ("" if sp is None else
-                    f"  guideΔ={info['guide_gain']:+.4f} "
-                    f"ens.std {sp:.4f}->{info['guide_ens_std']:.4f} "
-                    f"Δ/std={info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f}"
-                    + ("  ** 게이트: 편집 건너뜀 (상태 OOD)" if info.get("gated") else
-                       "  ** 상태가 OOD (편집 전부터 크다. 오프라인 0.007~0.02)"
-                       if sp > 0.05 else
-                       "  ** 편집이 OOD 로 밀어냄" if info["guide_ens_std"] > 0.05 else ""))
-            # cog 모드는 edit 후보를 만들지 않는다 (residual policy 미사용) — 표시도 그렇게.
+            gtxt = ""
+            if sp is not None:
+                r = max(self.ood_ref, 1e-9)
+                if info.get("gated"):
+                    gtxt = f" GATED(std {sp:.4f} = {sp/r:.0f}x ref, gate {self.ood_gate:g}x)"
+                else:
+                    gtxt = (f" gΔ={info['guide_gain']:+.4f}"
+                            f" std {sp:.4f}→{info['guide_ens_std']:.4f}"
+                            f" ({sp/r:.0f}x)"
+                            f" Δ/std={info['guide_gain']/max(info['guide_ens_std'],1e-9):.2f}")
             ncand = f"{n}" if self.cog is not None else f"{n}+{min(self.cfg.n_edit_samples, n)}"
-            etxt = (f"  샘플엔트로피={info['parl_entropy']:.3f}(균등={np.log(min(self.parl_keep, n)):.3f})"
+            etxt = (f" H={info['parl_entropy']:.2f}/{np.log(min(self.parl_keep, n)):.2f}"
                     if self.parl_keep > 0 and self.parl_temp > 0 else "")
-            print(f"[EXPO] #{self.calls} {dt:.0f}ms  후보 {ncand}{etxt} "
-                  f"→ {j}{' (edit)' if j >= n else ''}  Q={info['chosen_q']:+.4f} "
-                  f"후보간Qstd={info['candidate_q_std']:.4f}{gtxt}", flush=True)
-        # --- 진단 요약: 학습 분포 안이었나 ---------------------------------------
-        if self.cog is not None and self.calls % self.log_every == 0:
-            h = np.asarray(self.hist[-self.log_every:])
+            print(f"[GUIDANCE] #{self.calls} {dt:.0f}ms n={ncand}→{j}"
+                  f"{'e' if j >= n else ''} Q={info['chosen_q']:+.4f}"
+                  f" qstd={info['candidate_q_std']:.4f}{etxt}{gtxt}", flush=True)
+        # --- diagnostic summary: were we inside the critic's training distribution?
+        # Cadence is fixed at >=25 calls so LOG_EVERY=1 doesn't repeat this every query.
+        diag_every = max(25, self.log_every)
+        if self.cog is not None and self.calls % diag_every == 0:
+            h = np.asarray(self.hist[-diag_every:])
             std, cstd, q, gd = (float(np.median(h[:, i])) for i in range(4))
             r = self.ood_ref
-            v = ("정상 (학습 분포 안)" if std <= 2 * r else
-                 "경계" if std <= 5 * r else "** OOD (critic 을 믿을 수 없다)")
-            print(f"[진단] 최근 {len(h)}호출 중앙값 | ens.std {std:.4f} (기준 {r:.4f}, "
-                  f"{std/r:.1f}배) | 후보간Qstd {cstd:.4f} | Q {q:+.4f} | guideΔ {gd:+.4f}"
-                  f"  → {v}", flush=True)
-            if self.ood_gate > 0:
-                print(f"        게이트: 지금까지 {self.gated}/{self.calls} 호출에서 편집을 "
-                      f"건너뜀 (ens.std > {self.ood_gate}x{r:.4f})", flush=True)
-            if std > 2 * r and cstd < 0.01:
-                print(f"        후보간Qstd {cstd:.4f} 가 0 에 가깝다 = critic 이 액션을 "
-                      f"구분하지 못한다 (분포형 헤드 포화). 편집해도 방향 정보가 없다",
-                      flush=True)
+            v = ("in-dist" if std <= 2 * r else
+                 "borderline" if std <= 5 * r else "OOD — critic unreliable")
+            gate = (f" | gated {self.gated}/{self.calls}" if self.ood_gate > 0 else "")
+            flat = (" | qstd≈0: critic can't rank candidates"
+                    if std > 2 * r and cstd < 0.01 else "")
+            print(f"[DIAG] last {len(h)} med | std {std:.4f} ({std/r:.1f}x ref {r:.4f})"
+                  f" qstd {cstd:.4f} Q {q:+.3f} gΔ {gd:+.4f} → {v}{gate}{flat}",
+                  flush=True)
         return pred, reset_memory
 
     def run(self, host: str, port: int, sim_wrapper: bool = False) -> None:
@@ -869,8 +925,8 @@ class ExpoServer:
             # 관측 변환만 추가되고 후보 선택/guidance 경로는 동일하다.
             from rldx.policy.rldx_policy import RLDXSimPolicyWrapper
             policy = RLDXSimPolicyWrapper(policy, strict=True)
-            print("  [래퍼] RLDXSimPolicyWrapper — flat 관측 키를 중첩 dict 로 바꾼다 "
-                  "(run_rldx_server.py --use-sim-policy-wrapper 와 동일)")
+            print("  [wrapper] RLDXSimPolicyWrapper — converts flat obs keys to nested dict "
+                  "(same as run_rldx_server.py --use-sim-policy-wrapper)")
         if self.dump_obs is not None:
             # 에피소드 경계. PolicyServer 는 "reset" 을 policy.reset 으로 보내고
             # (server_client.py:99), 롤아웃 클라이언트는 에피소드마다 정확히 한 번
@@ -883,9 +939,10 @@ class ExpoServer:
                 return _orig_reset(*args, **kw)
 
             policy.reset = _reset_counting
-            print("  [덤프] 에피소드 경계를 reset 으로 센다")
+            print("  [dump] counting episode boundaries via reset")
 
-        print(f"\n  듣는다 tcp://{host}:{port}   (rrc zmq_client 가 붙으면 된다)", flush=True)
+        print(f"\n  listening on tcp://{host}:{port}   (rrc zmq_client connects here)",
+              flush=True)
         PolicyServer(policy=policy, host=host, port=port).run()
 
 
@@ -1210,6 +1267,13 @@ def _serve(argv: list[str]) -> int:
                         "  **guidance 의 유일한 실질 노브는 --guide-move 다.**\n"
                         "Q-VGM 실측(LIBERO): 선택만 86.0 / guidance 88.7 (SFT 79.0). "
                         "cog feature critic 에서만 동작한다")
+    p.add_argument("--guide-step-size", type=float, default=0.0,
+                   help="**raw-gradient guidance** (relabel_parl.py 의 새 방식, PA-RL 원본): "
+                        "cur += step_size·∇_A Q 를 --guide-steps 번, 정규화 없이. "
+                        "‖∇Q‖ 에 비례해 움직이므로 critic 이 평평한(OOD) 상태에서는 자동으로 "
+                        "덜 움직인다. 이 모드에서는 상승·선택·keep-best 가 전부 online 앙상블 "
+                        "mean 을 본다 (relabel 과 동일). 0 이면 기존 정규화 방식(--guide-move, "
+                        "target min 판정)을 쓴다. relabel 에서 쓰던 값(예: 1, 3)을 그대로 줄 것")
     p.add_argument("--guide-move", type=float, default=0.05,
                    help="상승의 차원당 총 이동량 (정규화 액션 단위). **실질적인 유일한 노브다.** "
                         "openarm 의 1프레임 자연 변화가 ~0.022 이라 0.05 는 약 2.3 프레임치, "
@@ -1241,7 +1305,7 @@ def _serve(argv: list[str]) -> int:
                    help="덤프에서 카메라 프레임을 뺀다. 액션 분포 분석(cand_vs_guided)만 할 때 "
                         "쓴다 — 프레임당 수 MB 가 빠져 수천 프레임을 모을 수 있다")
     p.add_argument("--log-every", type=int, default=25,
-                   help="[EXPO] 한 줄을 몇 호출마다 찍을지. 1 이면 매 스텝 (진단용)")
+                   help="[GUIDANCE] 한 줄을 몇 호출마다 찍을지. 1 이면 매 쿼리 (진단용). [DIAG] 요약은 최소 25호출 주기")
     p.add_argument("--rtc-exec-horizon", type=int, default=0,
                    help="RTC 의 execution horizon s. 0 이면 yaml 의 replan_steps 를 쓴다 "
                         "(= rrc 의 execution_horizon). 이 값을 안 넘기면 RLDX 가 "
@@ -1286,6 +1350,11 @@ def _serve(argv: list[str]) -> int:
     a = p.parse_args(argv)
 
     exp = yaml.safe_load((repo / "configs" / "exp" / f"{a.exp}.yaml").read_text())
+    # --n-cand 는 서버 생성 **전에** 반영한다 — 시작 로그([선택] N=...)와 EXPOLearner 의
+    # 후보 확장이 전부 cfg.N 을 보므로, 생성 후에 바꾸면 로그가 yaml 값을 보여준다.
+    if a.n_cand > 0 and a.n_cand != int(exp["expo"].get("N") or 0):
+        print(f"  [후보] expo.N {exp['expo'].get('N')} -> {a.n_cand} (--n-cand)")
+        exp["expo"]["N"] = a.n_cand
     modality = a.modality or (repo / exp["modality"])
     w, h = (int(v) for v in a.critic_image_size.lower().split("x"))
     print(f"EXPO 정책 서버 — 실험 {a.exp}")
@@ -1293,6 +1362,7 @@ def _serve(argv: list[str]) -> int:
                      device=a.device, artifacts=a.artifacts, seed=a.seed, lora=a.lora,
                      rtc_mode=a.rtc_inference_mode, img_size=(w, h), verbose=a.verbose,
                      guide_steps=a.guide_steps, guide_move=a.guide_move,
+                     guide_step_size=a.guide_step_size,
                      guide_all=a.guide_all, rtc_exec_horizon=a.rtc_exec_horizon or None,
                      log_every=a.log_every, dump_obs=a.dump_obs, dump_n=a.dump_n,
                      dump_cams=not a.dump_no_cams,
@@ -1301,9 +1371,6 @@ def _serve(argv: list[str]) -> int:
                      guide_groups=(None if not a.guide_groups else
                                    ([] if a.guide_groups == "all" else
                                     [g.strip() for g in a.guide_groups.split(",") if g.strip()])))
-    if a.n_cand > 0 and a.n_cand != srv.cfg.N:
-        print(f"  [후보] expo.N {srv.cfg.N} -> {a.n_cand} (--n-cand)")
-        srv.cfg.N = a.n_cand
     srv.run(a.host, a.port, sim_wrapper=a.sim_wrapper)
     return 0
 

@@ -60,8 +60,12 @@ CKPT=${MODEL_PATH:-$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' "$Y
 
 # adapter.pt 는 체크포인트 디렉토리 안에 model.safetensors 옆으로 있다
 # (lora_train.sbatch 가 학습 끝에 만든다). 별도 디렉토리를 대조할 필요가 없다.
+# LORA_PATH 를 주면 ARM/LORA_STEP 탐색을 건너뛰고 그 adapter.pt 를 그대로 쓴다.
 ARM_DIR=$REPO/checkpoints/fuji_distill/$ARM
-if [ -n "${LORA_STEP:-}" ]; then
+if [ -n "${LORA_PATH:-}" ]; then
+  LORA=$LORA_PATH
+  [ -f "$LORA" ] || { echo "LoRA 어댑터가 없다: $LORA"; exit 3; }
+elif [ -n "${LORA_STEP:-}" ]; then
   LORA=$(ls "$ARM_DIR"/*/checkpoint-${LORA_STEP}/adapter.pt 2>/dev/null | head -1)
 else                                   # 비우면 최신 스텝
   LORA=$(ls "$ARM_DIR"/*/checkpoint-*/adapter.pt 2>/dev/null \
@@ -76,7 +80,8 @@ if [ -z "${LORA:-}" ] || [ ! -f "$LORA" ]; then
   echo "  third_party/RLDX-1/.venv/bin/python utils/adapter_to_artifacts.py --arm $ARM --all-steps"
   exit 3
 fi
-LSTEP_SHOWN=$(echo "$LORA" | sed 's|.*/checkpoint-\([0-9]*\)/.*|\1|')
+LSTEP_SHOWN=$(echo "$LORA" | sed -n 's|.*/checkpoint-\([0-9]*\)/.*|\1|p')
+LSTEP_SHOWN=${LSTEP_SHOWN:-0}    # LORA_PATH 직접 지정 등 checkpoint-<N> 패턴이 아니면 0
 
 
 # 방법 프리셋. bc 면 증류 정책만, 나머지는 그 위에 test-time critic 을 얹는다
@@ -108,10 +113,20 @@ else
 fi
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
-export HF_HOME=${HF_HOME:-/fsx/rlwrld/junmo_cho/hf_cache}
+# HF 캐시: 클러스터(fsx)가 있으면 그것, 없으면(로컬 워크스테이션) ~/.cache/huggingface.
+# 안 맞으면 백본(RLWRLD/RLDX-1-VLM) config 로드에서 "couldn't connect to hf.co" 로 죽는다.
+if [ -z "${HF_HOME:-}" ]; then
+  HF_HOME=/fsx/rlwrld/junmo_cho/hf_cache
+  [ -d "$HF_HOME" ] || HF_HOME=$HOME/.cache/huggingface
+fi
+export HF_HOME
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
-PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
+# 파이썬: pixi 환경이 있으면 우선 (RTX 5090 은 .venv 의 torch cu126 으로 CUDA 가 안 돈다).
+if [ -z "${PY:-}" ]; then
+  PY=$REPO/third_party/RLDX-1/.pixi/envs/rldx/bin/python
+  [ -x "$PY" ] || PY=$REPO/third_party/RLDX-1/.venv/bin/python
+fi
 [ -x "$PY" ] || { echo "python 이 없다: $PY"; exit 3; }
 
 export RD_SERVE_INFO="{\"exp\":\"$EXP\",\"kind\":\"distill\",\"arm\":\"$ARM\",\"lora_step\":$LSTEP_SHOWN,\"lora\":\"$LORA\",\"base\":\"$CKPT\",\"method\":\"$METHOD\",\"critic\":\"$CRITIC\"}"

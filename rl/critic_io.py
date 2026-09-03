@@ -245,8 +245,12 @@ class ServingCritic:
         """
         return backbone_features[:, -self.n_cog:, :].float().mean(1)
 
+    def feat_std(self, cog: torch.Tensor) -> torch.Tensor:
+        """표준화된 cog feature — residual(edit) actor 의 학습 입력과 같은 공간."""
+        return (cog - self.mu) / self.sd
+
     def latent(self, cog: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        z = (cog - self.mu) / self.sd
+        z = self.feat_std(cog)
         if self.fuse:
             return self.enc(z, state)                  # 합친 뒤 LayerNorm
         return torch.cat([self.enc(z), state], -1)

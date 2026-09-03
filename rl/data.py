@@ -26,6 +26,7 @@ EXPO-FT ``expo_ft/data/replay_buffer.py`` 의 ``sample_jax`` 의미를 그대로
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -617,6 +618,94 @@ def open_images(out: Path) -> tuple[np.memmap, dict]:
     meta = json.loads(out.with_suffix(".json").read_text())
     mm = np.memmap(out, dtype=np.uint8, mode="r", shape=tuple(meta["shape"]))
     return mm, meta
+
+
+def build_cogfeat(vla, flat: Flat, imgs, mod: Modality, task: str, out: Path,
+                  batch: int = 16, log=print) -> np.ndarray:
+    """cognition token 을 mean-pool 한 feature 를 flat 과 같은 순서로 캐시한다.
+
+    rl/extract_cogfeat.py 의 추출 루프를 라운드 버퍼용으로 함수화한 것. 백본이 RL 에서
+    완전 동결이므로 (RLDXVLA.setup_training) feature 는 라운드가 지나도 불변이다 —
+    새 프레임만 뒤에 이어 붙이면 된다 (sidecar json 의 done 으로 이어받고, 프레임이
+    늘면 npy 를 새 파일로 옮겨 담아 늘린다).
+
+    반환: (T, dfeat) float32 memmap (read 모드로 다시 연 것).
+    """
+    import torch
+
+    T = len(flat)
+    meta_path = out.with_suffix(".json")
+    n_cog = int(getattr(vla.model, "_n_cog_tokens",
+                        getattr(vla.model.backbone, "n_cog_tokens", 64)))
+
+    start, feats = 0, None
+    if out.is_file() and meta_path.is_file():
+        start = int(json.loads(meta_path.read_text()).get("done", 0))
+        feats = np.lib.format.open_memmap(out, mode="r+")
+        if feats.shape[0] != T:                     # 프레임이 늘었다 — 옮겨 담아 확장
+            keep_n = min(start, feats.shape[0], T)
+            tmp = out.with_suffix(".npy.grow")
+            new_f = np.lib.format.open_memmap(tmp, mode="w+", dtype=feats.dtype,
+                                              shape=(T, feats.shape[1]))
+            for c0 in range(0, keep_n, 8192):
+                new_f[c0:min(c0 + 8192, keep_n)] = feats[c0:min(c0 + 8192, keep_n)]
+            new_f.flush()
+            del new_f, feats
+            os.replace(tmp, out)
+            feats = np.lib.format.open_memmap(out, mode="r+")
+            start = keep_n
+    if start >= T:
+        del feats
+        return np.lib.format.open_memmap(out, mode="r")
+
+    # get_action_with_features 를 감싸 backbone_features 를 가로챈다. 디노이저는 돌릴
+    # 필요가 없으므로 StopIteration 으로 끊는다 (extract_cogfeat.py 와 동일).
+    grab = {}
+    orig = vla.model.action_model.get_action_with_features
+
+    def hooked(backbone_features, state_features, embodiment_id, backbone_output,
+               action_input=None):
+        grab["f"] = backbone_features.detach()
+        raise StopIteration
+
+    def vla_obs(idx):
+        x = np.asarray(imgs[idx])
+        return {"video": {name: x[:, c][:, None] for c, (name, _) in enumerate(mod.video)},
+                "state": {name: flat.state[idx][:, None, s:e]
+                          for name, s, e in mod.offsets("state")},
+                "language": {mod.task_key: [[task]] * len(idx)}}
+
+    vla.model.action_model.get_action_with_features = hooked
+    t0 = time.time()
+    try:
+        for c in range(start, T, batch):
+            idx = np.arange(c, min(c + batch, T))
+            with torch.no_grad():
+                try:
+                    vla.runtime._forward(vla._collate(vla_obs(idx)))
+                except StopIteration:
+                    pass
+            z = grab["f"][:, -n_cog:, :].float().mean(1).cpu().numpy().astype(np.float32)
+            if feats is None:
+                feats = np.lib.format.open_memmap(out, mode="w+", dtype=np.float32,
+                                                  shape=(T, z.shape[1]))
+                log(f"[cogfeat] {out.name} ({T}, {z.shape[1]}) float32 = "
+                    f"{T * z.shape[1] * 4 / 1e6:.0f} MB  (cog {n_cog}개 mean-pool)")
+            feats[idx] = z
+            if (c // batch) % 50 == 0 or c + len(idx) >= T:
+                el = max(time.time() - t0, 1e-9)
+                done = c + len(idx) - start
+                log(f"[cogfeat] {c + len(idx)}/{T}  {done / el:.1f} 프레임/s")
+                meta_path.write_text(json.dumps(
+                    {"done": int(c + len(idx)), "T": T, "n_cog": n_cog,
+                     "dim": int(feats.shape[1]), "dtype": "float32"}) + "\n")
+    finally:
+        vla.model.action_model.get_action_with_features = orig
+    feats.flush()
+    meta_path.write_text(json.dumps({"done": T, "T": T, "n_cog": n_cog,
+                                     "dim": int(feats.shape[1]), "dtype": "float32"}) + "\n")
+    del feats
+    return np.lib.format.open_memmap(out, mode="r")
 
 
 def verify_images(root: Path, out: Path, mod: Modality, n_probe: int = 24,

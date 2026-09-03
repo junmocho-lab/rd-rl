@@ -237,6 +237,61 @@ def code_provenance(repo: Path) -> dict:
     return prov
 
 
+def qvgm_spec(exp: dict, mod) -> dict | None:
+    """exp yaml 의 critic 블록 → EXPOLearner 의 qvgm 파라미터. 없으면 None (legacy ResNet).
+
+    action_index 는 오프라인 critic 과 같은 규칙: **창 전체** [0, latency+replan) x
+    explore_groups 열 (critic.sbatch 의 --action-groups 규칙 — spec.index 는 실행 구간만
+    가리키므로 여기 쓰면 안 된다. fuji d4r16: 20스텝 x 오른팔 7관절 = 140차원).
+    """
+    cb = exp.get("critic")
+    if not cb:
+        return None
+    lat, rep, adim = int(exp["inference_latency"]), int(exp["replan_steps"]), mod.action_dim
+    groups = exp.get("explore_groups") or [n for n, _, _ in mod.offsets("action")]
+    per = [i for n, s, e in mod.offsets("action") if n in groups for i in range(s, e)]
+    aidx = [t * adim + i for t in range(lat + rep) for i in per]
+    return dict(dfeat=int(cb.get("dfeat", 4096)), action_index=aidx,
+                latent=int(cb.get("latent", 2048)),
+                state_latent=int(cb.get("state_latent", 256)),
+                hidden=tuple(cb.get("hidden", (1024, 512))),
+                bins=int(cb.get("bins", 128)),
+                q_range=tuple(cb.get("q_range", (0.0, 1.0))),
+                inject=bool(cb.get("inject", True)),
+                n_steps=int(cb.get("n_steps", 1)))
+
+
+def qvgm_theta(L, feat_mu, feat_sd, exp: dict, mod, qv: dict) -> dict:
+    """qvgm EXPOLearner → 산출물 dict.
+
+    **서빙(critic_io.load_serving_critic)이 그대로 읽는 오프라인 critic 체크포인트 형식**
+    이다 — features/feat_mu/하이퍼 메타를 넣어 두면 ExpoServer 의 cog 경로가 theta.pt 를
+    --artifacts 로 받아 critic 을 세우고, residual/temp/lora 는 같은 파일의 추가 키다.
+    """
+    import numpy as np
+    import torch
+    qc, tq = L.critic, L.target_critic
+    return {
+        "kind": "qvgm", "features": "cogfeat.npy",
+        "enc": qc.enc.state_dict(), "critic": qc.q.state_dict(),
+        "tenc": tq.enc.state_dict(), "target": tq.q.state_dict(),
+        "residual": L.residual.state_dict(), "temp": L.temp.state_dict(),
+        "feat_mu": torch.as_tensor(np.asarray(feat_mu), dtype=torch.float32),
+        "feat_sd": torch.as_tensor(np.asarray(feat_sd), dtype=torch.float32),
+        "latent": qv["latent"], "state_latent": qv["state_latent"],
+        "hidden_dims": list(qv["hidden"]), "bins": qv["bins"],
+        "q_range": f"{qv['q_range'][0]},{qv['q_range'][1]}",
+        "num_qs": L.cfg.num_qs, "num_min_qs": L.cfg.num_min_qs,
+        "n_steps": qv["n_steps"], "inject": qv["inject"],
+        "critic_layer_norm": L.cfg.critic_layer_norm,
+        "latency": int(exp["inference_latency"]), "replan": int(exp["replan_steps"]),
+        "action_dim": mod.action_dim, "state_dim": mod.state_dim,
+        "action_index": list(qv["action_index"]),
+        "action_groups": list(exp.get("explore_groups") or []),
+        "edit_scale": L.cfg.edit_scale, "n_edit_samples": L.cfg.n_edit_samples,
+    }
+
+
 def export_init(ckpt_exp: Path, log: Log, args) -> None:
     """learner 가 뜰 때 θ₀ 를 내보낸다. actor 가 이걸 받아 round 0 을 돈다.
 
@@ -295,18 +350,32 @@ def export_init(ckpt_exp: Path, log: Log, args) -> None:
                         mod.action_dim, int(exp["replan_steps"]),
                         int(exp["inference_latency"]))
     seed = int(args.seed)
+    qv = qvgm_spec(exp, mod)
     L = EXPOLearner(DummyVLA(mod.action_dim, int(exp["action_horizon"])), spec, mod.state_dim,
                     mod.n_cams, int(exp["replan_steps"]), ecfg, device="cpu", seed=seed,
-                    latency=int(exp["inference_latency"]))
+                    latency=int(exp["inference_latency"]), qvgm=qv)
 
     out.mkdir(parents=True, exist_ok=True)
     theta = out / "theta.pt"
-    torch.save({"enc": L.encoder.state_dict(), "critic": L.critic.state_dict(),
-                "target": L.target_critic.state_dict(), "residual": L.residual.state_dict(),
-                "temp": L.temp.state_dict()}, theta)
+    if qv is not None:
+        # θ₀ 시점에는 cogfeat 표준화 통계가 없다 (첫 ingest 때 고정된다) — identity 로
+        # 내보낸다. round 0 은 어차피 랜덤 critic/residual (EXPO-FT warmup) 이라 무해하고,
+        # r000 부터는 실제 통계가 들어간다.
+        import numpy as np
+        sd_out = qvgm_theta(L, np.zeros(qv["dfeat"], np.float32),
+                            np.ones(qv["dfeat"], np.float32), exp, mod, qv)
+        log(f"[init] critic 백엔드: qvgm cog-feature (dfeat {qv['dfeat']}, "
+            f"action_index {len(qv['action_index'])}차원, bins {qv['bins']}) — "
+            f"feat 통계는 identity (첫 ingest 에서 고정)")
+        torch.save(sd_out, theta)
+    else:
+        torch.save({"enc": L.encoder.state_dict(), "critic": L.critic.state_dict(),
+                    "target": L.target_critic.state_dict(),
+                    "residual": L.residual.state_dict(),
+                    "temp": L.temp.state_dict()}, theta)
     sha = hashlib.sha256(theta.read_bytes()).hexdigest()
     n = sum(p.numel() for m in (L.encoder, L.critic, L.target_critic, L.residual, L.temp)
-            for p in m.parameters())
+            if m is not None for p in m.parameters())
     log(f"[init] θ₀ {theta.name} {theta.stat().st_size/1e6:.0f} MB  {n/1e6:.2f}M 파라미터")
     log(f"       sha256 {sha[:16]}  seed={seed}  탐색 {list(spec.groups)}")
     log(f"       {src}")
@@ -319,7 +388,9 @@ def export_init(ckpt_exp: Path, log: Log, args) -> None:
         "theta_sha256": sha,
         "params": n,
         "artifacts": ["theta.pt"],
-        "keys": ["enc", "critic", "target", "residual", "temp"],
+        "critic_backend": "qvgm" if qv is not None else "resnet",
+        "keys": (["enc", "critic", "tenc", "target", "residual", "temp"] if qv is not None
+                 else ["enc", "critic", "target", "residual", "temp"]),
         "lora": "zero-init (포함하지 않음 — 주입 직후 델타가 0 이라 base BC 와 동일)",
         "torch": torch.__version__,
         "expo_deviations": ecfg.deviations(),
@@ -397,6 +468,11 @@ class Trainer:
         self.cfg = ExpoConfig.from_dict(exp.get("expo"))
         spec = explore_spec(mod.offsets("action"), exp.get("explore_groups") or [],
                             mod.action_dim, self.replan, self.latency)
+        self.qv = qvgm_spec(exp, mod)
+        if self.qv is not None:
+            self.log(f"[학습] critic 백엔드: qvgm cog-feature (dfeat {self.qv['dfeat']}, "
+                     f"action_index {len(self.qv['action_index'])}차원, "
+                     f"bins {self.qv['bins']}, num_qs {self.cfg.num_qs})")
         self.log(f"[학습] {src}")
         self.log(f"[학습] 정책 로드 {base.name}")
         t0 = time.time()
@@ -404,7 +480,8 @@ class Trainer:
                            device=self.device, rtc_inference_mode="none")
         info = self.vla.setup_training(lr=float((exp.get("vla") or {}).get("lora_lr", 3e-4)))
         self.L = EXPOLearner(self.vla, spec, mod.state_dim, mod.n_cams, self.replan, self.cfg,
-                             device=self.device, seed=int(self.args.seed), latency=self.latency)
+                             device=self.device, seed=int(self.args.seed), latency=self.latency,
+                             qvgm=self.qv)
         self.log(f"[학습] {time.time()-t0:.0f}s  LoRA {info['trainable_params']/1e6:.2f}M "
                  f"(백본 trainable {info['backbone_trainable_tensors']})  "
                  f"탐색 {list(spec.groups)} {spec.active_dim}/{mod.action_dim}차원")
@@ -412,8 +489,9 @@ class Trainer:
 
         # rank 0 의 파라미터로 전부 맞춘다. 여기서 어긋난 채 시작하면 gradient 만 평균되고
         # 파라미터는 영원히 갈라진 상태로 학습된다 (rl/ddp.py 머리말 참고).
-        ddp.broadcast_params([self.L.encoder, self.L.critic, self.L.target_critic,
-                              self.L.residual, self.L.temp, self.vla.model])
+        ddp.broadcast_params([m for m in (self.L.encoder, self.L.critic, self.L.target_critic,
+                                          self.L.residual, self.L.temp, self.vla.model)
+                              if m is not None])
 
         # 배치 추출만 rank 마다 달라야 한다 — 같으면 4장이 똑같은 미니배치를 돌아서
         # 실효 배치가 늘지 않는다. 스트림이 겹치지 않게 rank 마다 멀리 떨어뜨린다.
@@ -479,8 +557,14 @@ class Trainer:
             self.log("[학습] 이어받을 산출물이 없다 — 방금 만든 θ 로 시작한다")
             return
         sd = torch.load(path, map_location=self.L.device, weights_only=True)
-        pairs = {"enc": self.L.encoder, "critic": self.L.critic, "target": self.L.target_critic,
-                 "residual": self.L.residual, "temp": self.L.temp}
+        if self.L.qvgm is not None:
+            pairs = {"enc": self.L.critic.enc, "critic": self.L.critic.q,
+                     "tenc": self.L.target_critic.enc, "target": self.L.target_critic.q,
+                     "residual": self.L.residual, "temp": self.L.temp}
+        else:
+            pairs = {"enc": self.L.encoder, "critic": self.L.critic,
+                     "target": self.L.target_critic,
+                     "residual": self.L.residual, "temp": self.L.temp}
         got = [k for k in pairs if k in sd]
         for k in got:
             pairs[k].load_state_dict(sd[k])
@@ -596,6 +680,36 @@ class Trainer:
         tasks = json.loads((paths[0] / "meta" / "tasks.jsonl").read_text().splitlines()[0])
         self.task = tasks["task"]
 
+        if self.L.qvgm is not None:
+            # cog feature 캐시 — 백본이 RL 에서 완전 동결이라 라운드 간 불변, 새 프레임만
+            # 이어 붙는다. 표준화 통계는 **첫 라운드에서 고정** — 라운드마다 다시 재면
+            # critic 입력 분포가 라운드마다 밀려서 이어 학습이 어긋난다.
+            err = None
+            if ddp.is_main():
+                try:
+                    from rl.data import build_cogfeat
+                    build_cogfeat(self.vla, self.flat, self.imgs, self.mod, self.task,
+                                  self.buf / "cogfeat.npy", log=self.log)
+                    stats = self.buf / "featstats.npz"
+                    if not stats.is_file():
+                        f = np.lib.format.open_memmap(self.buf / "cogfeat.npy", mode="r")
+                        mu = f.mean(0, dtype=np.float64).astype(np.float32)
+                        sd = (f.std(0, dtype=np.float64) + 1e-6).astype(np.float32)
+                        np.savez(stats, mu=mu, sd=sd)
+                        self.log(f"[cogfeat] 표준화 통계 고정 ({len(f)} 프레임 기준)")
+                except Exception as exc:
+                    err = f"{type(exc).__name__}: {exc}"
+            errs = [e for e in ddp.gather_object(err) if e]
+            if errs:
+                raise RuntimeError(f"cogfeat 준비 실패: {errs[0]}")
+            self.cogfeat = np.lib.format.open_memmap(self.buf / "cogfeat.npy", mode="r")
+            want = (len(self.flat), self.L.qvgm["dfeat"])
+            if tuple(self.cogfeat.shape) != want:
+                raise SystemExit(f"cogfeat shape {tuple(self.cogfeat.shape)} != {want} — "
+                                 f"critic.dfeat 설정 또는 버퍼가 어긋났다")
+            z = np.load(self.buf / "featstats.npz")
+            self.feat_mu, self.feat_sd = z["mu"], z["sd"]
+
         self.succ_idx = np.nonzero(self.flat.is_success)[0]
         n_ep = len(self.flat.ep_length)
         n_succ_ep = int(sum(self.flat.ep_success))
@@ -640,6 +754,12 @@ class Trainer:
         b["next_action_prefix"] = self.actnorm[b["next_idx"]][:, :L].reshape(len(idx), L * A)
         b["state"] = self.statenorm[idx]
         b["next_state"] = self.statenorm[b["next_idx"]]
+        if self.L.qvgm is not None:
+            # qvgm critic 은 이미지 대신 표준화된 cog feature 를 obs 로 받는다
+            # (EXPOLearner.encode 가 통과시키고 critic 내부 FuseProj 가 state 와 융합).
+            b["obs"] = ((self.cogfeat[idx] - self.feat_mu) / self.feat_sd).astype(np.float32)
+            b["next_obs"] = ((self.cogfeat[b["next_idx"]] - self.feat_mu)
+                             / self.feat_sd).astype(np.float32)
         dev = self.L.device
         out = {}
         for k, v in b.items():
@@ -718,10 +838,21 @@ class Trainer:
         lora = {k: v.detach().cpu() for k, v in self.vla.model.state_dict().items()
                 if "lora_" in k}
         theta = ckpt_round / "theta.pt"
-        torch.save({"enc": self.L.encoder.state_dict(), "critic": self.L.critic.state_dict(),
-                    "target": self.L.target_critic.state_dict(),
-                    "residual": self.L.residual.state_dict(), "temp": self.L.temp.state_dict(),
-                    "lora": lora}, theta)
+        if self.L.qvgm is not None:
+            sd_out = qvgm_theta(self.L, self.feat_mu, self.feat_sd, self.exp, self.mod,
+                                self.qv)
+            sd_out["lora"] = lora
+            keys = [k for k in ("enc", "critic", "tenc", "target", "residual", "temp",
+                                "lora")]
+            torch.save(sd_out, theta)
+        else:
+            keys = ["enc", "critic", "target", "residual", "temp", "lora"]
+            torch.save({"enc": self.L.encoder.state_dict(),
+                        "critic": self.L.critic.state_dict(),
+                        "target": self.L.target_critic.state_dict(),
+                        "residual": self.L.residual.state_dict(),
+                        "temp": self.L.temp.state_dict(),
+                        "lora": lora}, theta)
         sha = hashlib.sha256(theta.read_bytes()).hexdigest()
         self.log(f"[산출물] theta.pt {theta.stat().st_size/1e6:.0f} MB "
                  f"(lora {len(lora)}텐서)  sha256 {sha[:16]}")
@@ -735,7 +866,8 @@ class Trainer:
             "metrics": {k: last[k] for k in sorted(last) if isinstance(last[k], float)},
             "theta_sha256": sha,
             "artifacts": ["theta.pt"],
-            "keys": ["enc", "critic", "target", "residual", "temp", "lora"],
+            "critic_backend": "qvgm" if self.L.qvgm is not None else "resnet",
+            "keys": keys,
             "seed": int(self.args.seed),
             "torch": torch.__version__,
             # expo.batch_size 는 rank 당 값이다. 실제로 한 critic 스텝이 본 표본 수는

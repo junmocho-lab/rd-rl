@@ -58,6 +58,8 @@ N_CAND=${N_CAND_OVERRIDE:-$N_CAND}
 PARL_KEEP=${PARL_KEEP_OVERRIDE:-$PARL_KEEP}
 GUIDE_STEPS=${GUIDE_STEPS_OVERRIDE:-$GUIDE_STEPS}
 GUIDE_MOVE=${GUIDE_MOVE_OVERRIDE:-$GUIDE_MOVE}
+# raw-gradient guidance (relabel_parl 의 새 방식). >0 이면 GUIDE_MOVE 대신 이걸 쓴다.
+GUIDE_STEP_SIZE=${GUIDE_STEP_SIZE:-0}
 PARL_TEMP=${PARL_TEMP:-$TEMP}
 OOD_GATE=${OOD_GATE:-0}          # 2 정도가 합리적 출발점 (serve --ood-gate 도움말)
 
@@ -67,6 +69,12 @@ CKPT=${MODEL_PATH:-$REPO/checkpoints/$(awk '/^base_policy:/{print $2; exit}' "$Y
 if [ "$METHOD" = bc ]; then
   CRITIC=""
   NAME=${NAME:-bc}
+elif [ -n "${CRITIC_PATH:-}" ]; then
+  # 임의 위치의 critic .pt 를 직접 지정 (CTAG/STEP 무시). 단 critic 은 여전히
+  # EXP yaml 의 latency/replan 과 맞아야 한다 — 로드 시 교차검증에 걸린다.
+  CRITIC=$CRITIC_PATH
+  [ -f "$CRITIC" ] || { echo "critic 없음: $CRITIC"; exit 3; }
+  NAME=${NAME:-${METHOD}__$(basename "$(dirname "$CRITIC")")_$(basename "$CRITIC" .pt)}
 else
   if [ "$STEP" -eq 0 ]; then CF=critic_latest.pt; else CF=$(printf 'critic_%06d.pt' "$STEP"); fi
   CRITIC=$REPO/checkpoints/${EXP}-critic/${CTAG}/${CF}
@@ -76,19 +84,35 @@ else
 fi
 
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
-export HF_HOME=${HF_HOME:-/fsx/rlwrld/junmo_cho/hf_cache}
+# HF 캐시: 클러스터(fsx)가 있으면 그것, 없으면(로컬 워크스테이션) ~/.cache/huggingface.
+# 안 맞으면 백본(RLWRLD/RLDX-1-VLM) config 로드에서 "couldn't connect to hf.co" 로 죽는다.
+if [ -z "${HF_HOME:-}" ]; then
+  HF_HOME=/fsx/rlwrld/junmo_cho/hf_cache
+  [ -d "$HF_HOME" ] || HF_HOME=$HOME/.cache/huggingface
+fi
+export HF_HOME
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
-PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
+# 파이썬: pixi 환경이 있으면 우선 (RTX 5090 은 .venv 의 torch cu126 으로 CUDA 가 안 돈다).
+if [ -z "${PY:-}" ]; then
+  PY=$REPO/third_party/RLDX-1/.pixi/envs/rldx/bin/python
+  [ -x "$PY" ] || PY=$REPO/third_party/RLDX-1/.venv/bin/python
+fi
 [ -x "$PY" ] || { echo "python 이 없다: $PY"; exit 3; }
 
 # 무엇으로 서빙했는지 로그에 남긴다 (나중에 라벨과 대조할 때 쓴다).
-export RD_SERVE_INFO="{\"exp\":\"$EXP\",\"method\":\"$METHOD\",\"critic\":\"$CRITIC\",\"ctag\":\"$CTAG\",\"step\":$STEP,\"n_cand\":$N_CAND,\"parl_keep\":$PARL_KEEP,\"parl_temp\":$PARL_TEMP,\"guide_steps\":$GUIDE_STEPS,\"guide_move\":$GUIDE_MOVE,\"ood_gate\":$OOD_GATE,\"base_policy\":\"$CKPT\"}"
+# guide 표기: raw 모드(GUIDE_STEP_SIZE>0)면 스텝수 x step_size (raw), 아니면 스텝수 x 총이동량
+if awk "BEGIN{exit !($GUIDE_STEP_SIZE > 0)}"; then
+  GUIDE_SHOWN="${GUIDE_STEPS}x${GUIDE_STEP_SIZE}(raw)"
+else
+  GUIDE_SHOWN="${GUIDE_STEPS}x${GUIDE_MOVE}(move)"
+fi
+export RD_SERVE_INFO="{\"exp\":\"$EXP\",\"method\":\"$METHOD\",\"critic\":\"$CRITIC\",\"ctag\":\"$CTAG\",\"step\":$STEP,\"n_cand\":$N_CAND,\"parl_keep\":$PARL_KEEP,\"parl_temp\":$PARL_TEMP,\"guide_steps\":$GUIDE_STEPS,\"guide_move\":$GUIDE_MOVE,\"guide_step_size\":$GUIDE_STEP_SIZE,\"guide_all\":${GUIDE_ALL:-0},\"ood_gate\":$OOD_GATE,\"base_policy\":\"$CKPT\"}"
 
 echo "=== $(date -Is)  fuji serve  $EXP / $NAME"
 echo "    base   $CKPT"
 echo "    critic ${CRITIC:-(없음 — 순수 BC)}"
-echo "    n_cand=$N_CAND keep=$PARL_KEEP temp=$PARL_TEMP guide=${GUIDE_STEPS}x${GUIDE_MOVE} ood_gate=$OOD_GATE"
+echo "    n_cand=$N_CAND keep=$PARL_KEEP temp=$PARL_TEMP guide=$GUIDE_SHOWN guide_all=${GUIDE_ALL:-0} ood_gate=$OOD_GATE"
 echo "    replan=$REPLAN latency=$LATENCY  ->  http://$HOST:$PORT"
 echo "    rrc 쪽 inference_latency_steps 가 $LATENCY, execution_horizon 이 $REPLAN 인지 확인할 것"
 
@@ -102,9 +126,12 @@ if [ -n "$CRITIC" ]; then
   ARGS+=(--artifacts "$CRITIC"
          --parl-keep "$PARL_KEEP" --parl-temp "$PARL_TEMP"
          --guide-steps "$GUIDE_STEPS" --guide-move "$GUIDE_MOVE"
+         --guide-step-size "$GUIDE_STEP_SIZE"
          --ood-gate "$OOD_GATE")
 fi
 [ -n "${DUMP_OBS:-}" ] && ARGS+=(--dump-obs "$DUMP_OBS")
 [ -n "${GUIDE_GROUPS:-}" ] && ARGS+=(--guide-groups "$GUIDE_GROUPS")
+# GUIDE_ALL=1: 후보 전부 상승 → argmax (relabel_parl 과 같은 순서). PARL_KEEP=0 과 함께 쓸 것.
+[ "${GUIDE_ALL:-0}" != 0 ] && ARGS+=(--guide-all)
 
 exec "$PY" -u -m rl.vla_rldx serve "${ARGS[@]}"

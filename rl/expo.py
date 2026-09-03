@@ -30,7 +30,8 @@ import torch
 import torch.nn as nn
 
 from rl import ddp
-from rl.nets import BatchEncoder, CriticEnsemble, ExploreSpec, ResidualActor, Temperature
+from rl.nets import (BatchEncoder, CriticEnsemble, ExploreSpec, FuseProj,
+                     ResidualActor, StepwiseEnsemble, Temperature)
 
 
 # --------------------------------------------------------------------------- #
@@ -136,12 +137,99 @@ class ExpoConfig:
                 if getattr(base, f.name) != getattr(self, f.name)}
 
 
+class QvgmCritic(nn.Module):
+    """qvgm(cog-feature) critic 을 EXPOLearner 의 (latent, state, action) 규약으로 감싼다.
+
+    offline_iql_qvgm / critic_io.ServingCritic 과 같은 배선 — "지금 critic 구조 그대로":
+        latent 인자 = **표준화된 cog feature** (B, dfeat). 이미지 latent 가 아니다.
+        x = FuseProj(feat, state)                      state 는 여기서 융합된다
+        q = StepwiseEnsemble(x, action[:, action_index])   창 전체 x 탐색 그룹 열만
+        스칼라 Q = 분포형(bins)이면 bin 기대값, 위치 축 합 → (num_qs, B)
+
+    forward 는 CriticEnsemble 과 같은 (lat, state, action, members) 시그니처라
+    select_from_chunks / update_residual_actor 가 분기 없이 그대로 쓴다.
+    학습 손실만 다르다 — update_critic 이 logits() + hl_gauss() 를 쓴다
+    (스칼라 MSE 는 발산 이력이 있어 offline 과 같이 HL-Gauss CE 를 기본으로 한다).
+    """
+
+    def __init__(self, dfeat: int, state_dim: int, action_full: int,
+                 action_index: list[int] | None, latent: int = 2048,
+                 state_latent: int = 256, n_steps: int = 1, num_qs: int = 10,
+                 hidden: tuple[int, ...] = (1024, 512), layer_norm: bool = True,
+                 inject: bool = True, bins: int = 128,
+                 q_range: tuple[float, float] = (0.0, 1.0)):
+        super().__init__()
+        self.state_latent = int(state_latent)
+        if self.state_latent <= 0:
+            raise ValueError("QvgmCritic 은 FuseProj(state_latent>0) 배선만 지원한다 — "
+                             "현재 critic 체크포인트들이 전부 이 구조다 (state_latent 256)")
+        self.enc = FuseProj(dfeat, state_dim, latent, self.state_latent)
+        in_dim = self.enc.out_dim
+        adim = len(action_index) if action_index else action_full
+        self.q = StepwiseEnsemble(in_dim, adim, n_steps, num_qs, tuple(hidden),
+                                  layer_norm, inject, bins)
+        self.num_qs, self.bins, self.n_steps = num_qs, bins, n_steps
+        idx = torch.as_tensor(list(action_index), dtype=torch.long) if action_index else None
+        self.register_buffer("action_index", idx)
+        self.lo, self.hi = (float(q_range[0]), float(q_range[1]))
+        edges = torch.linspace(self.lo, self.hi, bins + 1) if bins else torch.zeros(0)
+        self.register_buffer("edges", edges)
+        self.register_buffer("centers", (edges[:-1] + edges[1:]) / 2 if bins else torch.zeros(0))
+        self.sigma = 0.75 * (self.hi - self.lo) / bins if bins else 0.0
+        # PA-RL kernel_scale_final=1e-2 — offline_iql_qvgm 과 같은 head 축소 초기화
+        with torch.no_grad():
+            for m in self.q.qs:
+                m.head.weight.mul_(1e-2)
+                m.head.bias.zero_()
+
+    def _x(self, feat: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        return self.enc(feat, state)
+
+    def _sel(self, action: torch.Tensor) -> torch.Tensor:
+        return action[..., self.action_index] if self.action_index is not None else action
+
+    def logits(self, feat, state, action, members: list[int] | None = None) -> torch.Tensor:
+        """(m, B, n_steps[, bins]) — 분포형 로짓 (HL-Gauss 손실용)."""
+        return self.q(self._x(feat, state), self._sel(action), members=members)
+
+    def q_of(self, out: torch.Tensor) -> torch.Tensor:
+        if self.bins:
+            out = (out.softmax(-1) * self.centers).sum(-1)
+        return out.sum(-1)                                        # (m, B)
+
+    def forward(self, feat, state, action, members: list[int] | None = None) -> torch.Tensor:
+        return self.q_of(self.logits(feat, state, action, members))
+
+    def subsample(self, num_min_qs: int, generator: torch.Generator | None = None) -> list[int]:
+        perm = torch.randperm(self.num_qs, generator=generator)
+        return perm[:num_min_qs].tolist()
+
+    def hl_gauss(self, logits: torch.Tensor, y: torch.Tensor,
+                 weight: torch.Tensor | None = None) -> torch.Tensor:
+        """offline_iql_qvgm 의 q_loss_fn 과 같은 HL-Gauss CE.
+
+        logits (m,B,R,bins), y (B,) 스칼라 TD 타깃, weight (B,) = valid 마스크.
+        """
+        m, B, R = logits.shape[:3]
+        yf = y[None, :, None].expand(m, B, R).reshape(-1)
+        z = (self.edges - yf.clamp(self.lo, self.hi)[:, None]) / (self.sigma * 2 ** 0.5)
+        cdf = 0.5 * (1 + torch.erf(z))
+        pr = cdf[:, 1:] - cdf[:, :-1]
+        pr = pr / pr.sum(-1, keepdim=True).clamp_min(1e-8)
+        ce = -(pr * logits.reshape(-1, self.bins).log_softmax(-1)).sum(-1)
+        if weight is not None:
+            w = weight[None, :, None].expand(m, B, R).reshape(-1)
+            return (ce * w).sum() / w.sum().clamp_min(1e-8)
+        return ce.mean()
+
+
 class EXPOLearner:
     """critic 앙상블 + residual(edit) actor + temperature + VLA."""
 
     def __init__(self, vla: VLA, spec: ExploreSpec, state_dim: int, n_cams: int,
                  replan_steps: int, cfg: ExpoConfig | None = None,
-                 device: str | torch.device = "cpu", seed: int = 0, latency: int = 0):
+                 device: str | torch.device = "cpu", seed: int = 0, latency: int = 0,
+                 qvgm: dict | None = None):
         self.vla, self.spec, self.cfg = vla, spec, cfg or ExpoConfig()
         self.replan_steps, self.latency = replan_steps, latency
         if vla.action_horizon < latency + replan_steps:
@@ -173,20 +261,45 @@ class EXPOLearner:
         # (VLA 디노이저 샘플링도 같은 seed 아래로 들어온다).
         torch.manual_seed(seed)
 
-        self.encoder = BatchEncoder(3 * n_cams, c.latent_dim_image, c.encoder_stage_sizes,
-                                    c.encoder_num_filters).to(self.device)
-        self.critic = CriticEnsemble(c.latent_dim_image, state_dim, full, c.num_qs,
-                                     c.latent_dim_state, c.include_state, c.hidden_dims,
-                                     c.critic_layer_norm).to(self.device)
-        self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
-        self.residual = ResidualActor(c.latent_dim_image, state_dim, spec, c.latent_dim_state,
-                                      c.include_state, c.hidden_dims).to(self.device)
+        self.qvgm = dict(qvgm) if qvgm is not None else None
+        if self.qvgm is not None:
+            # cog-feature critic (오프라인 qvgm 과 같은 구조). 이미지 인코더가 없다 —
+            # 배치의 obs/next_obs 자리에 **표준화된 cog feature** 가 온다 (encode 는 통과).
+            # 백본이 RL 에서 완전 동결이라 (setup_training) cog feature 는 라운드 간
+            # 불변 = ingest 때 한 번 추출해 캐시하면 학습 루프에 백본이 안 들어온다
+            # (next 후보 샘플링 vla.sample 제외 — 그건 EXPO 의 정의상 필요하다).
+            self.encoder = None
+            dfeat = int(self.qvgm["dfeat"])
+            self.critic = QvgmCritic(
+                dfeat, state_dim, full, self.qvgm.get("action_index"),
+                latent=int(self.qvgm.get("latent", 2048)),
+                state_latent=int(self.qvgm.get("state_latent", 256)),
+                n_steps=int(self.qvgm.get("n_steps", 1)),
+                num_qs=c.num_qs,
+                hidden=tuple(self.qvgm.get("hidden", (1024, 512))),
+                layer_norm=c.critic_layer_norm,
+                inject=bool(self.qvgm.get("inject", True)),
+                bins=int(self.qvgm.get("bins", 128)),
+                q_range=tuple(self.qvgm.get("q_range", (0.0, 1.0)))).to(self.device)
+            self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
+            self.residual = ResidualActor(dfeat, state_dim, spec, c.latent_dim_state,
+                                          c.include_state, c.hidden_dims).to(self.device)
+        else:
+            self.encoder = BatchEncoder(3 * n_cams, c.latent_dim_image, c.encoder_stage_sizes,
+                                        c.encoder_num_filters).to(self.device)
+            self.critic = CriticEnsemble(c.latent_dim_image, state_dim, full, c.num_qs,
+                                         c.latent_dim_state, c.include_state, c.hidden_dims,
+                                         c.critic_layer_norm).to(self.device)
+            self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
+            self.residual = ResidualActor(c.latent_dim_image, state_dim, spec, c.latent_dim_state,
+                                          c.include_state, c.hidden_dims).to(self.device)
         self.temp = Temperature(c.init_temperature).to(self.device)
 
         # 원본은 critic 과 batch_encoder 에 각각 Adam(critic_lr) 을 둔다. Adam 은 파라미터
-        # 단위라 하나로 묶어도 동일하다.
+        # 단위라 하나로 묶어도 동일하다. (qvgm 은 인코더가 critic 안에 있다 — FuseProj)
+        _enc_params = list(self.encoder.parameters()) if self.encoder is not None else []
         self.opt_critic = torch.optim.Adam(
-            list(self.critic.parameters()) + list(self.encoder.parameters()), lr=c.critic_lr)
+            list(self.critic.parameters()) + _enc_params, lr=c.critic_lr)
         self.opt_residual = torch.optim.Adam(self.residual.parameters(), lr=c.actor_lr)
         self.opt_temp = torch.optim.Adam(self.temp.parameters(), lr=c.temp_lr)
         self.steps = {"critic": 0, "actor": 0, "residual": 0, "temp": 0}
@@ -194,12 +307,16 @@ class EXPOLearner:
         # 멀티 GPU 에서 backward 뒤 opt.step() 전에 gradient 를 rank 평균으로 맞춘다.
         # 단일 프로세스면 ddp.all_reduce_grads 가 즉시 반환하므로 분기하지 않는다.
         # (자세한 이유는 rl/ddp.py 머리말)
-        self._critic_params = list(self.critic.parameters()) + list(self.encoder.parameters())
+        self._critic_params = list(self.critic.parameters()) + _enc_params
         self._residual_params = list(self.residual.parameters())
         self._temp_params = list(self.temp.parameters())
 
     # --- 공통 ---------------------------------------------------------------
     def encode(self, obs: torch.Tensor, stop_gradient: bool) -> torch.Tensor:
+        if self.encoder is None:
+            # qvgm: obs 가 이미 표준화된 cog feature 다. 융합(FuseProj)은 critic 내부에서
+            # state 와 함께 일어나고, 그 gradient 는 opt_critic 이 관리한다.
+            return obs
         return self.encoder(obs, stop_gradient=stop_gradient)
 
     def _members(self) -> list[int]:
@@ -287,8 +404,15 @@ class EXPOLearner:
             target_q = b["reward"] + (c.discount ** self.replan_steps) * b["mask"] * next_q
 
         lat = self.encode(b["obs"], stop_gradient=c.freeze_critic_encoder)
-        qs = self.critic(lat, b["state"], b["action"])
-        loss = (((qs - target_q.unsqueeze(0)) ** 2) * b["valid"].unsqueeze(0)).mean()
+        if self.qvgm is not None and self.critic.bins:
+            # 분포형 헤드는 HL-Gauss CE (offline_iql_qvgm 과 동일 — 스칼라 MSE 는
+            # 발산 이력이 있다). qs 는 로깅용 스칼라 환산값.
+            logits = self.critic.logits(lat, b["state"], b["action"])
+            loss = self.critic.hl_gauss(logits, target_q, weight=b["valid"])
+            qs = self.critic.q_of(logits.detach())
+        else:
+            qs = self.critic(lat, b["state"], b["action"])
+            loss = (((qs - target_q.unsqueeze(0)) ** 2) * b["valid"].unsqueeze(0)).mean()
 
         self.opt_critic.zero_grad(set_to_none=True)
         loss.backward()
@@ -559,6 +683,40 @@ def _verify() -> int:
     same = torch.equal(theta(0), theta(0))
     check("8 같은 seed → 같은 θ₀ (라운드 0 을 무엇으로 모았는지 기록하려면 필수)", same)
     check("8 다른 seed → 다른 θ₀", not torch.equal(theta(0), theta(1)))
+
+    # 9) qvgm(cog-feature) critic 백엔드 — obs 자리에 표준화된 feature 가 온다
+    dfeat = 96
+    aidx = [t * adim + i for t in range(latency + replan)
+            for i in range(3, 10)]                    # "오른팔 7관절" 흉내: 창 전체 x 7열
+    qv = dict(dfeat=dfeat, action_index=aidx, latent=64, state_latent=16,
+              hidden=(64, 32), bins=17, q_range=(0.0, 1.0))
+    vq = DummyVLA(adim, 40, seed=3)
+    Lq = EXPOLearner(vq, spec, adim, n_cams, replan, cfg, seed=0, latency=latency, qvgm=qv)
+
+    def fbatch(n):
+        b = batch(n)
+        b["obs"] = torch.randn(n, dfeat)
+        b["next_obs"] = torch.randn(n, dfeat)
+        return b
+
+    iq = Lq.update(fbatch(B * UTD), actor_batch=fbatch(B))
+    check("9 qvgm: 1 update == utd_ratio critic 스텝", Lq.steps["critic"] == UTD, str(Lq.steps))
+    check("9 qvgm: 후보간 Q 분산 > 0", iq["candidate_q_std"] > 0, f"{iq['candidate_q_std']:.5f}")
+    check("9 qvgm: Q 가 support [0,1] 안", 0.0 <= iq["q"] <= 1.0, f"q={iq['q']:.4f}")
+    check("9 qvgm: critic_loss 유한", math.isfinite(iq["critic_loss"]), str(iq["critic_loss"]))
+    ch, _ = Lq.act({"batch_size": 4}, torch.randn(4, dfeat), torch.randn(4, adim))
+    check("9 qvgm: act() 출력 (B, full_dim)", ch.shape == (4, spec.full_dim),
+          str(tuple(ch.shape)))
+    check("9 qvgm: 액션에 NaN 없음", bool(torch.isfinite(ch).all()))
+    # action_index 밖의 열을 흔들어도 Q 가 안 변해야 한다 (critic 이 그 열을 안 본다)
+    ftest = torch.randn(2, dfeat)
+    stest, atest = torch.randn(2, adim), torch.rand(2, spec.full_dim) * 2 - 1
+    amod = atest.clone()
+    outside = [i for i in range(spec.full_dim) if i not in set(aidx)]
+    amod[:, outside] += 10.0
+    with torch.no_grad():
+        dq = (Lq.critic(ftest, stest, atest) - Lq.critic(ftest, stest, amod)).abs().max()
+    check("9 qvgm: action_index 밖 열은 Q 에 무영향", float(dq) == 0.0, f"Δ={float(dq):.2e}")
 
     print(f"\n{'전부 통과' if not fails else f'{len(fails)}개 실패: ' + ', '.join(fails)}")
     return 1 if fails else 0
