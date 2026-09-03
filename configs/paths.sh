@@ -29,7 +29,7 @@ L_PYTHONPATH=$L_RL/third_party/RLDX-1:$L_RL
 
 # --- k8s ---
 L_NS=p-rlwrld
-L_POD=younghoon-shin-sleep-2gpu-j8x98-99npj
+L_POD=younghoon-shin-rldx-img-0827-0903-4gpu-46ndb-gpvp5
 
 # base policy 는 여기 없다 — 실험마다 다르므로 configs/exp/<이름>.yaml 에 둔다
 # (paths.sh 는 이 머신의 사실만 담는다).

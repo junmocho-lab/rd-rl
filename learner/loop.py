@@ -708,8 +708,9 @@ class Trainer:
             if ddp.is_main():
                 try:
                     from rl.data import build_cogfeat
+                    # batch 64 는 H200(141GB) 기준 — 작은 GPU 에서 OOM 이 나면 낮출 것
                     build_cogfeat(self.vla, self.flat, self.imgs, self.mod, self.task,
-                                  self.buf / "cogfeat.npy", log=self.log)
+                                  self.buf / "cogfeat.npy", batch=64, log=self.log)
                     stats = self.buf / "featstats.npz"
                     if not stats.is_file():
                         f = np.lib.format.open_memmap(self.buf / "cogfeat.npy", mode="r")
