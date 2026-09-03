@@ -88,8 +88,8 @@ round:
   updates_per_episode: 3
   # 시드 데모: BC 학습에 쓴 성공 teleop 을 버퍼 맨 앞에 넣는다 (EXPO-FT --num_data).
   # 학습서버의 $L_DS 에 올린 teleop 데이터셋 경로 (repo 상대). 라운드 전에 확인할 것.
-  seed_dataset: rl-dataset/t0
-  seed_teleop_episodes: 10
+  seed_dataset: rl-dataset/t0_rc_320x192
+  seed_teleop_episodes: 20
   seed_success_only: true
   # 온라인 롤아웃 에피소드가 이 수에 닿기 전에는 버퍼에만 넣고 학습하지 않는다.
   min_online_episodes: 10

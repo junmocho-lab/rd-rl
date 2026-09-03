@@ -49,7 +49,11 @@ p.add_argument("--shard", default="",
                     "<out>.partI_of_N.npy 로 쓴다. GPU 마다 CUDA_VISIBLE_DEVICES 를 달리해 "
                     "N개 프로세스를 띄우고, 전부 끝나면 --merge N 으로 합친다.\n"
                     "**images.mm 이 먼저 완성돼 있어야 한다** (N개가 동시에 디코딩하면 "
-                    "memmap 이 깨진다) — 한 번은 --shard 없이 돌리거나 rl.data images 로 만들 것")
+                    "memmap 이 깨진다) — 한 번은 --shard 없이 돌리거나 rl.data images 로 만들 것.\n"
+                    "**OMP_NUM_THREADS=<코어수/N> 를 꼭 걸 것** — 안 걸면 프로세스마다 torch 가 "
+                    "전체 코어만큼 스레드를 만들어 서로 싸운다 (실측 H200x4/128코어: 캡 없이 "
+                    "9 fps, OMP=16 으로 213 fps — 23배). torchrun 는 자동으로 1 로 잡아주지만 "
+                    "이 스크립트는 수동 병렬이라 직접 걸어야 한다")
 p.add_argument("--merge", type=int, default=0,
                help="N 개의 .partI_of_N.npy 를 <out> 으로 합치고 part 파일을 지운다 (GPU 불필요)")
 a = p.parse_args()
