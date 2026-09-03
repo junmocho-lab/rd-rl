@@ -534,8 +534,13 @@ class Trainer:
         self.wb = None
         if not ddp.is_main():
             return                    # 4개 rank 가 같은 run id 로 붙으면 서로 덮어쓴다
-        if self.args.no_wandb or not os.environ.get("WANDB_API_KEY"):
-            self.log("[wandb] WANDB_API_KEY 가 없어 붙지 않는다 (로그 파일만)")
+        # 키는 env 또는 ~/.netrc (wandb 라이브러리가 netrc 를 네이티브로 읽는다) —
+        # 셸마다 export 를 까먹어서 라운드가 wandb 없이 도는 사고가 있었다 (2026-09-04).
+        netrc = Path.home() / ".netrc"
+        has_key = bool(os.environ.get("WANDB_API_KEY")) or (
+            netrc.is_file() and "api.wandb.ai" in netrc.read_text())
+        if self.args.no_wandb or not has_key:
+            self.log("[wandb] WANDB_API_KEY/.netrc 가 없어 붙지 않는다 (로그 파일만)")
             return
         try:
             import wandb
@@ -559,6 +564,12 @@ class Trainer:
                 **{f"expo.{k}": v for k, v in vars(self.cfg).items()},
                 **{f"round.{k}": v for k, v in self.rnd_cfg.items()},
             })
+        # 재시작 시 스텝 이어붙기 — self.updates 가 0 부터 다시 세면 wandb 가
+        # "step 이 되돌아갔다" 며 이전 최대 스텝(예: r000 의 60) 이하 포인트를 조용히
+        # 버린다. resume 된 run 의 마지막 스텝에서 이어서 센다.
+        if self.wb.resumed and self.wb.step:
+            self.updates = int(self.wb.step)
+            self.log(f"[wandb] 재시작 이어붙기 — step {self.updates} 부터")
         self.log(f"[wandb] {self.args.wandb_project}/{self.args.exp} → {self.wb.url}")
 
     def _latest_theta(self) -> Path | None:
