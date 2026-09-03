@@ -1,0 +1,95 @@
+# ★ 배선 확인용 smoke 판 — fuji_online.yaml 과 동일하되 batch/utd/게이트만 축소.
+# 본 실험은 fuji_online.yaml 을 쓸 것.
+# fuji (rby1m_rh56f1) — **온라인 EXPO-FT RL** (actor 로컬 / learner 학습서버 라운드 루프).
+#
+# fuji_d4r16 (오프라인 critic 학습용) 에서 갈라져 나온 것. 다른 점:
+#   1. base_policy 가 hilw3 (rc) checkpoint-30000 — 로컬에서 서빙 검증한 그 모델.
+#      config.json 실측: action_horizon 40, rtc_training_max_delay 8 (>= inference_latency 4 ✓),
+#      n_cog_tokens 64. **로컬($A_CKPT)과 학습서버($L_CKPT) 양쪽에 같은 상대경로로 둘 것.**
+#      학습서버 실경로: /data/rlwrld-unified-checkpoints/younghoon_shin/checkpoints/<base_policy>
+#      로컬은 $A_CKPT 아래 같은 상대경로에 심볼릭 링크 (원본: ~/fuji_ws/model_ckpt/
+#      rldx_img_0827-0902-hilw3-40k-2gpu-128b — 로컬 디렉토리명에는 _rc 가 없다).
+#   2. critic: 블록 — EXPOLearner 가 ResNet 이미지 critic 대신 **qvgm cog-feature critic**
+#      (오프라인 fuji_d4r16_0902 critic 과 같은 구조) 를 만든다. 처음부터 학습한다
+#      (critic warm start 없음 — cog feature 가 base 모델마다 달라 이식이 안 된다).
+#   3. round: 블록 — learner/loop.py 의 라운드 학습 게이트/시드.
+#
+# rrc 쪽: execution_horizon=16, inference_latency_steps=4 (d4r16 과 동일).
+
+name: fuji_online_smoke
+dataset: rl-dataset/fuji/0831_fuji_all_nostop     # (참고용 — 온라인 버퍼는 round 로 쌓인다)
+robot: rby1m_rh56f1
+
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+modality: modality/rby1m_rh56f1/modality.json
+
+# <checkpoints>/ 아래 상대경로 — actor 와 learner 양쪽에 이 경로로 배치한다.
+base_policy: rldx-img-curated/rldx_img_rc_0827-0902-hilw3-40k-2gpu-128b/checkpoint-30000
+
+action_horizon: 40
+replan_steps: 16
+inference_latency: 4
+
+# --- critic 백엔드: qvgm cog-feature (learner/loop.py qvgm_spec 이 읽는다) ------
+# 값은 fuji_d4r16_0902 오프라인 critic 체크포인트 실측과 동일. action_index 는
+# explore_groups x 창 전체 [0, latency+replan) 로 자동 유도된다 (오른팔 7관절 x 20스텝
+# = 140차원). dfeat 4096 은 RLDX-1-VLM cognition token 의 mean-pool 차원.
+critic:
+  dfeat: 4096
+  latent: 2048
+  state_latent: 256
+  hidden: [1024, 512]
+  bins: 128
+  q_range: [0.0, 1.0]
+  inject: true
+  n_steps: 1
+
+explore_groups:
+  - right_arm_joints
+
+expo:
+  N: 8
+  n_edit_samples: 8
+  # fuji 1프레임 자연 변화 ~0.0051. 0.01 = 2프레임치 (0.02 는 실기에서 흔들렸다).
+  edit_scale: 0.01
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+  # 프레임당 할인 (fuji 평균 617프레임 → 0.998^617 = 0.27). fuji_d4r16 주석 참고.
+  discount: 0.998
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  # 아래 4개는 legacy ResNet critic 용 — critic: 블록이 있으면 쓰이지 않지만
+  # ExpoConfig 필드라 남겨 둔다 (residual actor 의 latent_dim_state/hidden 은 쓰인다).
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
+  batch_size: 32          # smoke: 배선 확인용 축소
+  utd_ratio: 4            # smoke: 업데이트당 critic 4스텝만
+  freeze_critic_encoder: false
+  actor_success_only: true
+
+vla:
+  lora_rank: 16
+  lora_lr: 3.0e-4
+  freeze_backbone: true
+
+# --- 라운드 운영 (fuji.yaml 의 주석 참고 — EXPO-FT 프로토콜 대응) ---------------
+round:
+  episodes_per_round: 5
+  updates_per_episode: 2   # smoke
+  # 시드 데모: BC 학습에 쓴 성공 teleop 을 버퍼 맨 앞에 넣는다 (EXPO-FT --num_data).
+  # 학습서버의 $L_DS 에 올린 teleop 데이터셋 경로 (repo 상대). 라운드 전에 확인할 것.
+  seed_dataset: rl-dataset/t0
+  seed_teleop_episodes: 10
+  seed_success_only: true
+  # 온라인 롤아웃 에피소드가 이 수에 닿기 전에는 버퍼에만 넣고 학습하지 않는다.
+  min_online_episodes: 1   # smoke: 데이터 1에피소드로도 학습이 돌게
+  buffer_capacity: 100000        # TODO: 코드가 아직 읽지 않는다 (fuji.yaml 과 동일)
