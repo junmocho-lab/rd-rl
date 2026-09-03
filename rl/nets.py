@@ -444,6 +444,44 @@ class ResidualActor(nn.Module):
         return self.spec.scatter(u * edit_scale), log_prob
 
 
+class FuseResidualActor(ResidualActor):
+    """qvgm critic(QvgmCritic)과 **같은 입력 배선**의 residual(edit) actor.
+
+    ResidualActor 와 다른 점 (critic 과 표현을 맞춘 것):
+      · cog feature → Linear(latent=2048) / state → Linear(state_latent=256)
+        → concat → LayerNorm  (critic 의 FuseProj 와 같은 배선. 가중치는 공유하지 않는다
+        — actor 와 critic 의 목적함수가 달라 표현이 갈릴 수 있어야 한다)
+      · base 액션은 critic 이 보는 열(action_index — 예: 오른팔 7관절 x 창 20스텝 =
+        140차원)만 본다. 어차피 편집(출력)도 그 관절들에만 들어간다.
+    출력·sample() 시그니처는 ResidualActor 와 동일 — 호출측이 갈리지 않는다.
+    첫 인자는 이미지 latent 가 아니라 **표준화된 cog feature** 다.
+    """
+
+    def __init__(self, dfeat: int, state_dim: int, spec: ExploreSpec,
+                 action_index: list[int], latent: int = 2048, state_latent: int = 256,
+                 hidden_dims: tuple[int, ...] = (256, 256, 256)):
+        nn.Module.__init__(self)
+        self.spec = spec
+        self.fuse = FuseProj(dfeat, state_dim, latent, state_latent)
+        self.register_buffer("action_index",
+                             torch.as_tensor(list(action_index), dtype=torch.long))
+        in_dim = self.fuse.out_dim + len(action_index)
+        self.body = MLP(in_dim, hidden_dims, activate_final=True)
+        self.mean = xavier_(nn.Linear(self.body.out_dim, spec.out_dim))
+        self.log_std = xavier_(nn.Linear(self.body.out_dim, spec.out_dim))
+
+    def dist(self, feat: torch.Tensor, state: torch.Tensor,
+             base_action: torch.Tensor) -> torch.distributions.Distribution:
+        x = self.fuse(feat, state)
+        h = self.body(torch.cat([x, base_action[..., self.action_index]], dim=-1))
+        mean = self.mean(h)
+        log_std = self.log_std(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        normal = torch.distributions.Normal(mean, log_std.exp())
+        return torch.distributions.TransformedDistribution(
+            torch.distributions.Independent(normal, 1),
+            torch.distributions.TanhTransform(cache_size=1))
+
+
 # --------------------------------------------------------------------------- #
 def _verify() -> int:
     """CPU 에서 shape / 파라미터 수 / scatter / gradient 확인."""

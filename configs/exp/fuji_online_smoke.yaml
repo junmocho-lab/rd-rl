@@ -50,8 +50,10 @@ explore_groups:
 expo:
   N: 8
   n_edit_samples: 8
-  # fuji 1프레임 자연 변화 ~0.0051. 0.01 = 2프레임치 (0.02 는 실기에서 흔들렸다).
-  edit_scale: 0.01
+  # fuji 1프레임 자연 변화 ~0.0051. 0.02 = 4프레임치. (guidance 실측에서 0.02 가 흔들린
+  # 기록이 있으나 여기선 critic argmax 가 나쁜 edit 을 거른다 — 성공률이 BC 대비 반토막
+  # 나면 0.01 로 내리고, 라운드 2~3째에도 candidate_q_std 가 0 이면 0.05 로 올릴 것.)
+  edit_scale: 0.02
   num_qs: 10
   num_min_qs: 2
   critic_layer_norm: true

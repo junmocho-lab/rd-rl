@@ -347,7 +347,7 @@ class ExpoServer:
                  parl_keep: int = 0, parl_temp: float = 0.0):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
-        from rl.nets import ResidualActor, explore_spec
+        from rl.nets import FuseResidualActor, explore_spec
 
         self.replan = int(exp["replan_steps"])
         self.latency = int(exp["inference_latency"])
@@ -407,12 +407,17 @@ class ExpoServer:
             self.loaded = ["cog-critic"]
             if "residual" in probe:
                 dfeat = int(probe["feat_mu"].shape[-1])
-                self.cog_residual = ResidualActor(
-                    dfeat, mod.state_dim, spec, self.cfg.latent_dim_state,
-                    self.cfg.include_state, self.cfg.hidden_dims).to(device).eval()
+                # critic 과 같은 입력 배선 — 하이퍼는 theta 메타에서 그대로 복원한다
+                self.cog_residual = FuseResidualActor(
+                    dfeat, mod.state_dim, spec, probe["action_index"],
+                    latent=int(probe.get("latent", 2048)),
+                    state_latent=int(probe.get("state_latent", 256)),
+                    hidden_dims=self.cfg.hidden_dims).to(device).eval()
                 self.cog_residual.load_state_dict(probe["residual"])
                 self.loaded.append("residual")
-                print(f"  [edit] residual actor loaded (input dfeat {dfeat}, "
+                print(f"  [edit] residual actor loaded (fuse dfeat {dfeat} → "
+                      f"{probe.get('latent', 2048)}+{probe.get('state_latent', 256)}, "
+                      f"action cols {len(probe['action_index'])}, "
                       f"edit_scale {self.cfg.edit_scale}, "
                       f"n_edit_samples {self.cfg.n_edit_samples})")
             if probe.get("lora"):

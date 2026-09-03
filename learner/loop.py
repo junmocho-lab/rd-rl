@@ -34,6 +34,8 @@ from pathlib import Path
 
 ROUND_RE = re.compile(r"^r(\d{3,})$")
 REQUIRED_DIRS = ("data", "meta", "videos")
+# convert_data.py 기본 -s 320x192 의 (H, W). 다른 해상도로 파이프라인을 바꾸면 여기도 같이.
+EXPECTED_HW = (192, 320)
 
 _stop = False
 
@@ -161,6 +163,24 @@ def scan_sessions(sessions: list[Path]) -> tuple[dict, list[str]]:
         eps = int(info.get("total_episodes", 0))
         if eps == 0:
             problems.append(f"{p.name}: total_episodes=0 (빈 데이터셋은 로더가 죽는다)")
+            continue
+        # 변환 검증 — convert_data.py 를 안 거친 원본(720x1280)을 그대로 보내는 실수를
+        # **업로드 전에** 잡는다 (전송량 30배 + learner 버퍼 memmap 불일치).
+        # shape 은 [C,H,W] 이 표준이지만 채널 위치에 관계없이 큰 두 값으로 비교한다.
+        bad = []
+        for k, v in (info.get("features") or {}).items():
+            if v.get("dtype") == "video":
+                hw = sorted(int(x) for x in (v.get("shape") or []))[-2:]
+                if tuple(hw) != EXPECTED_HW:
+                    bad.append(f"{k}:{v.get('shape')}")
+        if bad:
+            problems.append(f"{p.name}: 비디오 해상도가 {EXPECTED_HW[1]}x{EXPECTED_HW[0]} 이 "
+                            f"아님 — convert_data.py 를 안 거친 원본이다: {', '.join(bad[:2])}")
+            continue
+        if not (p / "meta" / "modality.json").is_file():
+            problems.append(f"{p.name}: meta/modality.json 없음 — convert_data.py 에 "
+                            f"--modality modality/<embodiment>/modality.json 을 주고 다시 "
+                            f"변환할 것 (RLDX 로더가 요구한다)")
             continue
         stats["sessions"].append(p.name)
         stats["episodes"] += eps

@@ -31,7 +31,7 @@ import torch.nn as nn
 
 from rl import ddp
 from rl.nets import (BatchEncoder, CriticEnsemble, ExploreSpec, FuseProj,
-                     ResidualActor, StepwiseEnsemble, Temperature)
+                     FuseResidualActor, ResidualActor, StepwiseEnsemble, Temperature)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,8 +282,12 @@ class EXPOLearner:
                 bins=int(self.qvgm.get("bins", 128)),
                 q_range=tuple(self.qvgm.get("q_range", (0.0, 1.0)))).to(self.device)
             self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
-            self.residual = ResidualActor(dfeat, state_dim, spec, c.latent_dim_state,
-                                          c.include_state, c.hidden_dims).to(self.device)
+            # edit policy 도 critic 과 같은 입력 배선 (FuseProj + action_index 열만)
+            self.residual = FuseResidualActor(
+                dfeat, state_dim, spec, self.qvgm.get("action_index") or [],
+                latent=int(self.qvgm.get("latent", 2048)),
+                state_latent=int(self.qvgm.get("state_latent", 256)),
+                hidden_dims=c.hidden_dims).to(self.device)
         else:
             self.encoder = BatchEncoder(3 * n_cams, c.latent_dim_image, c.encoder_stage_sizes,
                                         c.encoder_num_filters).to(self.device)
