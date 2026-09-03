@@ -6,6 +6,8 @@ A_RUNS=/home/rd/ws/junmo_cho/rd-rl/runs
 
 # --- learner (training server) ---
 L_RL=/data/junmo_cho/workspace/rd-rl
+# 산출물($L_CKPT/expo/<run id>/)은 junmo_cho 쪽에 쌓는다. base 모델 원본은
+# younghoon_shin 쪽에 있고, 여기 rldx-img-curated/ 아래 심볼릭 링크로 연결돼 있다.
 L_CKPT=/data/rlwrld-unified-checkpoints/junmo_cho/checkpoints
 L_DS=/data/junmo_cho/workspace/rd-rl/rl-dataset
 L_RUNS=/data/junmo_cho/workspace/rd-rl/runs
@@ -27,7 +29,7 @@ L_PYTHONPATH=$L_RL/third_party/RLDX-1:$L_RL
 
 # --- k8s ---
 L_NS=p-rlwrld
-L_POD=junmo-cho-data-pod-2
+L_POD=younghoon-shin-sleep-2gpu-j8x98-99npj
 
 # base policy 는 여기 없다 — 실험마다 다르므로 configs/exp/<이름>.yaml 에 둔다
 # (paths.sh 는 이 머신의 사실만 담는다).
