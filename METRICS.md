@@ -47,6 +47,11 @@ edit_scale               0.2          (base 다양성의 7배)
 | `q` 가 [0, 1] 로 올라옴 | 정상. 성공에 가까운 프레임이 1 에 가까워야 한다 |
 | **`q_max > 1.2`** | **발산.** 상한이 1 인데 넘었다는 뜻이므로 즉시 멈출 신호 |
 
+**qvgm(분포형, fuji_online) 주의**: HL-Gauss 헤드는 support [0,1] 밖을 **구조적으로 못
+낸다** — `q_max > 1.2` 신호가 아예 안 뜬다. 발산은 대신 `critic_loss` 상승 반전,
+`target_q_mean` 이 1 근처에 붙는 것, 서빙 `ens.std` 폭주로 드러난다. 랜덤 초기화 직후
+q ≈ 0.5 (bins 균등 = support 중앙)가 정상이다 (smoke 실측 0.484).
+
 값 전파는 느리다. Bellman backup 한 번이 결정 하나를 옮기고 `tau=0.005` 의 시간상수가
 약 200스텝이므로, openarm(에피소드당 약 38결정) 은 최소 38×200 ≈ **7,600 스텝**이 필요하다.
 fuji 는 에피소드가 더 길어(약 150결정) 더 오래 걸린다. "안 되는 것"과 "느린 것"을
@@ -67,10 +72,19 @@ fuji 는 에피소드가 더 길어(약 150결정) 더 오래 걸린다. "안 �
 | 실험 | 활성 차원 | target |
 |---|---|---|
 | openarm_rim | left_arm 7 + left_hand 6 = 13, × replan 8 = 104 | **-52** |
-| fuji | right_arm 7, × replan 8 = 56 | **-28** |
+| fuji d3r8 | right_arm 7, × replan 8 = 56 | **-28** |
+| fuji_online (d4r16) | right_arm 7, × replan 16 = 112 | **-56** |
 
 entropy 가 target 보다 낮으면 `train/temperature` 가 올라가고, 높으면 내려간다.
-**temperature 가 발산하면(수십~수백) 뭔가 잘못된 것.**
+
+**주의 — edit_scale 이 작으면 target 이 구조적으로 도달 불가다.** entropy 는 편집(액션)
+공간에서 재므로 (`log_prob -= dim·log(edit_scale)`) 상한이 균등분포일 때의
+`dim·ln(2·edit_scale)` 이다. fuji_online(edit_scale 0.02, 112차원)의 상한은
+`112·ln(0.04) ≈ -361` — target -56 에 절대 못 닿는다. 그래서 **temperature 가 꾸준히
+오르는 것 자체는 정상**이고 (원본 EXPO-FT 도 같은 구조), 볼 것은 두 가지다:
+entropy 가 상한(-361) 근처에서 평평해지는지, 그리고 `residual_q` 가 여전히 loss 에서
+의미를 갖는지 (α 가 커져 Q 항이 완전히 묻히면 edit 이 균등 노이즈로 퇴화 — 그때는
+target 을 도달 가능한 값으로 재정의하는 한 줄 수정이 답이다).
 
 ## 5. 보조 지표
 
@@ -79,7 +93,7 @@ entropy 가 target 보다 낮으면 `train/temperature` 가 올라가고, 높으
 | `train/next_q_nan_ratio` | 0 | 타깃 계산에 NaN. 즉시 조사 |
 | `train/critic_grad_norm` | 튀지 않음 | 스파이크는 발산 전조 |
 | `train/actor_loss` | 낮고 안정 | 오르면 BC 타깃(고른 후보)이 VLA 가 낼 수 있는 범위를 벗어나는 중 |
-| `train/mean_edit_norm` | 1.31 (상한 `edit_scale·√dim` ≈ 2.04) | 상한에 붙으면 tanh 포화 = residual 이 한계 |
+| `train/mean_edit_norm` | 상한은 `edit_scale·√활성차원` — openarm(0.2) ≈ 2.04 실측 1.31, fuji_online(0.02, 112차원) ≈ 0.21 | 상한에 붙으면 tanh 포화 = residual 이 한계 |
 | `train/critic_loss` | 내려감 | — |
 
 ## 6. `round/success_rate` — 진짜 목표
@@ -114,9 +128,10 @@ fuji 는 에피소드당 약 150결정이라 `0.9227^150 ≈ 6e-6` — **보상�
 **2. `tau` (0.005)** — 값 전파 속도. 2번 항목의 7,600스텝 계산이 여기서 나온다.
 "맞는데 느린" 것처럼 보이면 여기.
 
-**3. `edit_scale` (0.2)** — 정규화 액션 스케일(std 0.5)의 40%. **유일하게 하드웨어 위험과
-직결된다.** 실기에서 너무 거칠면 낮추는 것이 안전하지만, 낮추면 critic 이 배울 액션
-다양성도 줄어든다.
+**3. `edit_scale` (원본 0.2, fuji_online 은 0.02)** — **유일하게 하드웨어 위험과
+직결된다.** fuji 실측: 0.2 는 거동이 눈에 띄게 흔들렸고(1프레임 자연변화의 40배),
+0.02 = 4프레임치로 시작한다. 성공률이 BC 대비 반토막 나면 0.01 로, 라운드 2~3째에도
+candidate_q_std 가 0 이면 0.05 로 (fuji_online.yaml 주석과 동일 기준).
 
 **4. `utd_ratio` (20)** — 계산량 그 자체. update() 1회 85~89초(로컬 5090, openarm)의
 대부분이 이것 × N 이다. 라운드가 너무 오래 걸리면 여기.
@@ -138,4 +153,15 @@ update() 1회        85~89초       batch 64 × utd 20 → 디노이저 배치 5
 라운드 (3×5회)      약 21분
 theta.pt            175 MB        enc + critic + target + residual + temp + lora(64텐서)
 정책 서버 추론      121 ms/회     N=8 + edit 8 (순수 BC 는 118ms — 후보 8개 비용이 3ms)
+```
+
+## 실측 기준값 — fuji_online qvgm (2026-09)
+
+```
+theta.pt            358 MB        qvgm critic(enc/critic/tenc/target) + residual + temp (+lora)
+정책 서버 추론      97 ms/회      hilw3 + qvgm critic + edit 8 (로컬 5090; 예산 133ms=4스텝@30fps)
+cogfeat 추출        ~50 프레임/s/GPU (5090 batch 32) — H200 은 --batch 64 + --shard i/4 로 병렬
+smoke (H200 1장)    21ep 19.5k프레임 ingest+cogfeat+22 update 완주 — update 시간은 실전에서 잴 것
+q(랜덤 θ₀)          0.484~0.499   bins 균등의 기대값 0.5 근처가 정상
+candidate_q_std     랜덤 critic 5e-6 / warm(offline 25k) critic 0.006~0.06
 ```

@@ -71,7 +71,9 @@ expo:
   encoder_num_filters: 64
   init_temperature: 1.0
   entropy_scale: 1.0
-  batch_size: 128
+  # rank 당 값. 유효 배치 = batch_size x GPU 수 — 4 GPU(torchrun)면 32x4=128.
+  # 단일 GPU 로 돌릴 때는 128 로 되돌릴 것 (유효 배치를 128 로 유지).
+  batch_size: 32
   utd_ratio: 20
   freeze_critic_encoder: false
   actor_success_only: true
