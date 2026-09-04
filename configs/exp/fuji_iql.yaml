@@ -1,0 +1,63 @@
+# fuji — **오프라인 IQL critic 학습** (rl/offline_iql_qvgm.py + rl/extract_cogfeat.py 용).
+#
+# fuji_online 에서 갈라져 나온 것. 다른 점 하나 — base_policy 가 **0901-0903 checkpoint-40000**
+# (2026-09-04 사용자 지정, IQL 재학습의 feature/normalizer 원천).
+#   학습서버 실경로: /data/rlwrld-unified-checkpoints/younghoon_shin/checkpoints/<base_policy>
+#   junmo_cho/checkpoints 아래 같은 상대경로에 심볼릭 링크로 배치 (fuji_online 과 같은 방식).
+# cog feature 는 base 모델 산물이므로 이 critic 은 **checkpoint-40000 서빙과만 정합**이다.
+#
+# 데이터: rl-dataset/fuji_rollouts_v1/ — 온라인 롤아웃 세션 심볼릭 링크 모음 (번호 접두사로
+# 정렬 고정). 세션이 늘면 다음 번호로 링크를 추가하고 cogfeat 을 --resume 으로 이어 뽑는다
+# (기존 세션 뒤에 정렬돼야 캐시 prefix 가 유효하다 — 번호 접두사가 그걸 보장).
+
+name: fuji_iql
+dataset: rl-dataset/fuji_rollouts_v1
+robot: rby1m_rh56f1
+
+rldx_data_config: rldx/configs/data/rby1_f1_config.py
+modality: modality/rby1m_rh56f1/modality.json
+
+base_policy: rldx-img-curated/rldx_img_0901-0903-hilw1-dp5-30k-4gpu-128b/checkpoint-40000
+
+action_horizon: 40
+replan_steps: 16
+inference_latency: 4
+
+critic:
+  dfeat: 4096
+  latent: 2048
+  state_latent: 256
+  hidden: [1024, 512]
+  bins: 128
+  q_range: [0.0, 1.0]
+  inject: true
+  n_steps: 1
+
+explore_groups:
+  - right_arm_joints
+
+# ExpoConfig 파싱용 (offline_iql_qvgm 이 exp.get("expo") 를 읽는다) — fuji_online 과 동일.
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.002
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+  discount: 0.998
+  tau: 0.005
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512
+  latent_dim_state: 64
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
+  batch_size: 32
+  utd_ratio: 20
+  freeze_critic_encoder: false
+  actor_success_only: true
