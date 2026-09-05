@@ -38,9 +38,9 @@ cd "$REPO"
 RUN=${RUN:-dexjoco_online_1}
 EXP=${EXP:-dexjoco_hammer_nail_d5r20_online}
 PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
-# restart(기본): 라운드마다 서버를 켜고(롤아웃) 끈다(학습) — 학습이 GPU 전체를 쓴다.
-# resident: 서버 상주 (리로드 0회, 메모리 공존 — OOM 나면 batch 를 낮출 것).
-SERVE_MODE=${SERVE_MODE:-restart}
+# resident(기본): 서버 상주 (리로드 0회, θ 핫리로드 — 메모리 공존).
+# 학습 OOM 이 나면 SERVE_MODE=restart (라운드마다 서버 on/off, 학습이 GPU 전체를 쓴다).
+SERVE_MODE=${SERVE_MODE:-resident}
 SIM_PY=${SIM_PY:-/workspace/junmo_cho/dexjoco/venv/bin/python}
 PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
 [ -x "$PY" ] || { echo "RLDX venv python 이 없다: $PY"; exit 3; }

@@ -286,11 +286,11 @@ def main() -> int:
     p.add_argument("--server-gpus", default="0,1",
                    help="정책 서버를 띄울 GPU 목록 (쉼표 구분). 서버 수 = 병렬 롤아웃 수. "
                         "learner(torchrun)와 같은 GPU 를 공유한다")
-    p.add_argument("--serve-mode", choices=("restart", "resident"), default="restart",
-                   help="restart(기본): 라운드마다 서버를 켜고(롤아웃) 끈다(학습) — 학습이 "
-                        "GPU 메모리를 전부 쓰므로 OOM 안전. 로드는 클라이언트 대기(300s "
-                        "타임아웃)와 겹쳐 라운드당 ~1분. resident: 서버 상주 (메모리 공존, "
-                        "리로드 0회 — H100 80GB 에서 batch 를 낮춰야 할 수 있다)")
+    p.add_argument("--serve-mode", choices=("restart", "resident"), default="resident",
+                   help="resident(기본): 서버 상주 — 리로드 0회, θ 는 에피소드 경계 핫리로드. "
+                        "learner 와 메모리 공존이므로 학습 OOM 이 나면 restart 로: 라운드마다 "
+                        "서버를 켜고(롤아웃; 로드는 클라이언트 300s 대기와 겹침) 꺼서(학습) "
+                        "GPU 메모리를 learner 에 전부 내준다")
     p.add_argument("--seed-base", type=int, default=1000,
                    help="에피소드 장면 seed = seed_base + 전역 에피소드 번호 — 재시작해도 "
                         "같은 라운드는 같은 장면")
