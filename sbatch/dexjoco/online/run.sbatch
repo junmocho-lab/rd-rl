@@ -36,12 +36,14 @@ REPO=${REPO:-${SLURM_SUBMIT_DIR:-$(pwd)}}
 cd "$REPO"
 
 EXP=${EXP:-dexjoco_hammer_nail_d5r20_online}
-# RUN 기본값 = yaml 이름 + 제출 시각 — 디렉토리만 봐도 무슨 실험인지 보이게.
-# ★ 이어받기(재제출)는 **기존 RUN 을 명시**해야 한다 — 기본값은 매번 새 이름이 된다:
-#     sbatch --export=ALL,RUN=<기존 run>,EXP=... run.sbatch
-RUN=${RUN:-${EXP}_$(date +%m%d_%H%M)}
 # 롤아웃 클라이언트의 태스크 이름 — 기본은 EXP 이름에서 유도 (dexjoco_<task>_d5r20_online*)
 TASK=${TASK:-$(echo "$EXP" | sed 's/^dexjoco_//; s/_d5r20.*//')}
+# RUN 기본값 = dexjoco/<task>/<변형>_<월일_시분> (계층 디렉토리 — runs/ 와 checkpoints/expo/
+# 아래에 그대로 반영, wandb id 는 / 가 _ 로 치환된다).
+# ★ 이어받기(재제출)는 **기존 RUN 을 명시**해야 한다 — 기본값은 매번 새 이름이 된다:
+#     sbatch --export=ALL,RUN=dexjoco/hammer_nail/base_0906_1830,EXP=... run.sbatch
+VAR=${EXP#dexjoco_${TASK}_d5r20_online}; VAR=${VAR#_}; VAR=${VAR:-base}
+RUN=${RUN:-dexjoco/${TASK}/${VAR}_$(date +%m%d_%H%M)}
 PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
 # resident(기본): 서버 상주 (리로드 0회, θ 핫리로드 — 메모리 공존).
 # 학습 OOM 이 나면 SERVE_MODE=restart (라운드마다 서버 on/off, 학습이 GPU 전체를 쓴다).

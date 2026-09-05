@@ -549,8 +549,10 @@ class Trainer:
         except ImportError:
             self.log("[wandb] wandb 가 설치돼 있지 않다 — 건너뛴다")
             return
+        # exp 가 계층 경로(dexjoco/hammer_nail/...)일 수 있다 — wandb id 는 슬래시 불가.
+        wb_id = str(self.args.exp).replace("/", "_")
         self.wb = wandb.init(
-            project=self.args.wandb_project, id=self.args.exp, name=self.args.exp,
+            project=self.args.wandb_project, id=wb_id, name=wb_id,
             resume="allow", config={
                 "exp": exp.get("name"), "robot": exp.get("robot"),
                 "base_policy": exp.get("base_policy"), "run_id": self.args.exp,
@@ -1195,8 +1197,8 @@ def main() -> int:
 
     runs_exp = args.runs_root / args.exp
     ckpt_exp = args.ckpt_root / "expo" / args.exp
-    # 로그는 runs/<exp>/ 밖에 둔다 — 라운드 디렉토리를 지워도 남아야 한다.
-    log = Log(args.runs_root / f"{args.exp}.learner.log", enabled=ddp.is_main())
+    # run 디렉토리 안에 둔다 (exp 에 계층 경로가 올 수 있다: dexjoco/hammer_nail/...).
+    log = Log(runs_exp / "learner.log", enabled=ddp.is_main())
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)

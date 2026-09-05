@@ -193,8 +193,8 @@ def start_servers(args, exp_name: str, live: Path, log: Log) -> None:
         env = dict(os.environ)
         env["PYTHONPATH"] = f"{REPO / 'third_party/RLDX-1'}:{REPO}"
         env["CUDA_VISIBLE_DEVICES"] = gpu
-        slog = (args.runs_root / f"{args.exp}.server{i}.log").open("a")
-        log(f"[서버{i}] 기동 (GPU {gpu}, port {port}) → {args.exp}.server{i}.log")
+        slog = (args.runs_root / args.exp / f"server{i}.log").open("a")
+        log(f"[서버{i}] 기동 (GPU {gpu}, port {port}) → server{i}.log")
         _servers.append(subprocess.Popen(cmd, cwd=REPO, env=env,
                                          stdout=slog, stderr=subprocess.STDOUT))
 
@@ -319,7 +319,7 @@ def main() -> int:
     ckpt_exp = args.ckpt_root / "expo" / args.exp
     live = runs_exp / "theta_live.pt"
     (runs_exp / "rollouts").mkdir(parents=True, exist_ok=True)
-    log = Log(args.runs_root / f"{args.exp}.driver.log")
+    log = Log(runs_exp / "driver.log")
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
 
