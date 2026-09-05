@@ -324,6 +324,16 @@ def main() -> int:
 
     log("=" * 70)
     log(f"driver 시작  exp={args.exp}  config={args.exp_config}")
+    # run 정체성 기록 — 디렉토리만 남았을 때 무슨 실험이었는지 복원할 수 있게.
+    meta_p = runs_exp / "run_meta.json"
+    meta = json.loads(meta_p.read_text()) if meta_p.is_file() else {
+        "run": args.exp, "exp_config": str(args.exp_config), "task": args.task,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "starts": []}
+    meta["serve_mode"] = args.serve_mode
+    meta["server_gpus"] = args.gpus
+    meta["code"] = lloop.code_provenance(REPO)
+    meta["starts"] = meta.get("starts", []) + [time.strftime("%Y-%m-%dT%H:%M:%S%z")]
+    write_atomic(meta_p, meta)
     log(f"  라운드 크기: 첫 {first}ep, 이후 {per}ep — 총 {total}ep 까지 "
         f"(서버 {len(args.gpus)}개 병렬 수집)")
     log(f"  replan={args.replan} latency={args.latency} "

@@ -14,7 +14,7 @@
 # 설계: configs/exp/dexjoco_hammer_nail_d5r20_online.yaml 머리말 + sim/dexjoco/online_driver.py.
 #
 #   RUN  : run id (메일박스 runs/<RUN>/, 산출물 checkpoints/expo/<RUN>/, wandb id).
-#          재시도마다 새 이름을 줄 것 (fuji_online_2 처럼: dexjoco_online_1, _2, ...)
+#          비우면 <EXP>_<월일_시분> 으로 자동 생성. **이어받기는 기존 RUN 을 명시할 것.**
 #   EXP  : exp yaml 이름
 #
 #   export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl   # 제출 플러그인용
@@ -35,8 +35,11 @@ REPO=${REPO:-${SLURM_SUBMIT_DIR:-$(pwd)}}
 [ -d "$REPO/configs/exp" ] || { echo "REPO 가 레포 루트가 아니다: $REPO"; exit 2; }
 cd "$REPO"
 
-RUN=${RUN:-dexjoco_online_1}
 EXP=${EXP:-dexjoco_hammer_nail_d5r20_online}
+# RUN 기본값 = yaml 이름 + 제출 시각 — 디렉토리만 봐도 무슨 실험인지 보이게.
+# ★ 이어받기(재제출)는 **기존 RUN 을 명시**해야 한다 — 기본값은 매번 새 이름이 된다:
+#     sbatch --export=ALL,RUN=<기존 run>,EXP=... run.sbatch
+RUN=${RUN:-${EXP}_$(date +%m%d_%H%M)}
 # 롤아웃 클라이언트의 태스크 이름 — 기본은 EXP 이름에서 유도 (dexjoco_<task>_d5r20_online*)
 TASK=${TASK:-$(echo "$EXP" | sed 's/^dexjoco_//; s/_d5r20.*//')}
 PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
