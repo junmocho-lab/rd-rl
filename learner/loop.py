@@ -805,6 +805,66 @@ class Trainer:
                 out[k] = v
         return out
 
+    def _plot_round_q(self, round_no: int, n_new_ep: int, ep_succ: list[int]) -> None:
+        """이번 라운드 새 에피소드들의 Q(s, 실행된 액션) 곡선 → runs/<exp>/plots/rNNN_q.png.
+
+        critic 이 배우고 있는지의 시각 진단: 성공(초록)은 종단으로 갈수록 1 로, 실패(빨강)는
+        0 으로 가야 하고, 라운드가 갈수록 분기가 일찍 나타나야 한다. 온라인 critic 은 V 헤드가
+        없으므로 (오프라인 IQL 전용) Q 의 앙상블 mean(실선)과 min(점선)을 그린다.
+        cogfeat/actnorm 이 버퍼에 캐시돼 있어 VLA 없이 계산된다. 같은 에피소드의 비디오는
+        rNNN/dataset/<세션>/videos/ 에 있다 (곡선 라벨의 세션 내 인덱스로 짝을 맞춘다).
+        """
+        from rl import ddp
+        if not ddp.is_main() or self.L.qvgm is None or n_new_ep == 0:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import numpy as np
+            import torch
+
+            win = self.latency + self.replan
+            A = self.mod.action_dim
+            ends = np.cumsum(self.flat.ep_length)
+            starts = ends - np.asarray(self.flat.ep_length)
+            dev = self.L.device
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            for k, e in enumerate(range(len(ends) - n_new_ep, len(ends))):
+                s0, hi = int(starts[e]), int(ends[e]) - win
+                if hi <= s0:
+                    continue
+                idx = np.arange(s0, hi)
+                feat = torch.from_numpy(((self.cogfeat[idx] - self.feat_mu) / self.feat_sd)
+                                        .astype(np.float32)).to(dev)
+                st = torch.from_numpy(np.ascontiguousarray(self.statenorm[idx])).to(dev)
+                act = torch.from_numpy(np.ascontiguousarray(
+                    np.asarray(self.actnorm[idx][:, :win])
+                    .reshape(len(idx), win * A))).to(dev)
+                with torch.no_grad():
+                    qs = self.L.critic(feat, st, act)          # (num_qs, B)
+                c = "tab:green" if ep_succ[k] else "tab:red"
+                x = np.arange(len(idx))
+                ax.plot(x, qs.mean(0).float().cpu().numpy(), color=c, alpha=0.85, lw=1.3,
+                        label=f"ep{k} ({'succ' if ep_succ[k] else 'fail'})")
+                ax.plot(x, qs.min(0).values.float().cpu().numpy(), color=c, alpha=0.3,
+                        lw=0.8, ls="--")
+            ax.set_xlabel("frame in episode")
+            ax.set_ylabel("Q(s, executed action)  mean(solid) / min(dashed)")
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_title(f"{self.args.exp}  r{round_no:03d}  after {self.updates} updates  "
+                         f"(success {sum(ep_succ)}/{len(ep_succ)})")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=7, ncol=2, loc="upper left")
+            fig.tight_layout()
+            out = self.args.runs_root / self.args.exp / "plots"
+            out.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out / f"r{round_no:03d}_q.png", dpi=120)
+            plt.close(fig)
+            self.log(f"[플롯] plots/r{round_no:03d}_q.png (에피소드 {n_new_ep}개 Q 곡선)")
+        except Exception as exc:                       # 플롯 실패가 라운드를 죽이면 안 된다
+            self.log(f"[플롯] 실패 (무시): {type(exc).__name__}: {exc}")
+
     # --- 라운드 -------------------------------------------------------------
     def run_round(self, round_dir: Path, ckpt_round: Path, stats: dict, ready: dict) -> None:
         self._build()
@@ -887,6 +947,7 @@ class Trainer:
                 row["round/success"] = int(succ)
                 row["round/success_rate"] = int(succ) / n_ep
             self.wb.log(row, step=self.updates)
+        self._plot_round_q(int(ready.get("round", 0)), n_new_ep, ep_succ)
         self.export(ckpt_round, stats, ready, buf, n_updates, last)
 
     def export(self, ckpt_round: Path, stats: dict, ready: dict, buf: dict,
