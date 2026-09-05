@@ -752,6 +752,7 @@ class Trainer:
         n_seed_ep = sum(len(r["episodes"]) for r in records
                         if r["kind"] == "seed" and r.get("episodes"))
         n_online_ep = n_ep - n_seed_ep
+        self._n_seed_ep = n_seed_ep
         self.log(f"[버퍼] 프레임 {len(self.flat)}  에피소드 {n_ep} "
                  f"(시드 {n_seed_ep} + 온라인 {n_online_ep}, 성공 {n_succ_ep})  "
                  f"성공 프레임 {len(self.succ_idx)}")
@@ -828,12 +829,13 @@ class Trainer:
             A = self.mod.action_dim
             ends = np.cumsum(self.flat.ep_length)
             starts = ends - np.asarray(self.flat.ep_length)
+            n_ep = len(ends)
             dev = self.L.device
-            fig, ax = plt.subplots(figsize=(9, 4.5))
-            for k, e in enumerate(range(len(ends) - n_new_ep, len(ends))):
+
+            def q_curve(e: int):
                 s0, hi = int(starts[e]), int(ends[e]) - win
                 if hi <= s0:
-                    continue
+                    return None, None
                 idx = np.arange(s0, hi)
                 feat = torch.from_numpy(((self.cogfeat[idx] - self.feat_mu) / self.feat_sd)
                                         .astype(np.float32)).to(dev)
@@ -843,12 +845,23 @@ class Trainer:
                     .reshape(len(idx), win * A))).to(dev)
                 with torch.no_grad():
                     qs = self.L.critic(feat, st, act)          # (num_qs, B)
+                return (qs.mean(0).float().cpu().numpy(),
+                        qs.min(0).values.float().cpu().numpy())
+
+            out = self.args.runs_root / self.args.exp / "plots"
+            out.mkdir(parents=True, exist_ok=True)
+
+            # 1) 이번 라운드 새 에피소드 (mean + min, 라벨 포함)
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            for k, e in enumerate(range(n_ep - n_new_ep, n_ep)):
+                mean, qmin = q_curve(e)
+                if mean is None:
+                    continue
                 c = "tab:green" if ep_succ[k] else "tab:red"
-                x = np.arange(len(idx))
-                ax.plot(x, qs.mean(0).float().cpu().numpy(), color=c, alpha=0.85, lw=1.3,
+                x = np.arange(len(mean))
+                ax.plot(x, mean, color=c, alpha=0.85, lw=1.3,
                         label=f"ep{k} ({'succ' if ep_succ[k] else 'fail'})")
-                ax.plot(x, qs.min(0).values.float().cpu().numpy(), color=c, alpha=0.3,
-                        lw=0.8, ls="--")
+                ax.plot(x, qmin, color=c, alpha=0.3, lw=0.8, ls="--")
             ax.set_xlabel("frame in episode")
             ax.set_ylabel("Q(s, executed action)  mean(solid) / min(dashed)")
             ax.set_ylim(-0.05, 1.05)
@@ -857,11 +870,38 @@ class Trainer:
             ax.grid(alpha=0.3)
             ax.legend(fontsize=7, ncol=2, loc="upper left")
             fig.tight_layout()
-            out = self.args.runs_root / self.args.exp / "plots"
-            out.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out / f"r{round_no:03d}_q.png", dpi=120)
+            fig.savefig(out / f"step{self.updates:06d}_r{round_no:03d}_q.png", dpi=120)
             plt.close(fig)
-            self.log(f"[플롯] plots/r{round_no:03d}_q.png (에피소드 {n_new_ep}개 Q 곡선)")
+
+            # 2) 지금까지의 **전체 에피소드** (시드 포함, mean 만 — 현재 critic 기준).
+            #    라운드 번호별 파일로 남으므로 학습 스텝에 따른 곡선 변화를 넘겨 보며
+            #    비교할 수 있다 (같은 에피소드가 라운드마다 다시 평가된다).
+            n_seed = getattr(self, "_n_seed_ep", 0)
+            fig, ax = plt.subplots(figsize=(9, 4.5))
+            for e in range(n_ep):
+                mean, _ = q_curve(e)
+                if mean is None:
+                    continue
+                ok = bool(self.flat.ep_success[e])
+                seed = e < n_seed
+                ax.plot(np.arange(len(mean)), mean,
+                        color=("tab:green" if ok else "tab:red"),
+                        alpha=(0.25 if seed else 0.45),
+                        lw=(0.7 if seed else 1.0),
+                        ls=(":" if seed else "-"))
+            n_succ = int(sum(self.flat.ep_success))
+            ax.set_xlabel("frame in episode")
+            ax.set_ylabel("Q(s, executed action)  ensemble mean")
+            ax.set_ylim(-0.05, 1.05)
+            ax.set_title(f"{self.args.exp}  ALL {n_ep} eps @ r{round_no:03d} "
+                         f"(updates {self.updates}, success {n_succ}/{n_ep}; "
+                         f"dotted = seed demo)")
+            ax.grid(alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(out / f"step{self.updates:06d}_r{round_no:03d}_q_all.png", dpi=120)
+            plt.close(fig)
+            self.log(f"[플롯] plots/step{self.updates:06d}_r{round_no:03d}_q(.png/_all.png) "
+                     f"— 새 {n_new_ep}개 / 전체 {n_ep}개 (현재 critic)")
         except Exception as exc:                       # 플롯 실패가 라운드를 죽이면 안 된다
             self.log(f"[플롯] 실패 (무시): {type(exc).__name__}: {exc}")
 
