@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dexjoco-hammer-nail-online-rl
-#SBATCH --partition=rlwrld
+#SBATCH --partition=dedicated-rd
 #SBATCH --wckey=project-short-name:rd
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
