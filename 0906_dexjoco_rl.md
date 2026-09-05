@@ -23,46 +23,48 @@ export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
 ## 1. 실행 명령 — 16개 조합 전부
 
 형식: 태스크 4 x 액션공간 2 (eef | fullact) x critic 2 (분포형 | scalarq).
-RUN 은 재시도마다 끝 숫자를 올릴 것 (`_1` → `_2`).
+RUN 은 **생략** — 자동으로 `dexjoco/<task>/<변형>_<월일_시분>` 계층 이름이 붙는다
+(예: `runs/dexjoco/hammer_nail/base_0906_1830/`, 변형 = base|scalarq|fullact|fullact_scalarq).
+RUN 을 명시하면 그 이름이 그대로 쓰인다 (이어받기 전용).
 
 ### hammer_nail
 
 ```bash
 # eef + 분포형(기본)
-sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
 # eef + 스칼라 Q (원본 EXPO-FT parity)
-sbatch --export=ALL,RUN=hammer_eef_sq_1,EXP=dexjoco_hammer_nail_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
 # 전체 액션(손가락 포함) + 분포형
-sbatch --export=ALL,RUN=hammer_full_1,EXP=dexjoco_hammer_nail_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
 # 전체 액션 + 스칼라 Q
-sbatch --export=ALL,RUN=hammer_full_sq_1,EXP=dexjoco_hammer_nail_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
 ### water_plant
 
 ```bash
-sbatch --export=ALL,RUN=water_eef_1,EXP=dexjoco_water_plant_d5r20_online sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=water_eef_sq_1,EXP=dexjoco_water_plant_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=water_full_1,EXP=dexjoco_water_plant_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=water_full_sq_1,EXP=dexjoco_water_plant_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_water_plant_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_water_plant_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_water_plant_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_water_plant_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
 ### click_mouse
 
 ```bash
-sbatch --export=ALL,RUN=click_eef_1,EXP=dexjoco_click_mouse_d5r20_online sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=click_eef_sq_1,EXP=dexjoco_click_mouse_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=click_full_1,EXP=dexjoco_click_mouse_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=click_full_sq_1,EXP=dexjoco_click_mouse_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_click_mouse_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_click_mouse_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_click_mouse_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_click_mouse_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
 ### fold_glasses
 
 ```bash
-sbatch --export=ALL,RUN=fold_eef_1,EXP=dexjoco_fold_glasses_d5r20_online sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=fold_eef_sq_1,EXP=dexjoco_fold_glasses_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=fold_full_1,EXP=dexjoco_fold_glasses_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
-sbatch --export=ALL,RUN=fold_full_sq_1,EXP=dexjoco_fold_glasses_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_fold_glasses_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_fold_glasses_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_fold_glasses_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_fold_glasses_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
 각 yaml 이 자동으로 들고 가는 값:
@@ -82,10 +84,11 @@ round0 10ep → 이후 2ep/라운드 → 총 100ep, 시드 = BC 데모 성공 10
 ## 2. 이어받기 (선점/타임아웃/중단 후)
 
 같은 RUN + 같은 EXP 로 재제출만 하면 된다 (DONE 라운드 건너뜀, 반쯤 구른 롤아웃 --resume,
-wandb step 이어붙기 자동):
+wandb step 이어붙기 자동). RUN 이름은 `ls runs/dexjoco/<task>/` 로 찾는다:
 
 ```bash
-sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=dexjoco/hammer_nail/base_0906_1830,EXP=dexjoco_hammer_nail_d5r20_online \
+       sbatch/dexjoco/online/run.sbatch
 ```
 
 ---
@@ -99,14 +102,14 @@ sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online sbatch
 sed 's/^name: \(.*\)$/name: \1_es005/; s/^  edit_scale: 0.2 .*/  edit_scale: 0.05/' \
   configs/exp/dexjoco_hammer_nail_d5r20_online.yaml \
   > configs/exp/dexjoco_hammer_nail_d5r20_online_es005.yaml
-sbatch --export=ALL,RUN=hammer_eef_es005_1,EXP=dexjoco_hammer_nail_d5r20_online_es005 sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online_es005 sbatch/dexjoco/online/run.sbatch
 ```
 
 ### 학습 OOM 대응 두 가지 (아무 조합에나 덧붙임)
 
 ```bash
 # 1) 서버를 라운드마다 켜고 끄기 — 학습이 GPU 메모리 전체를 쓴다 (라운드당 ~1분 로드)
-sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online,SERVE_MODE=restart sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online,SERVE_MODE=restart sbatch/dexjoco/online/run.sbatch
 
 # 2) 배치 축소 (실효 128 → 64 = 원본 parity): yaml 의 batch_size 를 32 로
 sed -i 's/^  batch_size: 64$/  batch_size: 32/' configs/exp/dexjoco_hammer_nail_d5r20_online.yaml
@@ -118,32 +121,34 @@ sed -i 's/^  batch_size: 64$/  batch_size: 32/' configs/exp/dexjoco_hammer_nail_
 SERVE_MODE=resident|restart    # 기본 resident
 PORT=22000                     # zmq 포트 (서버 i = PORT+i). 기본 jobid 기반 자동
 TASK=hammer_nail               # 기본은 EXP 이름에서 자동 유도 — 보통 만질 일 없음
-SIM_PY=/workspace/junmo_cho/dexjoco/venv/bin/python   # dexjoco venv 경로가 다르면
+SIM_PY=$REPO/third_party/dexjoco/.venv/bin/python     # dexjoco venv 경로가 다르면
 ```
 
 ---
 
-## 4. 모니터링 — 풀 명령 (RUN=hammer_eef_1 예시, 이름만 바꿔 쓰기)
+## 4. 모니터링 — 풀 명령 (R=runs/dexjoco/hammer_nail/base_0906_1830 예시)
 
 ```bash
-squeue -u $USER                                                    # 잡 상태
-tail -f out/dexjoco-online_<jobid>.out                             # learner 로그
-tail -f runs/hammer_eef_1.driver.log                               # 라운드 진행/곡선 갱신
-tail -f runs/hammer_eef_1.server0.log                              # 서버0 ([reload] 확인)
-tail -f runs/hammer_eef_1.server1.log                              # 서버1
-watch -n30 'ls -la runs/hammer_eef_1/train_success_curve.png runs/hammer_eef_1/plots/ | tail'
-cat runs/hammer_eef_1/run_meta.json                                # 무슨 실험이었나
-cat runs/hammer_eef_1/r000/READY | python3 -m json.tool | head -20 # 라운드 에피소드별 성공
-nvidia-smi                                                          # 메모리 공존 확인 (노드에서)
+R=runs/dexjoco/hammer_nail/base_0906_1830        # ls runs/dexjoco/hammer_nail/ 로 확인
+squeue -u $USER                                  # 잡 상태
+tail -f out/dexjoco-online_<jobid>.out           # sbatch stdout (learner 포함)
+tail -f $R/learner.log                           # learner (라운드 학습 [N/M])
+tail -f $R/driver.log                            # driver (롤아웃/READY/theta/곡선)
+tail -f $R/server0.log $R/server1.log            # 서버 ([reload] = θ 핫리로드)
+watch -n30 "ls -la $R/train_success_curve.png $R/plots/ | tail"
+cat $R/run_meta.json                             # 무슨 yaml/코드로 돈 실험인가
+cat $R/r000/READY | python3 -m json.tool | head -20   # 에피소드별 성공/프레임
+nvidia-smi                                       # 메모리 공존 확인 (노드에서)
 ```
 
 에피소드 영상 (플롯 라벨 epN ↔ episode_00000N.mp4):
 
 ```bash
-ls runs/hammer_eef_1/r000/dataset/rollout_r000_a/videos/chunk-000/observation.images.camera_front/
+ls $R/r000/dataset/rollout_r000_a/videos/chunk-000/observation.images.camera_front/
 ```
 
-wandb: https://wandb.ai/junmokane/rd-rl-expo → run 이름 = RUN.
+wandb: https://wandb.ai/junmokane/rd-rl-expo → run 이름 = RUN 의 / 를 _ 로 치환한 것
+(예: dexjoco_hammer_nail_base_0906_1830).
 `rollout/success` 는 그 라운드 **학습 스텝 위에 에피소드 경계마다** 찍힌다 (라운드 학습이
 끝나야 그 라운드 몫이 다 보임). 차트 x축을 `rollout/sim_seconds` 로 바꾸면 시간축 성공률.
 
