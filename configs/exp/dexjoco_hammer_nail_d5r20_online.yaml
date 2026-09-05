@@ -9,9 +9,9 @@
 #      action_index = 9 x 창 25(latency 5 + replan 20) = 225차원.
 #   3. edit_scale 0.2 (EXPO-FT 원본값) — sim 이라 탐색 비용이 로봇 시간이 아니다.
 #      fuji 의 0.002(base 보존) 체제와 정반대: 여기서는 대비(contrast)를 사고 싶다.
-#   4. updates_per_episode 9 — 원본 파리티. 원본은 update_type=step 기준 40 env스텝당
+#   4. updates_per_episode 10 — 원본 파리티. 원본은 update_type=step 기준 40 env스텝당
 #      update 1회를 에피소드(~120스텝)당 3회로 환산해 썼다. hammer_nail 은 에피소드가
-#      최대 360스텝이므로 360/40 = 9회.
+#      최대 400스텝이므로 400/40 = 10회.
 #   5. vla.lora_lr 2.5e-5 + AdamW + grad clip 1.0 — 포크(pd-perry/openpi@expo_ft)의
 #      pi0.5 실측 설정 (0904_fuji_expo_ft_issue.md #3 재보정 참조). fuji r000 사고의
 #      3e-4 는 residual 용 값의 오이식이었다. residual/critic/temp 는 원본대로
@@ -20,7 +20,7 @@
 # 롤아웃 규약 (sim/dexjoco/rollout_dexjoco.py + rl/vla_rldx serve):
 #   서버:   --exp <이 파일> --artifacts <theta_live.pt> --artifacts-watch
 #           --rtc-inference-mode trained --rtc-exec-horizon 20 --sim-wrapper
-#   클라이언트: --task hammer_nail --replan 20 --rtc-delay 5 --max-episode-steps 360
+#   클라이언트: --task hammer_nail --replan 20 --rtc-delay 5 --max-episode-steps 400
 #   오케스트레이션: sim/dexjoco/online_driver.py (라운드 메일박스는 fuji 와 동일 규약,
 #   단 같은 파일시스템이라 kubectl 없이 rename 으로 전달)
 
@@ -99,7 +99,9 @@ round:
   episodes_first_round: 10   # round 0 롤아웃 수 — min_online_episodes 와 같아야 즉시 학습
   episodes_per_round: 2      # 이후 라운드당 롤아웃 수
   total_online_episodes: 100 # 이 수에 닿으면 driver 가 종료
-  max_episode_steps: 360
+  # 성공 길이 실측 max 390 (p99 365) — 400 이면 성공 오라벨이 사실상 0 (360 은 2.3%%였다).
+  # 실패 에피소드가 8초까지 끄는 비용은 감수한다.
+  max_episode_steps: 400
   # sim 제어 주파수. env.step 1회 = control_dt 0.02s (physics 0.002 x 10 substeps) = 50Hz
   # (rollout_dexjoco.py Config.fps 의 근거 주석 참조 — 구 데이터셋의 30 선언은 레코더 관례).
   # driver 가 train_success_curve.png 의 x축(sim 분)을 이걸로 환산한다.
@@ -107,7 +109,7 @@ round:
   # 성공률 곡선의 러닝 윈도 (최근 N 온라인 에피소드; 시드 teleop/BC 는 제외)
   success_window: 20
   # learner 가 읽는 키 (fuji 와 동일 의미):
-  updates_per_episode: 9     # 360스텝 / 40스텝당 1회 (원본 파리티)
+  updates_per_episode: 10    # 400스텝 / 40스텝당 1회 (원본 파리티)
   seed_dataset: rl-dataset/dexjoco/dexjoco_bc
   seed_teleop_episodes: 10
   seed_success_only: true
