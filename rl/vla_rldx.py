@@ -241,7 +241,13 @@ class RLDXVLA(VLA):
         am.beta_dist = Beta(torch.tensor(float(am.config.noise_beta_alpha)),
                             torch.tensor(float(am.config.noise_beta_beta)))
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        self.opt = torch.optim.Adam(trainable, lr=lr)
+        # EXPO-FT 포크(pd-perry/openpi@expo_ft)의 pi0.5 옵티마이저 그대로 —
+        # AdamW(b2 0.95, weight_decay 1e-10) + grad clip 1.0, 고정 lr (warmup/EMA 는
+        # 포크가 껐다). fuji r000 파괴는 residual 용 3e-4 를 순정 Adam 으로 오이식한
+        # 사고였다 (0904_fuji_expo_ft_issue.md #3 재보정). clip 은 train_step 에서 건다.
+        self.opt = torch.optim.AdamW(trainable, lr=lr, betas=(0.9, 0.95),
+                                     eps=1e-8, weight_decay=1e-10)
+        self.clip_norm = 1.0
         self._trainable = trainable          # train_step 에서 rank 평균을 낼 대상
         n_tr = sum(p.numel() for p in trainable)
         n_bb = sum(int(p.requires_grad) for p in self.model.backbone.parameters())
@@ -286,8 +292,9 @@ class RLDXVLA(VLA):
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         ddp.all_reduce_grads(self._trainable)     # 멀티 GPU 일 때만 실제로 통신한다
+        gn = torch.nn.utils.clip_grad_norm_(self._trainable, self.clip_norm)
         self.opt.step()
-        return {"actor_loss": float(loss.detach())}
+        return {"actor_loss": float(loss.detach()), "actor_grad_norm": float(gn)}
 
 
 # --------------------------------------------------------------------------- #
@@ -344,7 +351,8 @@ class ExpoServer:
                  dump_cams: bool = True,
                  ood_ref: float = 0.0, ood_gate: float = 0.0,
                  guide_groups: list[str] | None = None,
-                 parl_keep: int = 0, parl_temp: float = 0.0):
+                 parl_keep: int = 0, parl_temp: float = 0.0,
+                 artifacts_watch: bool = False):
         from rl.data import resolve_modality
         from rl.expo import EXPOLearner, ExpoConfig
         from rl.nets import FuseResidualActor, explore_spec
@@ -372,6 +380,12 @@ class ExpoServer:
         # (EXPOLearner 의 ResNet 인코더 + CriticEnsemble 은 shape 이 다르다 —
         #  실측 856(512+64+280) vs 820(512+28+280). load_state_dict 가 실패한다)
         self.cog = None
+        # --artifacts-watch 용 리로드 컨텍스트 (에피소드 경계에서 theta 를 갈아끼운다)
+        self._device = device
+        self._artifacts = Path(artifacts) if artifacts is not None else None
+        self._artifacts_watch = bool(artifacts_watch)
+        self._artifacts_mtime = None
+        self._lora_injected = False
         if artifacts is not None and Path(artifacts).is_file():
             probe = torch.load(artifacts, map_location="cpu")
             if probe.get("features"):
@@ -422,11 +436,14 @@ class ExpoServer:
                       f"n_edit_samples {self.cfg.n_edit_samples})")
             if probe.get("lora"):
                 self.vla.setup_training(lora=True)
+                self._lora_injected = True
                 r = self.vla.model.load_state_dict(probe["lora"], strict=False)
                 if r.unexpected_keys:
                     raise SystemExit(f"--artifacts 의 lora 키가 모델에 없다: "
                                      f"{r.unexpected_keys[:3]}")
                 self.loaded.append(f"lora({len(probe['lora'])}텐서)")
+            if self._artifacts is not None and self._artifacts.is_file():
+                self._artifacts_mtime = self._artifacts.stat().st_mtime_ns
         else:
             self.loaded = self._load(artifacts)
 
@@ -915,6 +932,49 @@ class ExpoServer:
                   flush=True)
         return pred, reset_memory
 
+    def _reload_artifacts(self) -> None:
+        """--artifacts 파일이 바뀌었으면 다시 읽는다 (--artifacts-watch, 에피소드 경계 전용).
+
+        온라인 루프에서 learner 가 라운드마다 theta_live.pt 를 원자적으로 교체하면
+        (tmp 에 쓰고 os.replace) 서버 재시작 없이 다음 에피소드부터 새 θ 로 돈다.
+        구조(창/차원/하이퍼)는 라운드 사이 불변이므로 값만 갈아끼운다. cog critic 은
+        feat_mu/feat_sd 도 값째 바뀔 수 있어 load_serving_critic 으로 통째로 다시 세운다
+        (MLP 라 1초 미만). 에피소드 도중에는 절대 부르지 말 것 — 정책이 중간에 바뀐다.
+        """
+        p = self._artifacts
+        if p is None:
+            return
+        try:
+            mt = p.stat().st_mtime_ns
+        except FileNotFoundError:
+            return
+        if mt == self._artifacts_mtime:
+            return
+        from rl.critic_io import load_serving_critic
+        probe = torch.load(p, map_location="cpu")
+        if not probe.get("features"):
+            print(f"  [reload] {p.name}: cog 형식이 아니라 건너뛴다", flush=True)
+            self._artifacts_mtime = mt
+            return
+        m = self.vla.model
+        n_cog = int(getattr(m, "_n_cog_tokens", getattr(m.backbone, "n_cog_tokens", 64)))
+        self.cog = load_serving_critic(p, self.cfg, self.mod.state_dim, self.mod.action_dim,
+                                       self.latency, self.replan, n_cog, dev=self._device)
+        loaded = ["cog-critic"]
+        if "residual" in probe and self.cog_residual is not None:
+            self.cog_residual.load_state_dict(probe["residual"])
+            loaded.append("residual")
+        if probe.get("lora"):
+            if not self._lora_injected:
+                self.vla.setup_training(lora=True)   # 첫 등장 시 어댑터 주입 (옵티마이저는 안 쓴다)
+                self._lora_injected = True
+            r = self.vla.model.load_state_dict(probe["lora"], strict=False)
+            if r.unexpected_keys:
+                raise SystemExit(f"reload: lora 키가 모델에 없다: {r.unexpected_keys[:3]}")
+            loaded.append(f"lora({len(probe['lora'])}텐서)")
+        self._artifacts_mtime = mt
+        print(f"  [reload] {p.name} → {' + '.join(loaded)}", flush=True)
+
     def run(self, host: str, port: int, sim_wrapper: bool = False) -> None:
         from rldx.policy.server_client import PolicyServer
 
@@ -945,6 +1005,21 @@ class ExpoServer:
 
             policy.reset = _reset_counting
             print("  [dump] counting episode boundaries via reset")
+
+        if self._artifacts_watch and self._artifacts is not None:
+            # 에피소드 경계(reset)에서만 리로드한다 — 도중 교체는 정책이 반쯤 섞인다.
+            # dump 훅과 같은 이유로 **래핑 뒤** policy.reset 에 건다.
+            _orig_reset_w = policy.reset
+
+            def _reset_reloading(*args, **kw):
+                try:
+                    self._reload_artifacts()
+                except Exception as exc:            # 리로드 실패 = 이전 θ 로 계속 (루프는 산다)
+                    print(f"  [reload] 실패 — 이전 theta 로 계속: {exc}", flush=True)
+                return _orig_reset_w(*args, **kw)
+
+            policy.reset = _reset_reloading
+            print(f"  [reload] watching {self._artifacts} (에피소드 경계마다 mtime 확인)")
 
         print(f"\n  listening on tcp://{host}:{port}   (rrc zmq_client connects here)",
               flush=True)
@@ -1268,7 +1343,7 @@ def _serve(argv: list[str]) -> int:
                         "  steps 1 / 2 / 4 / 10 / 20 의 ΔQ 가 소수점 5자리까지 **완전히 동일**하다\n"
                         "  (move 0.02 → 0.00075,  move 0.05 → 0.00185). 즉 Q 가 이 범위에서\n"
                         "  사실상 선형이라 그래디언트 방향이 이동 중에 안 변한다. 스텝을 늘려도\n"
-                        "  계산만 낭비다. keep-best 도 100% 프레임에서 최종 반복이 채택되어 무의미하다.\n"
+                        "  계산만 낭비다. keep-best 도 100%% 프레임에서 최종 반복이 채택되어 무의미하다.\n"
                         "  **guidance 의 유일한 실질 노브는 --guide-move 다.**\n"
                         "Q-VGM 실측(LIBERO): 선택만 86.0 / guidance 88.7 (SFT 79.0). "
                         "cog feature critic 에서만 동작한다")
@@ -1323,7 +1398,7 @@ def _serve(argv: list[str]) -> int:
     p.add_argument("--n-cand", type=int, default=0,
                    help="관측당 base 후보 수. 0 이면 exp yaml 의 expo.N. 후보를 늘리면 "
                         "고를 폭이 넓어지지만, dexjoco 실측에서는 후보 32개의 Q 범위가 "
-                        "성공/실패 격차의 0.31% 에 불과했다 — 후보 수보다 critic 의 "
+                        "성공/실패 격차의 0.31%% 에 불과했다 — 후보 수보다 critic 의 "
                         "액션 민감도가 병목이다")
     p.add_argument("--parl-keep", type=int, default=0,
                    help="PA-RL 의 num_actions_to_keep. >0 이면 후보 N 개를 Q 로 정렬해 상위 M "
@@ -1331,7 +1406,7 @@ def _serve(argv: list[str]) -> int:
                         "(action_optimization.py:368-470). 0 이면 기존 동작 "
                         "(argmax 하나만 상승, 또는 --guide-all 이면 전부 상승). "
                         "필터를 두는 이유: 전부 상승시키면 critic 이 가장 크게 과대평가한 "
-                        "후보가 뽑히기 쉽다 — 실측 72% (guide-all) vs 84% (argmax 후 상승)")
+                        "후보가 뽑히기 쉽다 — 실측 72%% (guide-all) vs 84%% (argmax 후 상승)")
     p.add_argument("--parl-temp", type=float, default=0.0,
                    help="PA-RL 의 최종 Categorical(logits=Q) 샘플링 온도. 0 이면 argmax.\n"
                         "**원본은 온도가 없다 — Q 를 그대로 logits 로 쓴다. 우리는 못 그런다:**\n"
@@ -1347,6 +1422,10 @@ def _serve(argv: list[str]) -> int:
                         "쓰므로 이 값에 영향받지 않는다 — 오직 ∇_A Q 상승의 통로만 넓힌다. "
                         "dexjoco 기본값 [eef_position] 은 625차원 중 60개뿐이라, Q 의 액션 "
                         "민감도가 회전·손가락에 있으면 밀지 못한다")
+    p.add_argument("--artifacts-watch", action="store_true",
+                   help="--artifacts 파일의 mtime 이 바뀌면 에피소드 경계(reset)에서 다시 "
+                        "읽는다. 온라인 루프에서 learner 가 theta_live.pt 를 원자 교체하는 "
+                        "용도 (sim/dexjoco/online_driver.py)")
     p.add_argument("--sim-wrapper", action="store_true",
                    help="RLDXSimPolicyWrapper 를 씌운다. sim 롤아웃 클라이언트처럼 flat 키 "
                         "(video.<cam> / state.<name>) 를 보내는 쪽과 붙을 때 필요하다 — "
@@ -1375,7 +1454,8 @@ def _serve(argv: list[str]) -> int:
                      parl_keep=a.parl_keep, parl_temp=a.parl_temp,
                      guide_groups=(None if not a.guide_groups else
                                    ([] if a.guide_groups == "all" else
-                                    [g.strip() for g in a.guide_groups.split(",") if g.strip()])))
+                                    [g.strip() for g in a.guide_groups.split(",") if g.strip()])),
+                     artifacts_watch=a.artifacts_watch)
     srv.run(a.host, a.port, sim_wrapper=a.sim_wrapper)
     return 0
 

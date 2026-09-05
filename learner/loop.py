@@ -34,7 +34,9 @@ from pathlib import Path
 
 ROUND_RE = re.compile(r"^r(\d{3,})$")
 REQUIRED_DIRS = ("data", "meta", "videos")
-# convert_data.py 기본 -s 320x192 의 (H, W). 다른 해상도로 파이프라인을 바꾸면 여기도 같이.
+# convert_data.py 기본 -s 320x192 의 (H, W). fuji 기본값 — 다른 파이프라인(예: dexjoco
+# sim 256x256)은 --expected-hw 로 덮는다 (main 이 이 전역을 바꾼다). actor/send_round.py 는
+# import 시점의 기본값을 그대로 쓴다.
 EXPECTED_HW = (192, 320)
 
 _stop = False
@@ -820,6 +822,14 @@ class Trainer:
                      f"세지 않는다")
             n_updates = 0
 
+        # 이번 라운드 **새 에피소드들**의 성공 여부 (ingest 순서 = flat 의 꼬리) —
+        # 온라인 학습 성공률 곡선용. 학습 스텝 사이사이 에피소드 경계에 맞춰 로깅해서
+        # (에피소드 j → j+1 번째 updates_per_episode 경계) wandb 스무딩으로 곡선을 그린다.
+        upe = int(rc.get("updates_per_episode", 1))
+        n_new_ep = int(stats["episodes"])
+        ep_succ = ([int(x) for x in self.flat.ep_success[-n_new_ep:]]
+                   if n_new_ep and self.flat is not None else [])
+
         t0 = time.time()
         last: dict = {}
         for i in range(n_updates):
@@ -828,9 +838,15 @@ class Trainer:
                                               if c.actor_success_only else None))
             self.updates += 1
             if self.wb is not None:
-                self.wb.log({f"train/{k}": v for k, v in last.items()
-                             if isinstance(v, (int, float))},
-                            step=self.updates)
+                row = {f"train/{k}": v for k, v in last.items()
+                       if isinstance(v, (int, float))}
+                if upe > 0 and (i + 1) % upe == 0:
+                    j = (i + 1) // upe - 1                 # 이번 라운드의 j 번째 에피소드
+                    if j < len(ep_succ):
+                        row["rollout/success"] = ep_succ[j]
+                        row["rollout/online_episode"] = \
+                            buf["online_episodes"] - len(ep_succ) + j + 1
+                self.wb.log(row, step=self.updates)
             if i == 0 or (i + 1) % 5 == 0 or i == n_updates - 1:
                 self.log(f"  [{i+1}/{n_updates}] critic_loss={last.get('critic_loss', 0):.4f} "
                          f"q={last.get('q', 0):+.3f} q_max={last.get('q_max', 0):+.3f} "
@@ -1043,11 +1059,19 @@ def main() -> int:
     p.add_argument("--exp-config", default="",
                    help="configs/exp/<이름>.yaml. 주면 시작할 때 θ₀ 를 init/ 로 내보낸다")
     p.add_argument("--seed", type=int, default=0, help="θ₀ 초기화 seed (manifest 에 기록된다)")
+    p.add_argument("--expected-hw", default="",
+                   help="세션 검증에 쓸 비디오 해상도 WxH (예 256x256). 비우면 fuji 기본 "
+                        "320x192")
     p.add_argument("--wandb-project", default="rd-rl-expo")
     p.add_argument("--no-wandb", action="store_true", help="WANDB_API_KEY 가 있어도 붙지 않는다")
     p.add_argument("--stub-seconds", type=float, default=5.0, help="stub 학습 소요 시간")
     p.add_argument("--stub-payload-mb", type=float, default=1.0)
     args = p.parse_args()
+
+    if args.expected_hw:
+        global EXPECTED_HW
+        w, h = (int(v) for v in args.expected_hw.lower().split("x"))
+        EXPECTED_HW = (h, w)
 
     # torchrun 으로 띄우면 rank 마다 GPU 하나씩. 단일 프로세스로 띄우면 world=1 이라
     # 아래 분기들이 전부 통과 상태가 된다 (같은 코드가 양쪽에서 돈다).
