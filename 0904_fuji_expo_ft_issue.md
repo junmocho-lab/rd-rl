@@ -42,8 +42,16 @@ round 2  r001+edit      37.5% (8ep)  — 로봇 손 이슈가 세션에 겹쳤�
   그런데 actor_loss 는 0.006 으로 바닥.
 - **원인(기전)**: 학습 데이터가 자기 성공 롤아웃이라 **배울 신호가 없음** →
   gradient ≈ 노이즈 → **Adam 은 gradient 크기와 무관하게 스텝을 lr 로 정규화** →
-  zero-init LoRA 가 노이즈 방향으로 lr×스텝수만큼 순수 표류. EXPO-FT 원본의 3e-4 는
-  대규모 연속학습 기준이라 소규모 라운드 체제에 과함.
+  zero-init LoRA 가 노이즈 방향으로 lr×스텝수만큼 순수 표류
+  (60스텝 × 3e-4 × √(LoRA 2M 파라미터) ≈ 25 = 실측 ‖ΔW‖ 24.8).
+- **lr 3e-4 의 출처가 오독이었다 (2026-09-04 코드 재확인)**: 원본
+  `expo_ft_pi_config.py:20` 의 `actor_lr = 3e-4` 는 **residual(edit) actor 전용**이다
+  (`expo_ft.py:335` 의 residual tx 에만 들어간다). 원본의 VLA(pi0.5) LoRA 는
+  ① SFT 를 LoRA 로 따로 하고 그 체크포인트를 이어받아 (zero-init 이 아님)
+  ② openpi TrainConfig 의 옵티마이저/스케줄 (warmup+cosine, peak ~2.5e-5 급) 로
+  온라인 BC 를 계속한다 (`pi05.py:78`, `_update_jit` 가 매 스텝 update_actor 호출 —
+  "RL 중 완전 동결"도 아니다). 즉 우리 사고는 **residual 용 lr 을 VLA 에 이식**해
+  원본 대비 ~12배 속도 + warmup 없음 + zero-init 3중 가속이 겹친 것.
 - **조치**: `vla.lora_lr: 0.0` (actor 동결). r000/theta.pt 에서 lora 키 제거
   (원본은 theta_with_lora.bak.pt). actor 재활성은 **자동/예정이 아니라 별도 결정 사항**
   (아예 안 켜고 test-time 개선만으로 가는 선택지 포함 — VLA 거동 리스크 원천 차단
