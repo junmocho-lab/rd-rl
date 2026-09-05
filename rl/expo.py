@@ -21,6 +21,7 @@ update() 한 번에 벌어지는 일 (원본 _update_jit 과 같은 순서):
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import math
 from dataclasses import dataclass, field
@@ -47,8 +48,12 @@ class VLA:
     action_dim: int          # 환경 액션 차원 (openarm 28, rby1m_rh56f1 34)
     action_horizon: int      # 모델이 한 번에 내는 청크 길이 (16 / 40)
 
-    def sample(self, obs, num_samples: int) -> torch.Tensor:
-        """(B, num_samples, action_horizon, action_dim). 백본은 1회만 돌아야 한다."""
+    def sample(self, obs, num_samples: int, collated=None) -> torch.Tensor:
+        """(B, num_samples, action_horizon, action_dim). 백본은 1회만 돌아야 한다.
+
+        collated: 미리 만들어 둔 전처리 결과(있으면 재사용). CPU 전용 구간이라
+        update() 가 GPU 연산과 겹쳐서 앞당겨 만든다. 무시해도 정답은 같다.
+        """
         raise NotImplementedError
 
     def train_step(self, obs, target_actions: torch.Tensor) -> dict:
@@ -70,8 +75,8 @@ class DummyVLA(VLA):
         self.opt = torch.optim.Adam([self.bias], lr=1e-3)
         self.calls = {"sample": 0, "train_step": 0}
 
-    def sample(self, obs, num_samples: int) -> torch.Tensor:
-        self.calls["sample"] += 1
+    def sample(self, obs, num_samples: int, collated=None) -> torch.Tensor:
+        self.calls["sample"] += 1                     # collated 는 무시 — 관측을 안 본다
         b = obs["batch_size"]
         x = torch.rand((b, num_samples, self.action_horizon, self.action_dim),
                        generator=self.gen) * 2 - 1
@@ -379,24 +384,29 @@ class EXPOLearner:
 
     def candidate_actions(self, vla_obs, latent: torch.Tensor, state: torch.Tensor,
                           prefix: torch.Tensor | None = None,
+                          collated: dict | None = None,
                           ) -> tuple[torch.Tensor, dict]:
         """관측에서 후보 N + n_edit 개를 만들고 target critic 으로 argmax.
 
         원본과 달리 base N 개를 잘라내지 않고 그대로 유지한 뒤 edit 을 덧붙인다
         (원본 롤아웃 경로는 N == n_edit_samples 를 가정하는 버그가 있다).
         """
+        kw = {} if collated is None else {"collated": collated}
         with torch.no_grad():
-            chunks = self.vla.sample(vla_obs, num_samples=self.cfg.N)        # (B,N,H,A)
+            chunks = self.vla.sample(vla_obs, num_samples=self.cfg.N, **kw)  # (B,N,H,A)
         chosen, _, info = self.select_from_chunks(chunks, latent, state, prefix)
         return chosen, info
 
     # --- critic (원본 update_critic) ----------------------------------------
-    def update_critic(self, b: dict) -> dict:
+    def update_critic(self, b: dict, collated: dict | None = None) -> dict:
         c = self.cfg
         next_lat = self.encode(b["next_obs"], stop_gradient=True)
         next_pre = b.get("next_action_prefix")
+        # collated 가 없으면 인자 자체를 넘기지 않는다 — candidate_actions 를 갈아끼운
+        # 코드(테스트의 스텁 등)가 이 인자를 몰라도 예전 그대로 동작한다.
+        kw = {} if collated is None else {"collated": collated}
         next_action, sel = self.candidate_actions(b["vla_next_obs"], next_lat, b["next_state"],
-                                                 next_pre)
+                                                 next_pre, **kw)
 
         with torch.no_grad():
             members = self._members()
@@ -482,11 +492,42 @@ class EXPOLearner:
             raise ValueError(f"배치 {total} 가 utd_ratio {c.utd_ratio} 의 배수가 아니다")
         n = total // c.utd_ratio
 
+        # ── critic utd 루프 (+ 이미지 전처리 프리페치) ──────────────────────────
+        # 각 서브업데이트는 CPU(_collate: numpy->PIL->Qwen2VL 전처리->정규화)와
+        # GPU(백본 forward + 손실/역전파)를 **번갈아** 쓴다. 실측(py-spy, 잡 1497,
+        # 7,996 샘플)에서 _collate 가 41.3%, forward 가 51.4% 였고 GPU util 이
+        # 2초 100% / 1초 0% 로 진동했다 (평균 57%, 0% 가 30%).
+        #
+        # 그래서 서브업데이트 i 의 GPU 연산이 도는 동안 워커 스레드가 i+1 의 collate 를
+        # 미리 만든다. RLDX-1 학습 경로가 쓰는 것과 같은 패턴이다
+        # (rldx/experiment/trainer.py:85 _PrefetchIterator — 거기서는 DataLoader
+        # worker 8개 + 큐 깊이 4 로 같은 일을 한다. 우리 온라인 루프에는 그게 없어서
+        # per-sample 전처리가 그대로 노출됐다).
+        #
+        # 안전성: _prepare_inputs / processor.__call__ 에 self 쓰기가 없어 재진입 가능하고,
+        # 워커가 1개라 collate 끼리는 겹치지 않는다 (겹치는 것은 forward 와만).
+        # 실패해도 결과는 같다 — collated=None 이면 update_critic 이 스스로 만든다.
+        # _collate 가 없는 VLA(DummyVLA 등)면 프리페치할 것이 없다 — VLA 프로토콜(:42)에
+        # 없는 메서드이므로 선택적으로 쓴다.
         info: dict = {}
-        for i in range(c.utd_ratio):
-            sl = slice(i * n, (i + 1) * n)
-            info = self.update_critic(_slice(batch, sl))          # 원본은 마지막 것만 로그
-        last = _slice(batch, slice(total - n, total))
+        subs = [_slice(batch, slice(i * n, (i + 1) * n)) for i in range(c.utd_ratio)]
+        collate = getattr(self.vla, "_collate", None)
+        if collate is None:
+            for sub in subs:
+                info = self.update_critic(sub)            # 원본은 마지막 것만 로그
+        else:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="collate") as ex:
+                fut = ex.submit(collate, subs[0]["vla_next_obs"])
+                for i, sub in enumerate(subs):
+                    try:
+                        col = fut.result()
+                    except Exception as e:                # noqa: BLE001
+                        print(f"[expo] collate 프리페치 실패 — 동기 경로로 계속한다: {e}")
+                        col = None
+                    if i + 1 < len(subs):                 # 다음 것을 GPU 연산과 겹친다
+                        fut = ex.submit(collate, subs[i + 1]["vla_next_obs"])
+                    info = self.update_critic(sub, collated=col)
+        last = subs[-1]
 
         info.update(self.update_actor(actor_batch if (c.actor_success_only and actor_batch)
                                      else last))

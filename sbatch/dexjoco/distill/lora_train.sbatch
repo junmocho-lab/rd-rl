@@ -108,7 +108,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_O
 export NO_ALBUMENTATIONS_UPDATE=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
 # 단편화로 인한 OOM 을 줄인다 (OOM 메시지가 직접 권하는 설정).
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-[ -f "$HOME/.rldx_secrets.sh" ] && source "$HOME/.rldx_secrets.sh"
+source "$REPO/scripts/load_secrets.sh"
 
 # wandb 는 있으면 쓰고 없으면 조용히 끈다. 30K 스텝짜리 학습이 로깅 키 하나 없다고
 # 죽으면 안 된다 — 밤새 도는 체인에서는 특히.

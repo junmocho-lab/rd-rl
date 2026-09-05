@@ -46,15 +46,20 @@ PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
 # resident(기본): 서버 상주 (리로드 0회, θ 핫리로드 — 메모리 공존).
 # 학습 OOM 이 나면 SERVE_MODE=restart (라운드마다 서버 on/off, 학습이 GPU 전체를 쓴다).
 SERVE_MODE=${SERVE_MODE:-resident}
-SIM_PY=${SIM_PY:-/workspace/junmo_cho/dexjoco/venv/bin/python}
+# ★ dexjoco sim venv. /workspace/... 는 **다른 클러스터** 경로다 — fsx 에는 없어서
+#   그대로 두면 "dexjoco venv python 이 없다" 로 즉시 exit 3 이다.
+#   이 머신에서는 서브모듈 체크아웃 안에 있다 (mujoco 3.4.0 / py3.11 확인함).
+SIM_PY=${SIM_PY:-$REPO/third_party/dexjoco/.venv/bin/python}
 PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
 [ -x "$PY" ] || { echo "RLDX venv python 이 없다: $PY"; exit 3; }
 [ -x "$SIM_PY" ] || { echo "dexjoco venv python 이 없다: $SIM_PY"; exit 3; }
 
-export HF_HOME=${HF_HOME:-/workspace/junmo_cho/hf_cache}
+export HF_HOME=${HF_HOME:-/fsx/rlwrld/junmo_cho/hf_cache}   # /workspace 는 다른 클러스터
 export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
+# HF_TOKEN / WANDB_API_KEY. 없으면 wandb 로깅만 꺼지고 학습은 계속된다.
+source "$REPO/scripts/load_secrets.sh"
 
 echo "=== $(date -Is)  dexjoco online RL  run=$RUN exp=$EXP task=$TASK port=$PORT mode=$SERVE_MODE"
 echo "    learner 2-rank(torchrun, GPU 0+1) / server x2(GPU 0,1) / rollout x2(CPU+EGL)"

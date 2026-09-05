@@ -281,7 +281,8 @@ def main() -> int:
     p.add_argument("--port", type=int, default=21500,
                    help="서버 i 는 port+i 를 쓴다")
     p.add_argument("--sim-py", type=Path,
-                   default=Path("/workspace/junmo_cho/dexjoco/venv/bin/python"))
+                   default=Path(__file__).resolve().parents[2]
+                   / "third_party/dexjoco/.venv/bin/python")
     p.add_argument("--task", default="hammer_nail")
     p.add_argument("--server-gpus", default="0,1",
                    help="정책 서버를 띄울 GPU 목록 (쉼표 구분). 서버 수 = 병렬 롤아웃 수. "

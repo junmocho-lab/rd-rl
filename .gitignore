@@ -13,3 +13,6 @@ __pycache__/
 
 # 라운드 메일박스 (프레임워크가 만들고 관리하는 상태)
 runs/
+
+# 토큰 (scripts/load_secrets.sh 가 읽는다). 예시 파일 .secrets.sh.example 만 추적한다.
+.secrets.sh

@@ -204,9 +204,14 @@ class RLDXVLA(VLA):
         finally:
             self.model.action_model.get_action_with_features = self._orig_gawf
 
-    def sample(self, obs: dict, num_samples: int) -> torch.Tensor:
-        """(B, num_samples, action_horizon, action_dim) 모델 공간 액션. 백본은 1회만 돈다."""
-        collated = self._collate(obs)
+    def sample(self, obs: dict, num_samples: int, collated: dict | None = None) -> torch.Tensor:
+        """(B, num_samples, action_horizon, action_dim) 모델 공간 액션. 백본은 1회만 돈다.
+
+        collated 를 주면 _collate 를 건너뛴다. 그것이 CPU 전용 구간이라(이미지 전처리)
+        호출측이 **직전 GPU 연산과 겹쳐서** 미리 만들어 둘 수 있다 — rl/expo.py 의
+        update() 가 그렇게 쓴다. 기본값 None 이면 예전과 완전히 같다 (롤아웃/서빙 경로).
+        """
+        collated = self._collate(obs) if collated is None else collated
         b = len(next(iter(obs["video"].values())))
         with self.expanded(num_samples):
             out = self.runtime._forward(collated)

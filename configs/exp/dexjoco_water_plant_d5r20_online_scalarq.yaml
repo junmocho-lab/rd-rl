@@ -25,7 +25,7 @@
 #   단 같은 파일시스템이라 kubectl 없이 rename 으로 전달)
 
 name: dexjoco_water_plant_d5r20_online_scalarq
-dataset: rl-dataset/dexjoco/dexjoco_bc/water_plant_rand_obj          # (참고용 — 온라인 버퍼는 round 로 쌓인다)
+dataset: rl-dataset/dexjoco/dexjoco_bc/dexjoco_bc_dataset/water_plant_rand_obj          # (참고용 — 온라인 버퍼는 round 로 쌓인다)
 robot: panda_allegro
 
 rldx_data_config: rldx/configs/data/dexjoco_panda_allegro_config.py
@@ -111,7 +111,7 @@ round:
   # learner 가 읽는 키 (fuji 와 동일 의미):
   updates_per_episode: 10    # 400스텝 / 40스텝당 1회 (원본 파리티)
   # dexjoco_bc 루트가 아니라 **태스크 하위 디렉토리** — 루트를 주면 6개 태스크가 전부 시드로 들어간다
-  seed_dataset: rl-dataset/dexjoco/dexjoco_bc/water_plant_rand_obj
+  seed_dataset: rl-dataset/dexjoco/dexjoco_bc/dexjoco_bc_dataset/water_plant_rand_obj
   seed_teleop_episodes: 10
   seed_success_only: true
   min_online_episodes: 10
