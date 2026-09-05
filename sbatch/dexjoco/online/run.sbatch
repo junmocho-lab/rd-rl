@@ -44,7 +44,9 @@ TASK=${TASK:-$(echo "$EXP" | sed 's/^dexjoco_//; s/_d5r20.*//')}
 #     sbatch --export=ALL,RUN=dexjoco/hammer_nail/base_0906_1830,EXP=... run.sbatch
 VAR=${EXP#dexjoco_${TASK}_d5r20_online}; VAR=${VAR#_}; VAR=${VAR:-base}
 RUN=${RUN:-dexjoco/${TASK}/${VAR}_$(date +%m%d_%H%M)}
-PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
+# 잡마다 포트 대역을 벌린다 (x10) — 연속 jobid 가 같은 노드에 오르면 서버 포트
+# (PORT, PORT+1)가 겹쳐 zmq bind 에서 죽는다. driver 가 빈 포트를 재스캔하는 것과 이중 방어.
+PORT=${PORT:-$((21000 + (${SLURM_JOB_ID:-$$} * 10) % 9000))}
 # resident(기본): 서버 상주 (리로드 0회, θ 핫리로드 — 메모리 공존).
 # 학습 OOM 이 나면 SERVE_MODE=restart (라운드마다 서버 on/off, 학습이 GPU 전체를 쓴다).
 SERVE_MODE=${SERVE_MODE:-resident}

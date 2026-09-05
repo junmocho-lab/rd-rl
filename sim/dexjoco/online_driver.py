@@ -177,10 +177,37 @@ def stop_servers(log: Log) -> None:
     _servers = []
 
 
+def free_port_base(base: int, count: int) -> int:
+    """base 부터 count 개 연속 포트가 전부 비어 있는 시작점을 찾는다.
+
+    같은 노드에 잡이 여러 개 오르면 jobid 기반 기본값이 겹칠 수 있다 — bind 프로브로
+    피한다 (프로브와 실제 bind 사이의 레이스는 남지만 실용적으로 충분하다).
+    """
+    import socket
+    p = base
+    for _ in range(300):
+        ok = True
+        for i in range(count):
+            with socket.socket() as s:
+                try:
+                    s.bind(("127.0.0.1", p + i))
+                except OSError:
+                    ok = False
+                    break
+        if ok:
+            return p
+        p += max(count, 2)
+    raise SystemExit(f"[오류] {base} 부터 빈 포트 {count}개 연속 구간을 못 찾았다")
+
+
 def start_servers(args, exp_name: str, live: Path, log: Log) -> None:
     py = REPO / "third_party/RLDX-1/.venv/bin/python"
     if not py.is_file():
         py = Path(sys.executable)
+    base = free_port_base(args.port, len(args.gpus))
+    if base != args.port:
+        log(f"[서버] 포트 {args.port}~ 가 사용 중 — {base}~ 로 이동 (다른 잡과 공존)")
+        args.port = base                     # 롤아웃 클라이언트도 같은 값을 쓴다
     for i, gpu in enumerate(args.gpus):
         port = args.port + i
         cmd = [str(py), "-u", "-m", "rl.vla_rldx", "serve",
@@ -206,10 +233,15 @@ def split_episodes(k: int, n: int) -> list[int]:
 
 
 def run_rollouts(args, sessions: list[tuple[Path, int, int, int]], log: Log) -> None:
-    """(세션 경로, 에피소드 수, seed, 포트) 목록을 병렬로 돌린다."""
+    """(세션 경로, 에피소드 수, seed, 서버 인덱스) 목록을 병렬로 돌린다.
+
+    포트는 여기서 args.port + 인덱스로 계산한다 — start_servers 가 포트 충돌을 피해
+    args.port 를 옮겼을 수 있어서, 배정 시점이 아니라 실행 시점 값을 써야 한다.
+    """
     procs = []
     t0 = time.time()
-    for out_dir, k, seed, port in sessions:
+    for out_dir, k, seed, si in sessions:
+        port = args.port + si
         cmd = [str(args.sim_py), "-u", str(REPO / "sim/dexjoco/rollout_dexjoco.py"),
                "--task", args.task, "--episodes", str(k),
                "--port", str(port), "--replan", str(args.replan),
@@ -400,7 +432,7 @@ def main() -> int:
             src = runs_exp / "rollouts" / name
             sess_paths.append(src)
             if not (mb_ds / name).is_dir():
-                todo.append((src, ki, args.seed_base + start, args.port + i))
+                todo.append((src, ki, args.seed_base + start, i))
             start += ki
         if todo:
             if args.serve_mode == "restart" and not _servers:
