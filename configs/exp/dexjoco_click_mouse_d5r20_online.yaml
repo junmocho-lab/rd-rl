@@ -4,7 +4,7 @@
 # 온라인 RL 이 실제로 도는지 검증한다 (DEXJOCO-SIM.md 의 오프라인 루프에 이은 온라인 편).
 #
 # fuji_online 과의 차이:
-#   1. base_policy 가 hammer_nail_rand_obj 100ep BC (dexjoco_hammer_nail_d5r20 과 동일).
+#   1. base_policy 가 click_mouse_rand_obj 100ep BC (dexjoco_hammer_nail_d5r20 과 동일).
 #   2. explore_groups = eef (position+rotation, 9관절) — critic/edit 이 팔 궤적만 본다.
 #      action_index = 9 x 창 25(latency 5 + replan 20) = 225차원.
 #   3. edit_scale 0.2 (EXPO-FT 원본값) — sim 이라 탐색 비용이 로봇 시간이 아니다.
@@ -20,19 +20,21 @@
 # 롤아웃 규약 (sim/dexjoco/rollout_dexjoco.py + rl/vla_rldx serve):
 #   서버:   --exp <이 파일> --artifacts <theta_live.pt> --artifacts-watch
 #           --rtc-inference-mode trained --rtc-exec-horizon 20 --sim-wrapper
-#   클라이언트: --task hammer_nail --replan 20 --rtc-delay 5 --max-episode-steps 400
+#   클라이언트: --task click_mouse --replan 20 --rtc-delay 5 --max-episode-steps 400
 #   오케스트레이션: sim/dexjoco/online_driver.py (라운드 메일박스는 fuji 와 동일 규약,
 #   단 같은 파일시스템이라 kubectl 없이 rename 으로 전달)
 
-name: dexjoco_hammer_nail_d5r20_online
-dataset: rl-dataset/dexjoco/dexjoco_bc/hammer_nail_rand_obj          # (참고용 — 온라인 버퍼는 round 로 쌓인다)
+name: dexjoco_click_mouse_d5r20_online
+dataset: rl-dataset/dexjoco/dexjoco_bc/click_mouse_rand_obj          # (참고용 — 온라인 버퍼는 round 로 쌓인다)
 robot: panda_allegro
 
 rldx_data_config: rldx/configs/data/dexjoco_panda_allegro_config.py
 modality: modality/dexjoco_panda_allegro/modality.json
 
 # <checkpoints>/ 아래 상대경로 (dexjoco_hammer_nail_d5r20.yaml 과 동일 모델).
-base_policy: dexjoco/dexjoco_hammer_nail_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs16_30k_1gpu_mlxp
+# ★ TODO: 실제 BC 체크포인트 디렉토리명으로 바꿀 것 (아래는 hammer_nail 패턴 추정 —
+#   checkpoints/dexjoco/ 에서 ls 로 확인. action_horizon 32 / rtc_training 8 전제)
+base_policy: dexjoco/dexjoco_click_mouse_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs16_30k_1gpu_mlxp
 
 action_horizon: 32
 replan_steps: 20
@@ -62,8 +64,7 @@ expo:
   num_qs: 10
   num_min_qs: 2
   critic_layer_norm: true
-  # 프레임당 할인 — dexjoco_hammer_nail_d5r20.yaml 의 근거 그대로 (에피소드 평균 289 /
-  # 최대 360 프레임, 시작 지점 V = 0.995^289 = 0.24 → Q 동적 범위가 산다).
+  # 프레임당 할인 — 0.995^324(평균) = 0.20 — 하한권이지만 동적 범위 유지
   discount: 0.995
   tau: 0.005
   actor_lr: 3.0e-4           # residual(edit) actor — 원본 parity (순정 Adam, clip 없음)
@@ -99,9 +100,8 @@ round:
   episodes_first_round: 10   # round 0 롤아웃 수 — min_online_episodes 와 같아야 즉시 학습
   episodes_per_round: 2      # 이후 라운드당 롤아웃 수
   total_online_episodes: 100 # 이 수에 닿으면 driver 가 종료
-  # 성공 길이 실측 max 390 (p99 365) — 400 이면 성공 오라벨이 사실상 0 (360 은 2.3%%였다).
-  # 실패 에피소드가 8초까지 끄는 비용은 감수한다.
-  max_episode_steps: 400
+  # BC 데모(teleop) 길이 실측: 평균 324 / p99 540 / max 771 — p99 위로 잡는다.
+  max_episode_steps: 600
   # sim 제어 주파수. env.step 1회 = control_dt 0.02s (physics 0.002 x 10 substeps) = 50Hz
   # (rollout_dexjoco.py Config.fps 의 근거 주석 참조 — 구 데이터셋의 30 선언은 레코더 관례).
   # driver 가 train_success_curve.png 의 x축(sim 분)을 이걸로 환산한다.
@@ -109,9 +109,9 @@ round:
   # 성공률 곡선의 러닝 윈도 (최근 N 온라인 에피소드; 시드 teleop/BC 는 제외)
   success_window: 20
   # learner 가 읽는 키 (fuji 와 동일 의미):
-  updates_per_episode: 10    # 400스텝 / 40스텝당 1회 (원본 파리티)
+  updates_per_episode: 15    # 600스텝 / 40스텝당 1회 (원본 파리티)
   # dexjoco_bc 루트가 아니라 **태스크 하위 디렉토리** — 루트를 주면 6개 태스크가 전부 시드로 들어간다
-  seed_dataset: rl-dataset/dexjoco/dexjoco_bc/hammer_nail_rand_obj
+  seed_dataset: rl-dataset/dexjoco/dexjoco_bc/click_mouse_rand_obj
   seed_teleop_episodes: 10
   seed_success_only: true
   min_online_episodes: 10

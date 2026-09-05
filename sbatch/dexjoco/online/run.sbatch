@@ -37,6 +37,8 @@ cd "$REPO"
 
 RUN=${RUN:-dexjoco_online_1}
 EXP=${EXP:-dexjoco_hammer_nail_d5r20_online}
+# 롤아웃 클라이언트의 태스크 이름 — 기본은 EXP 이름에서 유도 (dexjoco_<task>_d5r20_online*)
+TASK=${TASK:-$(echo "$EXP" | sed 's/^dexjoco_//; s/_d5r20.*//')}
 PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
 # resident(기본): 서버 상주 (리로드 0회, θ 핫리로드 — 메모리 공존).
 # 학습 OOM 이 나면 SERVE_MODE=restart (라운드마다 서버 on/off, 학습이 GPU 전체를 쓴다).
@@ -51,7 +53,7 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_O
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
 
-echo "=== $(date -Is)  dexjoco online RL  run=$RUN exp=$EXP port=$PORT mode=$SERVE_MODE"
+echo "=== $(date -Is)  dexjoco online RL  run=$RUN exp=$EXP task=$TASK port=$PORT mode=$SERVE_MODE"
 echo "    learner 2-rank(torchrun, GPU 0+1) / server x2(GPU 0,1) / rollout x2(CPU+EGL)"
 
 # ── learner (torchrun 2 rank — 실효 배치 = expo.batch_size x 2 = 128) ─────────────
@@ -70,7 +72,8 @@ trap 'kill $LEARNER_PID 2>/dev/null; pkill -P $$ 2>/dev/null' EXIT
 "$PY" -u sim/dexjoco/online_driver.py \
     --exp "$RUN" --exp-config "configs/exp/$EXP.yaml" \
     --runs-root "$REPO/runs" --ckpt-root "$REPO/checkpoints" \
-    --port "$PORT" --sim-py "$SIM_PY" --server-gpus 0,1 --serve-mode "$SERVE_MODE"
+    --port "$PORT" --sim-py "$SIM_PY" --server-gpus 0,1 --serve-mode "$SERVE_MODE" \
+    --task "$TASK"
 rc=$?
 
 echo "=== $(date -Is)  종료 rc=$rc  (learner 정리)"
