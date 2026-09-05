@@ -77,7 +77,9 @@ expo:
   encoder_num_filters: 64
   init_temperature: 1.0
   entropy_scale: 1.0
-  # rank 당 값. 단일 GPU learner 이므로 실효 배치 = 64 (원본과 동일).
+  # rank 당 값. learner 는 torchrun 2-rank — 실효 배치 = 64 x 2 = 128.
+  # (원본 parity 인 64 로 돌리려면 32 로. restart 서빙 모드에서는 학습 국면에 GPU 를
+  #  전부 쓰므로 64도 메모리 여유가 있다.)
   batch_size: 64
   utd_ratio: 20
   freeze_critic_encoder: false

@@ -38,6 +38,9 @@ cd "$REPO"
 RUN=${RUN:-dexjoco_online_1}
 EXP=${EXP:-dexjoco_hammer_nail_d5r20_online}
 PORT=${PORT:-$((21000 + ${SLURM_JOB_ID:-$$} % 9000))}
+# restart(기본): 라운드마다 서버를 켜고(롤아웃) 끈다(학습) — 학습이 GPU 전체를 쓴다.
+# resident: 서버 상주 (리로드 0회, 메모리 공존 — OOM 나면 batch 를 낮출 것).
+SERVE_MODE=${SERVE_MODE:-restart}
 SIM_PY=${SIM_PY:-/workspace/junmo_cho/dexjoco/venv/bin/python}
 PY=${PY:-$REPO/third_party/RLDX-1/.venv/bin/python}
 [ -x "$PY" ] || { echo "RLDX venv python 이 없다: $PY"; exit 3; }
@@ -48,11 +51,12 @@ export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1} TRANSFORMERS_OFFLINE=${TRANSFORMERS_O
 export NO_ALBUMENTATIONS_UPDATE=1 PYTHONUNBUFFERED=1
 export PYTHONPATH="$REPO/third_party/RLDX-1:$REPO"
 
-echo "=== $(date -Is)  dexjoco online RL  run=$RUN exp=$EXP port=$PORT"
-echo "    learner GPU1 / server GPU0 / rollout CPU+EGL"
+echo "=== $(date -Is)  dexjoco online RL  run=$RUN exp=$EXP port=$PORT mode=$SERVE_MODE"
+echo "    learner 2-rank(torchrun, GPU 0+1) / server x2(GPU 0,1) / rollout x2(CPU+EGL)"
 
-# ── learner (GPU 1, 단일 프로세스 — 실효 배치 = expo.batch_size = 64 원본 파리티) ──
-CUDA_VISIBLE_DEVICES=1 "$PY" -u learner/loop.py \
+# ── learner (torchrun 2 rank — 실효 배치 = expo.batch_size x 2 = 128) ─────────────
+# 롤아웃 국면에는 메일박스 폴링만 하므로 (컴퓨트 0) 서버와 국면이 교대한다.
+"$PY" -u -m torch.distributed.run --standalone --nproc-per-node 2 learner/loop.py \
     --exp "$RUN" \
     --runs-root "$REPO/runs" --ckpt-root "$REPO/checkpoints" --repo "$REPO" \
     --exp-config "configs/exp/$EXP.yaml" \
@@ -61,11 +65,12 @@ CUDA_VISIBLE_DEVICES=1 "$PY" -u learner/loop.py \
 LEARNER_PID=$!
 trap 'kill $LEARNER_PID 2>/dev/null; pkill -P $$ 2>/dev/null' EXIT
 
-# ── driver (θ₀ 대기 → 서버(GPU0) 기동 → 라운드 루프). 서버는 driver 의 자식이다 ──
+# ── driver (θ₀ 대기 → 라운드 루프; 서버 x2 는 driver 의 자식 — SERVE_MODE 에 따라
+#    라운드마다 켜고 끄거나(restart) 상주(resident)) ─────────────────────────────
 "$PY" -u sim/dexjoco/online_driver.py \
     --exp "$RUN" --exp-config "configs/exp/$EXP.yaml" \
     --runs-root "$REPO/runs" --ckpt-root "$REPO/checkpoints" \
-    --port "$PORT" --sim-py "$SIM_PY" --server-gpu 0
+    --port "$PORT" --sim-py "$SIM_PY" --server-gpus 0,1 --serve-mode "$SERVE_MODE"
 rc=$?
 
 echo "=== $(date -Is)  종료 rc=$rc  (learner 정리)"

@@ -826,9 +826,17 @@ class Trainer:
         # 온라인 학습 성공률 곡선용. 학습 스텝 사이사이 에피소드 경계에 맞춰 로깅해서
         # (에피소드 j → j+1 번째 updates_per_episode 경계) wandb 스무딩으로 곡선을 그린다.
         upe = int(rc.get("updates_per_episode", 1))
+        hz = float(rc.get("control_hz", 50))
         n_new_ep = int(stats["episodes"])
         ep_succ = ([int(x) for x in self.flat.ep_success[-n_new_ep:]]
                    if n_new_ep and self.flat is not None else [])
+        # sim 시간 누적 (온라인 롤아웃만 — 시드는 로봇/sim 시간을 안 썼으므로 제외).
+        # 에피소드 순서 = flat 순서 (시드 세션들 뒤에 온라인 라운드 순).
+        ep_len = ([int(x) for x in self.flat.ep_length[-n_new_ep:]]
+                  if n_new_ep and self.flat is not None else [])
+        online_frames_total = int(sum(self.flat.ep_length[buf["seed_episodes"]:])) \
+            if self.flat is not None else 0
+        cum_frames_before = online_frames_total - sum(ep_len)
 
         t0 = time.time()
         last: dict = {}
@@ -846,6 +854,12 @@ class Trainer:
                         row["rollout/success"] = ep_succ[j]
                         row["rollout/online_episode"] = \
                             buf["online_episodes"] - len(ep_succ) + j + 1
+                        # sim 시간 — 이 에피소드의 길이(초)와, 온라인 롤아웃 누적합(초/분/시)
+                        row["rollout/episode_seconds"] = round(ep_len[j] / hz, 1)
+                        secs = (cum_frames_before + sum(ep_len[:j + 1])) / hz
+                        row["rollout/sim_seconds"] = round(secs, 1)
+                        row["rollout/sim_minutes"] = round(secs / 60, 3)
+                        row["rollout/sim_hours"] = round(secs / 3600, 4)
                 self.wb.log(row, step=self.updates)
             if i == 0 or (i + 1) % 5 == 0 or i == n_updates - 1:
                 self.log(f"  [{i+1}/{n_updates}] critic_loss={last.get('critic_loss', 0):.4f} "
