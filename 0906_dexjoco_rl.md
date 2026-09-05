@@ -1,138 +1,169 @@
-# 0906 dexjoco sim 온라인 RL — 실행 치트시트
+# 0906 dexjoco sim 온라인 RL — 명령어 전집
 
-fuji 온라인 RL(실기)이 학습에 실패한 뒤, 분석이 쉬운 sim 에서 EXPO-FT 온라인 RL 이 실제로
-도는지 검증하는 실험. 구조 설명은 `configs/exp/dexjoco_hammer_nail_d5r20_online.yaml` 머리말과
-`sim/dexjoco/online_driver.py` 머리말에 있다. 이 문서는 **명령어 모음**이다.
-
-한 노드(gpu:2)에서 세 국면이 교대한다:
-서버 x2 병렬 롤아웃 → 세션을 라운드 메일박스로 rename → learner 2-rank DDP 학습 →
-theta_live.pt 원자 교체(서버가 에피소드 경계에서 핫리로드) → 반복. round 0 = 10ep,
-이후 2ep/라운드, 총 100ep. 시드 = 태스크별 BC 데모 성공 10개.
+복붙용. 배경 설명은 yaml 머리말과 `sim/dexjoco/online_driver.py` 머리말 참조.
+모든 명령은 **클러스터의 레포 루트**에서.
 
 ---
 
-## 0. 준비 (클러스터, 레포 루트에서 1회)
+## 0. 준비 (1회)
 
 ```bash
-git pull && git submodule update --init third_party/RLDX-1 third_party/expo-ft
-wandb login                      # ~/.netrc 저장 (없으면 로그 파일만 남고 wandb 는 조용히 생략)
+git pull
+git submodule update --init third_party/RLDX-1 third_party/expo-ft
+wandb login                                                        # ~/.netrc 저장
 mkdir -p out
-ls checkpoints/dexjoco/          # ★ 신규 태스크 base_policy 실명 확인 (아래 §5)
-export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl   # 제출 플러그인용
+ls checkpoints/dexjoco/            # ★ 신규 3태스크 base_policy 실명 확인 — 다르면 yaml 수정
+export MODEL_OUTPUT_DIR=/fsx/rlwrld-unified-checkpoints/$USER/rd-rl
 ```
 
-## 1. 기본 실행
+`MODEL_OUTPUT_DIR` 는 제출 셸마다 export 돼 있어야 한다 (`--export=ALL` 이 실어 나른다).
+
+---
+
+## 1. 실행 명령 — 16개 조합 전부
+
+형식: 태스크 4 x 액션공간 2 (eef | fullact) x critic 2 (분포형 | scalarq).
+RUN 은 재시도마다 끝 숫자를 올릴 것 (`_1` → `_2`).
+
+### hammer_nail
 
 ```bash
-sbatch --export=ALL,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
+# eef + 분포형(기본)
+sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
+# eef + 스칼라 Q (원본 EXPO-FT parity)
+sbatch --export=ALL,RUN=hammer_eef_sq_1,EXP=dexjoco_hammer_nail_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+# 전체 액션(손가락 포함) + 분포형
+sbatch --export=ALL,RUN=hammer_full_1,EXP=dexjoco_hammer_nail_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+# 전체 액션 + 스칼라 Q
+sbatch --export=ALL,RUN=hammer_full_sq_1,EXP=dexjoco_hammer_nail_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
-- `RUN` 생략 시 `<EXP>_<월일_시분>` 자동 (예: `dexjoco_hammer_nail_d5r20_online_0906_1430`)
-- **이어받기(선점/타임아웃 후)는 기존 RUN 을 명시**: `--export=ALL,RUN=<기존>,EXP=<같은 yaml>`
-  — DONE 라운드 건너뛰기 / 반쯤 구른 롤아웃 --resume / wandb step 이어붙기 전부 자동
-- `TASK` 는 EXP 이름에서 자동 유도 (`dexjoco_<task>_d5r20_online*`)
-
-## 2. 옵션 매트릭스 — 전부 EXP(yaml) 선택으로 갈린다
-
-### 태스크 x 액션 공간 (yaml 8개)
-
-| | eef 만 (9관절; critic 225d / edit 180d) | 전체 액션 (25관절; 625d / 500d) |
-|---|---|---|
-| hammer_nail | `dexjoco_hammer_nail_d5r20_online` | `..._online_fullact` |
-| water_plant | `dexjoco_water_plant_d5r20_online` | `..._online_fullact` |
-| click_mouse | `dexjoco_click_mouse_d5r20_online` | `..._online_fullact` |
-| fold_glasses | `dexjoco_fold_glasses_d5r20_online` | `..._online_fullact` |
-
-차이는 `explore_groups` 블록 하나 — critic/edit 차원·target_entropy 는 자동 유도.
-fullact 는 d5r20 오프라인 실측(625차원 critic 의 후보 Qstd 0.0001)의 온라인 재검 대조군.
-
-태스크별 자동 반영값 (BC 데모 길이 실측 기반):
-
-| task | max_episode_steps | updates/ep | discount (시작 V) |
-|---|---|---|---|
-| hammer_nail | 400 | 10 | 0.995 (0.34) |
-| water_plant | 400 | 10 | 0.995 (0.25) |
-| click_mouse | 600 | 15 | 0.995 (0.20) |
-| fold_glasses | 800 | 20 | 0.9975 (0.26) |
-
-### critic: 분포형 vs 스칼라 (원본 EXPO-FT parity)
+### water_plant
 
 ```bash
-# HL-Gauss 분포형 bins 128 (기본 — support [0,1] 이 발산 상한)
-EXP=dexjoco_hammer_nail_d5r20_online
-# 스칼라 MSE Q (원본 EXPO-FT 와 동일 — REDQ min/보상 [0,1]/LayerNorm 만으로 방어)
-EXP=dexjoco_hammer_nail_d5r20_online_scalarq
+sbatch --export=ALL,RUN=water_eef_1,EXP=dexjoco_water_plant_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=water_eef_sq_1,EXP=dexjoco_water_plant_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=water_full_1,EXP=dexjoco_water_plant_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=water_full_sq_1,EXP=dexjoco_water_plant_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
-스위치는 yaml 의 `critic.bins: 128 → 0` 한 줄이다. 다른 태스크의 scalarq 판이 필요하면:
+### click_mouse
 
 ```bash
-sed 's/^name: \(.*\)$/name: \1_scalarq/; s/^  bins: 128/  bins: 0/' \
-  configs/exp/dexjoco_water_plant_d5r20_online.yaml \
-  > configs/exp/dexjoco_water_plant_d5r20_online_scalarq.yaml
+sbatch --export=ALL,RUN=click_eef_1,EXP=dexjoco_click_mouse_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=click_eef_sq_1,EXP=dexjoco_click_mouse_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=click_full_1,EXP=dexjoco_click_mouse_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=click_full_sq_1,EXP=dexjoco_click_mouse_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
-주의: 스칼라는 발산 상한이 없다 — learner 로그의 `q_max > 1.2` 경고가 뜨면 분포형으로 복귀.
-
-### edit_scale (yaml `expo.edit_scale`, 기본 0.2 = 원본값)
-
-- 0.2 는 dexjoco 자연 후보 산포(0.019)의 ~10배 — round 0 성공률이 base(~50%) 아래로
-  떨어지는 것은 예상이자 필요 비용 (대비 신호). 판정은 "떨어졌나"가 아니라 **회복하나**.
-- round 0 성공이 0~1/10 이면: `edit_scale: 0.05` 로 낮춰 **새 RUN**.
-- 2~3라운드에 회복 조짐이 없고 `edit선택` 이 0.5 에서 안 내려가면 critic 이 edit 을
-  못 거르는 것 — 같은 처방.
-
-### 서빙 모드 (GPU 메모리)
+### fold_glasses
 
 ```bash
-SERVE_MODE=resident   # 기본: 서버 상주 + θ 핫리로드 (learner 와 메모리 공존)
-SERVE_MODE=restart    # 학습 OOM 시: 라운드마다 서버 on/off — 학습이 GPU 전체를 쓴다
-                      # (서버 로드는 클라이언트의 300s 대기와 겹쳐 라운드당 ~1분)
+sbatch --export=ALL,RUN=fold_eef_1,EXP=dexjoco_fold_glasses_d5r20_online sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=fold_eef_sq_1,EXP=dexjoco_fold_glasses_d5r20_online_scalarq sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=fold_full_1,EXP=dexjoco_fold_glasses_d5r20_online_fullact sbatch/dexjoco/online/run.sbatch
+sbatch --export=ALL,RUN=fold_full_sq_1,EXP=dexjoco_fold_glasses_d5r20_online_fullact_scalarq sbatch/dexjoco/online/run.sbatch
 ```
 
-learner OOM 의 다른 손잡이: yaml `expo.batch_size: 64 → 32` (실효 128 → 64 = 원본 parity).
+각 yaml 이 자동으로 들고 가는 값:
 
-## 3. 모니터링
+| task | max_episode_steps | updates/ep | discount | eef critic/edit | fullact critic/edit |
+|---|---|---|---|---|---|
+| hammer_nail | 400 | 10 | 0.995 | 225d / 180d | 625d / 500d |
+| water_plant | 400 | 10 | 0.995 | 225d / 180d | 625d / 500d |
+| click_mouse | 600 | 15 | 0.995 | 225d / 180d | 625d / 500d |
+| fold_glasses | 800 | 20 | 0.9975 | 225d / 180d | 625d / 500d |
+
+공통: N 8 + edit 8 후보, edit_scale 0.2, REDQ 10앙상블 min-of-2, utd 20,
+round0 10ep → 이후 2ep/라운드 → 총 100ep, 시드 = BC 데모 성공 10ep.
+
+---
+
+## 2. 이어받기 (선점/타임아웃/중단 후)
+
+같은 RUN + 같은 EXP 로 재제출만 하면 된다 (DONE 라운드 건너뜀, 반쯤 구른 롤아웃 --resume,
+wandb step 이어붙기 자동):
 
 ```bash
-squeue -u $USER
-tail -f out/dexjoco-online_<jobid>.out          # learner (라운드 학습, [N/M] 진행)
-tail -f runs/<RUN>.driver.log                   # driver (롤아웃/READY/theta 게시/곡선)
-tail -f runs/<RUN>.server0.log                  # 서버0 ([reload] = θ 핫리로드 확인)
+sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online sbatch/dexjoco/online/run.sbatch
 ```
 
-산출물 지도:
+---
 
+## 3. 변형 노브 — 풀 명령
+
+### edit_scale 낮추기 (round 0 성공 0~1/10 이거나 2~3라운드 무회복일 때)
+
+```bash
+# 0.05 판 yaml 생성 (예: hammer eef) 후 새 RUN 으로
+sed 's/^name: \(.*\)$/name: \1_es005/; s/^  edit_scale: 0.2 .*/  edit_scale: 0.05/' \
+  configs/exp/dexjoco_hammer_nail_d5r20_online.yaml \
+  > configs/exp/dexjoco_hammer_nail_d5r20_online_es005.yaml
+sbatch --export=ALL,RUN=hammer_eef_es005_1,EXP=dexjoco_hammer_nail_d5r20_online_es005 sbatch/dexjoco/online/run.sbatch
 ```
-runs/<RUN>/
-  run_meta.json                 무슨 yaml/태스크/코드로 돌았나 + 재시작 이력
-  train_success_curve.png       x=sim 분, 최근 20ep 러닝 성공률 (라운드마다 갱신)
-  plots/step*_r*_q.png          라운드 새 에피소드 Q 곡선 (성공 초록/실패 빨강)
-  plots/step*_r*_q_all.png      전체 에피소드를 그 시점 critic 으로 재평가 (스텝별 비교용)
-  rNNN/dataset/<세션>/videos/   에피소드별 mp4 (plots 라벨의 ep 인덱스와 짝)
-  rNNN/READY                    에피소드별 성공/프레임 (json)
-  buffer/                       images.mm / cogfeat.npy / actnorm.npy (재생성 가능 캐시)
-checkpoints/expo/<RUN>/rNNN/{theta.pt,meta.json,DONE}
+
+### 학습 OOM 대응 두 가지 (아무 조합에나 덧붙임)
+
+```bash
+# 1) 서버를 라운드마다 켜고 끄기 — 학습이 GPU 메모리 전체를 쓴다 (라운드당 ~1분 로드)
+sbatch --export=ALL,RUN=hammer_eef_1,EXP=dexjoco_hammer_nail_d5r20_online,SERVE_MODE=restart sbatch/dexjoco/online/run.sbatch
+
+# 2) 배치 축소 (실효 128 → 64 = 원본 parity): yaml 의 batch_size 를 32 로
+sed -i 's/^  batch_size: 64$/  batch_size: 32/' configs/exp/dexjoco_hammer_nail_d5r20_online.yaml
 ```
 
-wandb (`rd-rl-expo/<RUN>`): `rollout/success`(에피소드 1/0 — **그 라운드 학습 스텝 위에
-에피소드 경계마다 분산 기록**되므로 라운드 학습이 끝나야 그 라운드 몫이 다 보인다),
-`rollout/episode_seconds`, `rollout/sim_seconds·minutes·hours`(누적),
-`train/critic_loss·q·q_max·candidate_q_std·select_ratio_with_residual`, `round/*`, `buffer/*`.
-차트 x축을 `rollout/sim_seconds` 나 `rollout/online_episode` 로 바꾸면 시간축 성공률 뷰.
+### 기타 env 노브 (전부 --export 에 콤마로 추가)
 
-## 4. 판정 기준 (fuji 교훈 요약)
+```bash
+SERVE_MODE=resident|restart    # 기본 resident
+PORT=22000                     # zmq 포트 (서버 i = PORT+i). 기본 jobid 기반 자동
+TASK=hammer_nail               # 기본은 EXP 이름에서 자동 유도 — 보통 만질 일 없음
+SIM_PY=/workspace/junmo_cho/dexjoco/venv/bin/python   # dexjoco venv 경로가 다르면
+```
 
-- **성공 신호**: 성공률 회복→상승, `candidate_q_std` 가 1e-4 바닥에서 기상,
-  `_q_all.png` 에서 성공/실패 곡선의 분기가 라운드마다 앞당겨짐
-- **경보**: q_max > 1.2 (스칼라 판), critic_loss 지속 상승, `edit선택` 이 0.5 고정
-  (critic 이 edit 을 못 거름), 성공 0 지속 (신호 소멸 — edit_scale 인하)
-- LoRA(actor)는 AdamW(b2 0.95, wd 1e-10)+clip 1.0+lr 2.5e-5 — fuji r000 파괴의 재발 방지.
-  `train/actor_grad_norm` 이 상시 clip(1.0)에 걸려 있으면 들여다볼 것
+---
 
-## 5. 남은 TODO
+## 4. 모니터링 — 풀 명령 (RUN=hammer_eef_1 예시, 이름만 바꿔 쓰기)
 
-- 신규 3태스크 yaml 의 `base_policy` 가 hammer_nail 패턴 **추정치**다 —
-  `ls checkpoints/dexjoco/` 실명으로 교체 후 실행 (BC 모델이 없으면 그것부터)
-- HL-Gauss bin 해상도 vs 초미세 edit 민감도 — 오프라인 격자 실험 설계는 메모리/이 문서
-  이력 참조 (`--bins {128,256,512}` + `rl/probe_actsens.py`)
+```bash
+squeue -u $USER                                                    # 잡 상태
+tail -f out/dexjoco-online_<jobid>.out                             # learner 로그
+tail -f runs/hammer_eef_1.driver.log                               # 라운드 진행/곡선 갱신
+tail -f runs/hammer_eef_1.server0.log                              # 서버0 ([reload] 확인)
+tail -f runs/hammer_eef_1.server1.log                              # 서버1
+watch -n30 'ls -la runs/hammer_eef_1/train_success_curve.png runs/hammer_eef_1/plots/ | tail'
+cat runs/hammer_eef_1/run_meta.json                                # 무슨 실험이었나
+cat runs/hammer_eef_1/r000/READY | python3 -m json.tool | head -20 # 라운드 에피소드별 성공
+nvidia-smi                                                          # 메모리 공존 확인 (노드에서)
+```
+
+에피소드 영상 (플롯 라벨 epN ↔ episode_00000N.mp4):
+
+```bash
+ls runs/hammer_eef_1/r000/dataset/rollout_r000_a/videos/chunk-000/observation.images.camera_front/
+```
+
+wandb: https://wandb.ai/junmokane/rd-rl-expo → run 이름 = RUN.
+`rollout/success` 는 그 라운드 **학습 스텝 위에 에피소드 경계마다** 찍힌다 (라운드 학습이
+끝나야 그 라운드 몫이 다 보임). 차트 x축을 `rollout/sim_seconds` 로 바꾸면 시간축 성공률.
+
+---
+
+## 5. 판정 기준 (fuji 교훈)
+
+- **성공 신호**: 성공률이 초기 하락 후 20~30ep 내 회복 기울기, `train/candidate_q_std` 가
+  1e-4 바닥에서 기상, `plots/step*_q_all.png` 에서 성공/실패 분기가 라운드마다 앞당겨짐
+- **경보**: `q_max > 1.2` (scalarq 판 — 분포형 128 로 복귀), critic_loss 지속 상승,
+  `edit선택` 0.5 고정 (critic 이 edit 을 못 거름), 성공 0 지속 (edit_scale 인하)
+- scalarq 는 "분포형만 제거"다 — critic 입력은 여전히 cog feature (완전 원본은 이미지
+  ResNet: yaml 에서 critic: 블록 제거 시 legacy 경로가 있으나 미검증)
+
+## 6. 남은 TODO
+
+- 신규 3태스크 `base_policy` 실명 교체 (`ls checkpoints/dexjoco/` 대조) — scalarq/fullact
+  변형 yaml 도 같은 줄을 갖고 있으니 같이:
+  ```bash
+  sed -i 's|dexjoco/dexjoco_water_plant_randobj_.*|dexjoco/<실제 디렉토리명>|' configs/exp/dexjoco_water_plant_d5r20_online*.yaml
+  ```
+- HL-Gauss bin 해상도 vs 초미세 edit 민감도 오프라인 격자 (`--bins {128,256,512}` +
+  `rl/probe_actsens.py`) — fuji 복귀 시점에

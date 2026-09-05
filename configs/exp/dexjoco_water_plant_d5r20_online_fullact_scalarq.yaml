@@ -1,0 +1,121 @@
+# dexjoco hammer_nail — **sim 온라인 EXPO-FT RL** (단일 서버: 롤아웃 + 학습이 같은 노드).
+#
+# fuji_online 의 sim 판이다. 목적: 실기(fuji)에서 학습이 안 됐으므로, 분석이 쉬운 sim 에서
+# 온라인 RL 이 실제로 도는지 검증한다 (DEXJOCO-SIM.md 의 오프라인 루프에 이은 온라인 편).
+#
+# fuji_online 과의 차이:
+#   1. base_policy 가 water_plant_rand_obj 100ep BC (dexjoco_hammer_nail_d5r20 과 동일).
+#   2. explore_groups = **전체 25관절 (fullact 변형)** — critic 625차원 / edit 500차원.
+#   3. edit_scale 0.2 (EXPO-FT 원본값) — sim 이라 탐색 비용이 로봇 시간이 아니다.
+#      fuji 의 0.002(base 보존) 체제와 정반대: 여기서는 대비(contrast)를 사고 싶다.
+#   4. updates_per_episode 10 — 원본 파리티. 원본은 update_type=step 기준 40 env스텝당
+#      update 1회를 에피소드(~120스텝)당 3회로 환산해 썼다. hammer_nail 은 에피소드가
+#      최대 400스텝이므로 400/40 = 10회.
+#   5. vla.lora_lr 2.5e-5 + AdamW + grad clip 1.0 — 포크(pd-perry/openpi@expo_ft)의
+#      pi0.5 실측 설정 (0904_fuji_expo_ft_issue.md #3 재보정 참조). fuji r000 사고의
+#      3e-4 는 residual 용 값의 오이식이었다. residual/critic/temp 는 원본대로
+#      순정 Adam 3e-4 (clip 없음 — expo_ft.py:335 TrainState 와 동일).
+#
+# 롤아웃 규약 (sim/dexjoco/rollout_dexjoco.py + rl/vla_rldx serve):
+#   서버:   --exp <이 파일> --artifacts <theta_live.pt> --artifacts-watch
+#           --rtc-inference-mode trained --rtc-exec-horizon 20 --sim-wrapper
+#   클라이언트: --task water_plant --replan 20 --rtc-delay 5 --max-episode-steps 400
+#   오케스트레이션: sim/dexjoco/online_driver.py (라운드 메일박스는 fuji 와 동일 규약,
+#   단 같은 파일시스템이라 kubectl 없이 rename 으로 전달)
+
+name: dexjoco_water_plant_d5r20_online_fullact_scalarq
+dataset: rl-dataset/dexjoco/dexjoco_bc/water_plant_rand_obj          # (참고용 — 온라인 버퍼는 round 로 쌓인다)
+robot: panda_allegro
+
+rldx_data_config: rldx/configs/data/dexjoco_panda_allegro_config.py
+modality: modality/dexjoco_panda_allegro/modality.json
+
+# <checkpoints>/ 아래 상대경로 (dexjoco_hammer_nail_d5r20.yaml 과 동일 모델).
+# ★ TODO: 실제 BC 체크포인트 디렉토리명으로 바꿀 것 (아래는 hammer_nail 패턴 추정 —
+#   checkpoints/dexjoco/ 에서 ls 로 확인. action_horizon 32 / rtc_training 8 전제)
+base_policy: dexjoco/dexjoco_water_plant_randobj_100ep_ptimg_h32_rtc8tr_drop03_bs16_30k_1gpu_mlxp
+
+action_horizon: 32
+replan_steps: 20
+inference_latency: 5
+
+# --- critic 백엔드: qvgm cog-feature (fuji_online 과 동일 구조) ----------------
+# dfeat 4096 = RLDX-1-VLM cognition token mean-pool. action_index 는 explore_groups x
+# 창 전체 [0, latency+replan) 로 자동 유도된다 (eef 9관절 x 25스텝 = 225차원).
+critic:
+  dfeat: 4096
+  latent: 2048
+  state_latent: 256
+  hidden: [1024, 512]
+  bins: 0   # ★ scalarq: 분포형 끔 — 원본 EXPO-FT 처럼 스칼라 MSE Q (q_max>1.2 경고 시 128 복귀)
+  q_range: [0.0, 1.0]
+  inject: true
+  n_steps: 1
+
+# ★ full-action 변형: 손가락 16관절 포함 — critic 25관절 x 창 25 = 625차원,
+# edit 25관절 x 실행 20 = 500차원 (target_entropy 는 -250 으로 자동). 참고:
+# d5r20 오프라인 실측에서 625차원 critic 은 후보간 Qstd 0.0001 로 액션 의존을
+# 못 배웠다 — 이 변형은 그 한계가 온라인에서도 성립하는지의 대조 실험이다.
+explore_groups:
+  - eef_position
+  - eef_rotation
+  - hand_joints
+
+expo:
+  N: 8
+  n_edit_samples: 8
+  edit_scale: 0.2            # EXPO-FT 원본값 (sim 탐색 체제)
+  num_qs: 10
+  num_min_qs: 2
+  critic_layer_norm: true
+  # 프레임당 할인 — 0.995^276(평균) = 0.25 — hammer_nail 과 같은 체제
+  discount: 0.995
+  tau: 0.005
+  actor_lr: 3.0e-4           # residual(edit) actor — 원본 parity (순정 Adam, clip 없음)
+  critic_lr: 3.0e-4
+  temp_lr: 3.0e-4
+  latent_dim_image: 512      # legacy ResNet critic 용 — critic: 블록이 있으면 안 쓰인다
+  latent_dim_state: 64       # (residual actor 의 latent_dim_state/hidden 은 쓰인다)
+  include_state: true
+  hidden_dims: [256, 256, 256]
+  encoder_stage_sizes: [3, 4, 6, 3]
+  encoder_num_filters: 64
+  init_temperature: 1.0
+  entropy_scale: 1.0
+  # rank 당 값. learner 는 torchrun 2-rank — 실효 배치 = 64 x 2 = 128.
+  # (원본 parity 인 64 로 돌리려면 32 로. restart 서빙 모드에서는 학습 국면에 GPU 를
+  #  전부 쓰므로 64도 메모리 여유가 있다.)
+  batch_size: 64
+  utd_ratio: 20
+  freeze_critic_encoder: false
+  actor_success_only: true
+
+vla:
+  lora_rank: 16
+  # 2.5e-5 = EXPO-FT 포크의 pi0.5 온라인 BC 실측값 (고정 lr, warmup/EMA 없음).
+  # setup_training 이 AdamW(b2 0.95, wd 1e-10) + grad clip 1.0 으로 돌린다 —
+  # fuji r000 파괴(3e-4 순정 Adam) 의 재발 방지 3종 중 2종 (나머지는 신호 유무 감시).
+  lora_lr: 2.5e-5
+  freeze_backbone: true
+
+# --- 라운드 운영 (online_driver.py 가 읽는다) ---------------------------------
+round:
+  # driver 전용 키 (learner 는 무시):
+  episodes_first_round: 10   # round 0 롤아웃 수 — min_online_episodes 와 같아야 즉시 학습
+  episodes_per_round: 2      # 이후 라운드당 롤아웃 수
+  total_online_episodes: 100 # 이 수에 닿으면 driver 가 종료
+  # BC 데모(teleop) 길이 실측: 평균 276 / p99 363 / max 393 — p99 위로 잡는다.
+  max_episode_steps: 400
+  # sim 제어 주파수. env.step 1회 = control_dt 0.02s (physics 0.002 x 10 substeps) = 50Hz
+  # (rollout_dexjoco.py Config.fps 의 근거 주석 참조 — 구 데이터셋의 30 선언은 레코더 관례).
+  # driver 가 train_success_curve.png 의 x축(sim 분)을 이걸로 환산한다.
+  control_hz: 50
+  # 성공률 곡선의 러닝 윈도 (최근 N 온라인 에피소드; 시드 teleop/BC 는 제외)
+  success_window: 20
+  # learner 가 읽는 키 (fuji 와 동일 의미):
+  updates_per_episode: 10    # 400스텝 / 40스텝당 1회 (원본 파리티)
+  # dexjoco_bc 루트가 아니라 **태스크 하위 디렉토리** — 루트를 주면 6개 태스크가 전부 시드로 들어간다
+  seed_dataset: rl-dataset/dexjoco/dexjoco_bc/water_plant_rand_obj
+  seed_teleop_episodes: 10
+  seed_success_only: true
+  min_online_episodes: 10
